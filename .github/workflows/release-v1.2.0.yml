@@ -1,0 +1,67 @@
+name: Publier v1.2.0
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/release-v1.2.0.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.repository == 'laurentmamelli-max/AMS-Lite_Companion'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tester le moteur
+        run: python3 -m unittest -v test_companion.py
+      - name: Construire l’application universelle
+        run: bash Construire_Application_macOS.command
+      - name: Vérifier le paquet
+        run: |
+          codesign --verify --deep --strict --verbose=2 "dist/AMS Lite Companion.app"
+          lipo -archs "dist/AMS Lite Companion.app/Contents/MacOS/AMS-Lite-Companion" | grep -q arm64
+          lipo -archs "dist/AMS Lite Companion.app/Contents/MacOS/AMS-Lite-Companion" | grep -q x86_64
+      - name: Publier la release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view v1.2.0 >/dev/null 2>&1; then
+            echo "La release v1.2.0 existe déjà."
+            exit 0
+          fi
+          gh release create v1.2.0 \
+            "dist/AMS-Lite-Companion-1.2.0-macOS.zip#Application macOS universelle" \
+            --target "$GITHUB_SHA" \
+            --title "AMS Lite Companion v1.2.0" \
+            --notes-file - <<'EOF'
+          ## AMS Lite Companion v1.2.0
+
+          La passerelle récupère automatiquement le fichier tranché créé par Bambu Studio officiel lors de l’envoi de l’impression.
+
+          ### Nouveautés
+
+          - récupération automatique du `.gcode.3mf` temporaire ;
+          - détection de la correspondance AMS A1–A4 depuis la commande locale lorsqu’elle est disponible ;
+          - correspondance enregistrée configurable en solution de repli ;
+          - analyse en flux adaptée aux gros projets ;
+          - protection contre les fichiers incomplets, anciens ou moins récents ;
+          - import manuel toujours disponible en secours ;
+          - conservation des niveaux et de l’historique v1.1.
+
+          ### Installation
+
+          1. Téléchargez `AMS-Lite-Companion-1.2.0-macOS.zip`.
+          2. Quittez l’ancienne version de Companion.
+          3. Décompressez l’archive et remplacez l’application dans `/Applications`.
+          4. Au premier lancement, effectuez un clic droit puis **Ouvrir**.
+          5. Vérifiez la carte **Passerelle Bambu Studio** avant la première impression.
+
+          Python 3 et Bambu Studio officiel doivent être installés.
+
+          Projet communautaire non officiel, sans affiliation avec Bambu Lab.
+          EOF

@@ -1,0 +1,37 @@
+name: Application macOS
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "ams_companion.py"
+      - "macos/**"
+      - "Construire_Application_macOS.command"
+      - ".github/workflows/macos-app.yml"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tests du moteur
+        run: python3 -m unittest -v test_companion.py
+      - name: Construire l’application universelle
+        run: bash Construire_Application_macOS.command
+      - name: Vérifier le paquet
+        run: |
+          codesign --verify --deep --strict --verbose=2 "dist/AMS Lite Companion.app"
+          file "dist/AMS Lite Companion.app/Contents/MacOS/AMS-Lite-Companion"
+          lipo -archs "dist/AMS Lite Companion.app/Contents/MacOS/AMS-Lite-Companion" | grep -q arm64
+          lipo -archs "dist/AMS Lite Companion.app/Contents/MacOS/AMS-Lite-Companion" | grep -q x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AMS-Lite-Companion-macOS
+          path: dist/AMS-Lite-Companion-*-macOS.zip
+          if-no-files-found: error

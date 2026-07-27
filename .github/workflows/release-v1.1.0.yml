@@ -1,0 +1,66 @@
+name: Publier v1.1.0
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/release-v1.1.0.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.repository == 'laurentmamelli-max/AMS-Lite_Companion'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tester le moteur
+        run: python3 -m unittest -v test_companion.py
+      - name: Construire l’application universelle
+        run: bash Construire_Application_macOS.command
+      - name: Vérifier le paquet
+        run: |
+          codesign --verify --deep --strict --verbose=2 "dist/AMS Lite Companion.app"
+          lipo -archs "dist/AMS Lite Companion.app/Contents/MacOS/AMS-Lite-Companion" | grep -q arm64
+          lipo -archs "dist/AMS Lite Companion.app/Contents/MacOS/AMS-Lite-Companion" | grep -q x86_64
+      - name: Publier la release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view v1.1.0 >/dev/null 2>&1; then
+            echo "La release v1.1.0 existe déjà."
+            exit 0
+          fi
+          gh release create v1.1.0 \
+            "dist/AMS-Lite-Companion-1.1.0-macOS.zip#Application macOS universelle" \
+            --target "$GITHUB_SHA" \
+            --title "AMS Lite Companion v1.1.0" \
+            --notes-file - <<'EOF'
+          ## AMS Lite Companion v1.1.0
+
+          Première application macOS autonome liée à Bambu Studio officiel.
+
+          ### Nouveautés
+
+          - icône native dans la barre des menus macOS ;
+          - niveaux des bobines A1 à A4 accessibles directement ;
+          - suivi monochrome et multicolore ;
+          - lancement automatique de Bambu Studio officiel ;
+          - arrêt automatique après la fermeture de Bambu Studio ;
+          - application universelle Apple Silicon et Intel ;
+          - conservation des niveaux et de l’historique existants.
+
+          ### Installation
+
+          1. Téléchargez `AMS-Lite-Companion-1.1.0-macOS.zip`.
+          2. Décompressez l’archive.
+          3. Glissez `AMS Lite Companion.app` dans `/Applications`.
+          4. Au premier lancement, effectuez un clic droit puis **Ouvrir**.
+
+          Python 3 et Bambu Studio officiel doivent être installés.
+
+          Projet communautaire non officiel, sans affiliation avec Bambu Lab.
+          EOF

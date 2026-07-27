@@ -1,0 +1,76 @@
+name: Publier v1.3.0
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/release-v1.3.0.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.repository == 'laurentmamelli-max/AMS-Lite_Companion'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tester le moteur
+        run: python3 -m unittest -v test_companion.py
+      - name: Construire l’application universelle
+        run: bash Construire_Application_macOS.command
+      - name: Vérifier le paquet
+        run: |
+          codesign --verify --deep --strict --verbose=2 "dist/AMS Lite Companion.app"
+          lipo -archs "dist/AMS Lite Companion.app/Contents/MacOS/AMS-Lite-Companion" | grep -q arm64
+          lipo -archs "dist/AMS Lite Companion.app/Contents/MacOS/AMS-Lite-Companion" | grep -q x86_64
+      - name: Publier la version stable
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view v1.3.0 >/dev/null 2>&1; then
+            echo "La release v1.3.0 existe déjà."
+            exit 0
+          fi
+          gh release create v1.3.0 \
+            "dist/AMS-Lite-Companion-1.3.0-macOS.zip#Application macOS universelle" \
+            --target "$GITHUB_SHA" \
+            --latest \
+            --title "AMS Lite Companion v1.3.0" \
+            --notes-file - <<'EOF'
+          ## AMS Lite Companion v1.3.0
+
+          Version stable du panneau Companion natif lié à Bambu Studio officiel.
+
+          ### Nouveautés
+
+          - panneau macOS natif accolé à Bambu Studio ;
+          - récupération automatique du véritable paquet d’impression sous `Metadata` ;
+          - connexion MQTT locale stable avec A1 mini et AMS Lite ;
+          - suivi indépendant des bobines A1 à A4 ;
+          - impressions monochromes et multicolores ;
+          - déduction unique après `RUNNING → FINISH` ;
+          - protection contre les sauvegardes de projet, doubles déductions et réarmements ;
+          - arrêt automatique avec Bambu Studio, sans service permanent.
+
+          ### Validation
+
+          - 16 scénarios automatisés réussis ;
+          - plusieurs impressions réelles validées, dont une impression bicolore ;
+          - reconnexion MQTT vérifiée pendant une impression ;
+          - application universelle Intel et Apple Silicon ;
+          - signature ad hoc contrôlée par GitHub Actions.
+
+          ### Installation
+
+          1. Téléchargez `AMS-Lite-Companion-1.3.0-macOS.zip`.
+          2. Quittez Companion et Bambu Studio.
+          3. Décompressez l’archive et glissez `AMS Lite Companion.app` dans `/Applications`.
+          4. Au premier lancement, effectuez un clic droit puis choisissez **Ouvrir**.
+
+          Les niveaux, noms de bobines et historiques existants sont conservés.
+
+          Projet communautaire non officiel, sans affiliation avec Bambu Lab.
+          EOF
