@@ -48,11 +48,12 @@ fait qu’ouvrir une alerte locale, dans le tableau de bord et dans la fenêtre
 macOS. Aucun popup, minuteur, détecteur ou traitement en arrière-plan ne peut
 préparer ni transmettre une action.
 
-Après vérification visuelle, l’utilisateur peut choisir **Préparer
-l’exclusion manuelle** pour un seul objet. Cette option recoupe l’identité
-canonique de `slice_info.config`, conserve une instruction locale idempotente
-et n’a aucun transport réseau. Companion ne publie jamais cette instruction à
-l’imprimante : l’exclusion reste une décision et une opération humaine.
+Après vérification visuelle, l’utilisateur peut choisir **Exclure réellement
+cet objet** pour un seul objet. Cette option recoupe l’identité canonique de
+`slice_info.config`, exige une impression MQTT connectée et une seconde
+confirmation, puis publie une seule demande locale. Elle n’est jamais
+déclenchée par une alerte, un popup ou une tâche de fond, n’est jamais rejouée
+après reconnexion et chaque tentative est journalisée.
 
 ## Dashboard et rapports — V2.4/V2.5
 

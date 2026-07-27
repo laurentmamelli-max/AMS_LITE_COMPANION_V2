@@ -1,8 +1,8 @@
 """V3 safety policy: alerts first, manual exclusion only on explicit request.
 
-AutoPilot never publishes to a printer.  A user may explicitly prepare one
-canonical Bambu ``skip_objects`` instruction from the dashboard, where it is
-stored locally for review.  No popup, detector, timer or background task can
+This module never owns a network connection.  It produces the one canonical
+``skip_objects`` instruction that Core may publish *only* after an explicit
+dashboard confirmation.  No popup, detector, timer or background task can
 call that path.
 """
 
@@ -43,8 +43,8 @@ class AutoPilotPlanner:
         "manual_exclusion_available": True,
         "reason": (
             "V3 n’automatise aucune décision : les alertes demandent une vérification. "
-            "L’exclusion ne peut être préparée que manuellement depuis le tableau de bord "
-            "et n’est jamais envoyée par Companion."
+            "L’exclusion ne peut être envoyée que manuellement depuis le tableau de bord, "
+            "après confirmation explicite et uniquement pendant une impression MQTT active."
         ),
     }
 
@@ -74,6 +74,18 @@ class AutoPilotPlanner:
                     instruction_json TEXT NOT NULL,
                     status TEXT NOT NULL CHECK(status IN ('prepared_manually')),
                     created_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS manual_exclusion_dispatches (
+                    id TEXT PRIMARY KEY,
+                    instruction_id TEXT NOT NULL,
+                    proposal_id TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('published', 'failed')),
+                    message TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS manual_exclusion_claims (
+                    instruction_id TEXT PRIMARY KEY,
+                    claimed_at REAL NOT NULL
                 );
                 """
             )
@@ -158,11 +170,25 @@ class AutoPilotPlanner:
             "created_at": float(row["created_at"]),
         } for row in rows]
 
+    def _dispatches(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM manual_exclusion_dispatches ORDER BY created_at DESC LIMIT 30"
+            ).fetchall()
+        return [{
+            "id": row["id"], "instruction_id": row["instruction_id"],
+            "proposal_id": row["proposal_id"], "status": row["status"],
+            "message": row["message"], "created_at": float(row["created_at"]),
+        } for row in rows]
+
     def state(self, guardian: dict[str, Any], active_job: dict[str, Any] | None) -> dict[str, Any]:
         proposals = [item for item in guardian.get("pending_proposals", []) if isinstance(item, dict)]
         plans = [self._plan_for(item, active_job) for item in proposals]
         alerts = [self._alert_for(proposal, plan) for proposal, plan in zip(proposals, plans)]
-        return {"capability": dict(self.capability), "alerts": alerts, "plans": plans, "prepared": self._saved()}
+        return {
+            "capability": dict(self.capability), "alerts": alerts, "plans": plans,
+            "prepared": self._saved(), "dispatches": self._dispatches(),
+        }
 
     def prepare_manual(self, proposal_id: str, guardian: dict[str, Any], active_job: dict[str, Any] | None) -> dict[str, Any]:
         """Persist an explicit user request; it deliberately does not control hardware."""
@@ -207,3 +233,49 @@ class AutoPilotPlanner:
                 "Exclusion manuelle préparée et journalisée. Companion ne l’a pas envoyée à l’imprimante."
             ),
         }
+
+    def record_dispatch(self, instruction: dict[str, Any], *, published: bool, message: str) -> dict[str, Any]:
+        """Audit a human-triggered transport attempt; never retries it automatically."""
+        instruction_id = str(instruction.get("id") or "")
+        proposal_id = str(instruction.get("proposal_id") or "")
+        if not instruction_id or not proposal_id:
+            raise ValueError("Instruction manuelle invalide")
+        status = "published" if published else "failed"
+        created_at = time.time()
+        dispatch_id = hashlib.sha256(
+            f"dispatch:{instruction_id}:{status}:{created_at:.6f}".encode()
+        ).hexdigest()[:32]
+        with self.lock, self._connect() as connection:
+            connection.execute(
+                """INSERT INTO manual_exclusion_dispatches(
+                       id, instruction_id, proposal_id, status, message, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (dispatch_id, instruction_id, proposal_id, status, str(message)[:500], created_at),
+            )
+        return {
+            "id": dispatch_id, "instruction_id": instruction_id, "proposal_id": proposal_id,
+            "status": status, "message": str(message)[:500], "created_at": created_at,
+        }
+
+    def claim_dispatch(self, instruction: dict[str, Any]) -> bool:
+        """Atomically reserve one instruction so a double-click cannot publish twice."""
+        instruction_id = str(instruction.get("id") or "")
+        if not instruction_id:
+            raise ValueError("Instruction manuelle invalide")
+        with self.lock, self._connect() as connection:
+            try:
+                connection.execute(
+                    "INSERT INTO manual_exclusion_claims(instruction_id, claimed_at) VALUES (?, ?)",
+                    (instruction_id, time.time()),
+                )
+            except sqlite3.IntegrityError:
+                return False
+        return True
+
+    def release_dispatch_claim(self, instruction: dict[str, Any]) -> None:
+        """Allow a new explicit user attempt after a failed transport only."""
+        instruction_id = str(instruction.get("id") or "")
+        if not instruction_id:
+            return
+        with self.lock, self._connect() as connection:
+            connection.execute("DELETE FROM manual_exclusion_claims WHERE instruction_id = ?", (instruction_id,))

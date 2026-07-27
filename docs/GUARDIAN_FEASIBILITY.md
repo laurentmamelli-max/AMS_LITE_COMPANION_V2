@@ -9,9 +9,11 @@ V2 sépare volontairement deux capacités :
 
 La première est développable localement. V3 conserve une option explicitement
 manuelle qui prépare et journalise une instruction unitaire `skip_objects`
-avec l’identifiant canonique du fichier `slice_info.config`. Elle n'est jamais
-transmise : le projet ne dispose pas d'une commande Bambu LAN/SD officielle et
-vérifiée pour ignorer un objet d'une impression en cours.
+avec l’identifiant canonique du fichier `slice_info.config`, puis la publie
+uniquement après confirmation explicite pendant une impression MQTT connectée.
+Elle emploie le protocole LAN observé dans Bambu Studio ; ce mécanisme reste à
+valider sur le modèle et le firmware réellement utilisés avant d’être considéré
+comme confirmé par l’imprimante.
 
 Le dépôt officiel de Bambu Studio référence encore une demande ouverte pour
 « Skip Object » sur les impressions SD/LAN :
@@ -24,9 +26,10 @@ copiera ni ne simulera donc une commande de contrôle non documentée :
 
 Le noyau `plate_guardian.py` ne peut que créer une proposition avec preuves.
 `autopilot.py` produit d’abord une alerte ; une instruction locale immuable et
-idempotente n’est créée qu’après un clic explicite de l’utilisateur. Il ne
-contient aucun transport réseau. Les popups V3 servent uniquement à attirer
-l’attention et ne proposent aucune exécution.
+idempotente n’est créée qu’après un clic explicite de l’utilisateur. Le Core
+la publie une seule fois sur la session MQTT déjà connectée, sans persistance
+de file : une coupure annule la demande au lieu de la rejouer. Les popups V3
+servent uniquement à attirer l’attention et ne proposent aucune exécution.
 
 ## Détection
 

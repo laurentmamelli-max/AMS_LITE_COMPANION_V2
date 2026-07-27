@@ -48,6 +48,17 @@ G1 X12 Y25
     return out.getvalue()
 
 
+class ManualMQTTStub:
+    """Test double: records the explicit request without opening a socket."""
+
+    def __init__(self):
+        self.sent: list[dict] = []
+
+    def publish_manual_skip(self, payload, *, timeout_seconds=7.0):
+        self.sent.append(payload)
+        return {"status": "published", "published_at": "2026-07-28T00:00:00+0200", "message": "Publié (test)"}
+
+
 class CompanionTests(unittest.TestCase):
     def test_imports_lan_identity_from_bambu_studio_config(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -88,7 +99,7 @@ class CompanionTests(unittest.TestCase):
         self.assertIn("Piece test.stl", objects["944"]["label"])
         self.assertTrue(objects["955"]["protocol_skipped"])
 
-    def test_prepares_a_manual_guardian_exclusion_without_controlling_the_printer(self):
+    def test_sends_a_manual_guardian_exclusion_only_after_explicit_execution(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = ac.Companion(Path(tmp) / "state.json")
             app.state["active_job"] = {
@@ -105,6 +116,48 @@ class CompanionTests(unittest.TestCase):
             self.assertEqual([944], prepared["instruction"]["print"]["obj_list"])
             self.assertEqual("prepared_manually", prepared["status"])
             self.assertEqual(1, len(app.public_state()["autopilot"]["prepared"]))
+            transport = ManualMQTTStub()
+            app.mqtt = transport
+            app.state["printer"].update({"connected": True, "state": "RUNNING"})
+            executed = app.execute_manual_exclusion(result["proposal"]["id"])
+            self.assertEqual("published", executed["transport"]["status"])
+            self.assertEqual([944], transport.sent[0]["print"]["obj_list"])
+            self.assertEqual("published", app.public_state()["autopilot"]["dispatches"][0]["status"])
+            with self.assertRaisesRegex(ValueError, "déjà"):
+                app.execute_manual_exclusion(result["proposal"]["id"])
+            self.assertEqual(1, len(transport.sent))
+
+    def test_manual_mqtt_packet_is_single_object_and_cannot_survive_a_disconnect(self):
+        class SocketRecorder:
+            def __init__(self):
+                self.packets = []
+
+            def sendall(self, packet):
+                self.packets.append(packet)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            mqtt = app.mqtt
+            done = threading.Event()
+            request = {
+                "payload": {"print": {"sequence_id": "0", "command": "skip_objects", "obj_list": [944]}},
+                "done": done, "created_at": time.monotonic(), "cancelled": False,
+            }
+            mqtt.manual_commands.put(request)
+            socket_recorder = SocketRecorder()
+            mqtt._drain_manual_commands(socket_recorder, "device/test/request")
+            self.assertTrue(done.is_set())
+            self.assertEqual("published", request["result"]["status"])
+            self.assertEqual(1, len(socket_recorder.packets))
+            self.assertEqual(0x30, socket_recorder.packets[0][0])
+            self.assertIn(b'"command":"skip_objects"', socket_recorder.packets[0])
+
+            pending = {"done": threading.Event(), "cancelled": False}
+            mqtt.manual_commands.put(pending)
+            mqtt._cancel_pending_manual_commands("connexion perdue")
+            self.assertTrue(pending["done"].is_set())
+            self.assertTrue(pending["cancelled"])
+            self.assertEqual("connexion perdue", pending["error"])
 
     def test_finish_deducts_once(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -214,7 +267,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("3.0.0", report["application"]["version"])
+            self.assertEqual("3.0.1", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -1040,6 +1093,9 @@ class CompanionTests(unittest.TestCase):
             app.state["active_job"] = {
                 "token": "http-job", "object_map": ac.parse_3mf(sample_mapped_3mf())["object_map"],
             }
+            app.state["printer"].update({"connected": True, "state": "RUNNING"})
+            mqtt_stub = ManualMQTTStub()
+            app.mqtt = mqtt_stub
             proposal = None
             for index in range(3):
                 observed = app.observe_plate_guardian({
@@ -1070,7 +1126,7 @@ class CompanionTests(unittest.TestCase):
                 self.assertIn("Arrêter Companion", html)
                 self.assertIn("Passerelle Bambu Studio", html)
                 self.assertIn("Cartographie G-code", html)
-                self.assertIn("prepareManualExclusion", html)
+                self.assertIn("executeManualExclusion", html)
                 self.assertIn("Gestionnaire de bobines", html)
                 self.assertIn("catalogView=", html)
                 self.assertIn("catalog-table", html)
@@ -1088,10 +1144,17 @@ class CompanionTests(unittest.TestCase):
                 prepared = json.loads(urllib.request.urlopen(prepare_request, timeout=2).read())
                 self.assertEqual([944], prepared["instruction"]["print"]["obj_list"])
                 self.assertEqual("prepared_manually", prepared["status"])
+                execute_request = urllib.request.Request(
+                    base + f"/api/manual-exclusions/proposals/{proposal['id']}/execute",
+                    data=b'{"confirmed":true}', method="POST", headers=headers,
+                )
+                executed = json.loads(urllib.request.urlopen(execute_request, timeout=2).read())
+                self.assertEqual("published", executed["transport"]["status"])
+                self.assertEqual([944], mqtt_stub.sent[0]["print"]["obj_list"])
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("3.0.0", report["application"]["version"])
+                self.assertEqual("3.0.1", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
                 self.assertIn("Poste de supervision", html)
                 self.assertIn("Historique Vision et rapports", html)

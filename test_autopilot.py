@@ -52,6 +52,9 @@ class AutoPilotTests(unittest.TestCase):
             self.assertEqual([944], prepared["instruction"]["print"]["obj_list"])
             self.assertEqual("prepared_manually", prepared["status"])
             self.assertIn("ne l’a pas envoyée", prepared["message"])
+            dispatch = planner.record_dispatch(prepared, published=True, message="Publié après confirmation")
+            self.assertEqual("published", dispatch["status"])
+            self.assertEqual("published", planner.state(guardian, job)["dispatches"][0]["status"])
 
     def test_v23_local_manual_history_is_migrated_without_becoming_an_action(self):
         with tempfile.TemporaryDirectory() as tmp:

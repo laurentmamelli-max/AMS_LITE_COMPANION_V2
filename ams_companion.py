@@ -3,7 +3,8 @@
 
 Uses only the Python standard library.  It reads per-filament ``used_g`` from
 a sliced Bambu/Orca .gcode.3mf and observes RUNNING -> FINISH over the
-printer's local MQTT endpoint.  It never sends print commands.
+printer's local MQTT endpoint.  A single-object exclusion may be published
+only through the explicit, confirmed manual V3 action.
 """
 
 from __future__ import annotations
@@ -58,7 +59,7 @@ EVENTS_FILE = APP_DIR / "events.sqlite3"
 AUTOPILOT_FILE = APP_DIR / "autopilot.sqlite3"
 REPORTS_FILE = APP_DIR / "reports.sqlite3"
 HOST, PORT = "127.0.0.1", 8766
-__version__ = "3.0.0"
+__version__ = "3.0.1"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -1728,6 +1729,8 @@ class LocalMQTT(threading.Thread):
         self.app = app
         self.stop_event = threading.Event()
         self.restart_event = threading.Event()
+        self.connected_event = threading.Event()
+        self.manual_commands: queue.Queue[dict[str, Any]] = queue.Queue()
         self.retry_count = 0
 
     def restart(self) -> None:
@@ -1736,6 +1739,80 @@ class LocalMQTT(threading.Thread):
     def stop(self) -> None:
         self.stop_event.set()
         self.restart_event.set()
+
+    @staticmethod
+    def _validate_manual_skip(payload: dict[str, Any]) -> None:
+        print_payload = payload.get("print") if isinstance(payload, dict) else None
+        object_ids = print_payload.get("obj_list") if isinstance(print_payload, dict) else None
+        if (not isinstance(print_payload, dict) or print_payload.get("command") != "skip_objects"
+                or not isinstance(object_ids, list) or len(object_ids) != 1
+                or not isinstance(object_ids[0], int) or object_ids[0] <= 0):
+            raise ValueError("Instruction d’exclusion manuelle invalide")
+
+    def publish_manual_skip(self, payload: dict[str, Any], *, timeout_seconds: float = 7.0) -> dict[str, Any]:
+        """Queue one confirmed manual request on the current MQTT session only.
+
+        The request is cancelled rather than retained if the current connection
+        drops or does not accept it promptly; a reconnect can never replay a
+        previous human decision.
+        """
+        self._validate_manual_skip(payload)
+        if not self.connected_event.is_set():
+            raise ConnectionError("MQTT n’est pas connecté : aucune exclusion n’a été envoyée")
+        request: dict[str, Any] = {
+            "payload": json.loads(json.dumps(payload)), "done": threading.Event(),
+            "created_at": time.monotonic(), "cancelled": False,
+        }
+        self.manual_commands.put(request)
+        if not request["done"].wait(timeout_seconds):
+            request["cancelled"] = True
+            raise TimeoutError("Envoi MQTT manuel expiré : aucune exclusion n’a été confirmée")
+        if request.get("error"):
+            raise ConnectionError(str(request["error"]))
+        result = request.get("result")
+        if not isinstance(result, dict):
+            raise ConnectionError("Envoi MQTT manuel non confirmé")
+        return result
+
+    @staticmethod
+    def _publish_payload(sock: ssl.SSLSocket, topic: str, payload: dict[str, Any]) -> None:
+        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        packet = mqtt_string(topic) + raw
+        sock.sendall(bytes([0x30]) + encode_varint(len(packet)) + packet)
+
+    def _cancel_pending_manual_commands(self, reason: str) -> None:
+        while True:
+            try:
+                request = self.manual_commands.get_nowait()
+            except queue.Empty:
+                return
+            request["cancelled"] = True
+            request["error"] = reason
+            request["done"].set()
+
+    def _drain_manual_commands(self, sock: ssl.SSLSocket, request_topic: str) -> None:
+        while True:
+            try:
+                request = self.manual_commands.get_nowait()
+            except queue.Empty:
+                return
+            if request.get("cancelled") or time.monotonic() - float(request.get("created_at") or 0) > 10:
+                request["error"] = "Demande manuelle annulée avant envoi"
+                request["done"].set()
+                continue
+            try:
+                payload = request["payload"]
+                self._validate_manual_skip(payload)
+                self._publish_payload(sock, request_topic, payload)
+                request["result"] = {
+                    "status": "published", "published_at": now_iso(),
+                    "message": "Demande d’exclusion envoyée à l’imprimante ; vérifie son état dans Bambu Studio.",
+                }
+                log("Exclusion manuelle publiée sur MQTT à la demande de l’utilisateur")
+            except Exception as exc:
+                request["error"] = f"Envoi MQTT manuel échoué : {exc}"
+            finally:
+                request["done"].set()
 
     def run(self) -> None:
         delay = 2
@@ -1771,7 +1848,9 @@ class LocalMQTT(threading.Thread):
             sock = context.wrap_socket(raw, server_hostname=cfg.ip)
             fingerprint = hashlib.sha256(sock.getpeercert(binary_form=True)).hexdigest()
             self.app.verify_or_remember_mqtt_certificate(fingerprint)
-            sock.settimeout(5)
+            # Keep command responsiveness bounded without changing the normal
+            # MQTT keepalive behaviour.  Manual requests are never deferred.
+            sock.settimeout(1)
             client_id = f"ams-companion-{os.getpid()}-{int(time.time())}"
             payload = mqtt_string(client_id) + mqtt_string("bblp") + mqtt_string(cfg.access_code)
             variable = mqtt_string("MQTT") + bytes([4, 0xC2]) + struct.pack("!H", 30)
@@ -1788,16 +1867,16 @@ class LocalMQTT(threading.Thread):
         # publication target for pushall.
             sub = struct.pack("!H", 1) + mqtt_string(report_topic) + b"\x00"
             sock.sendall(bytes([0x82]) + encode_varint(len(sub)) + sub)
-            request = json.dumps({"pushing": {"sequence_id": "1", "command": "pushall"}}, separators=(",", ":")).encode()
-            publish = mqtt_string(request_topic) + request
-            sock.sendall(bytes([0x30]) + encode_varint(len(publish)) + publish)
+            self._publish_payload(sock, request_topic, {"pushing": {"sequence_id": "1", "command": "pushall"}})
             self.app.set_connected(True)
+            self.connected_event.set()
             log(f"MQTT connecté à {cfg.ip} ({cfg.serial})")
             if self.retry_count:
                 log(f"MQTT reconnecté après {self.retry_count} tentative(s)")
                 self.retry_count = 0
             last_ping = time.monotonic()
             while not self.stop_event.is_set() and not self.restart_event.is_set():
+                self._drain_manual_commands(sock, request_topic)
                 try:
                     first = sock.recv(1)
                     if not first:
@@ -1827,6 +1906,8 @@ class LocalMQTT(threading.Thread):
                     last_ping = time.monotonic()
             self.restart_event.clear()
         finally:
+            self.connected_event.clear()
+            self._cancel_pending_manual_commands("Connexion MQTT interrompue : demande manuelle annulée")
             self.app.set_connected(False)
             try:
                 raw.close()
@@ -2193,6 +2274,43 @@ class Companion:
             self.guardian.state(),
             self.state.get("active_job"),
         )
+
+    def execute_manual_exclusion(self, proposal_id: str) -> dict[str, Any]:
+        """Publish one user-confirmed, canonical object exclusion exactly once.
+
+        This method is reachable only from the explicit manual dashboard route.
+        It refuses stale, unmapped, disconnected or non-running prints and never
+        retries a transport failure in the background.
+        """
+        with self.lock:
+            printer = self.state.get("printer") or {}
+            if not printer.get("connected"):
+                raise ConnectionError("Imprimante MQTT non connectée : exclusion non envoyée")
+            if str(printer.get("state") or "").upper() not in RUNNING:
+                raise ValueError("L’exclusion manuelle est disponible uniquement pendant une impression active")
+            instruction = self.autopilot.prepare_manual(
+                proposal_id,
+                self.guardian.state(),
+                self.state.get("active_job"),
+            )
+        if not self.autopilot.claim_dispatch(instruction):
+            raise ValueError("Cette exclusion manuelle est déjà en cours ou a déjà été envoyée")
+        try:
+            transport = self.mqtt.publish_manual_skip(instruction["instruction"])
+        except Exception as exc:
+            self.autopilot.record_dispatch(instruction, published=False, message=str(exc))
+            self.autopilot.release_dispatch_claim(instruction)
+            raise
+        dispatch = self.autopilot.record_dispatch(
+            instruction, published=True, message=str(transport.get("message") or "Demande MQTT publiée"),
+        )
+        return {
+            "ok": True, "instruction": instruction, "transport": transport, "dispatch": dispatch,
+            "message": (
+                "Demande d’exclusion envoyée. Vérifie la prise en compte dans Bambu Studio ; "
+                "Companion ne relancera jamais cette demande automatiquement."
+            ),
+        }
 
     def mqtt_config(self) -> MQTTConfig:
         with self.lock:
@@ -3364,6 +3482,11 @@ class Handler(BaseHTTPRequestHandler):
             elif match := re.fullmatch(r"/api/manual-exclusions/proposals/([a-f0-9]{32})/prepare", path):
                 self.json_body()
                 self.send_json(self.app.prepare_manual_exclusion(match.group(1)))
+            elif match := re.fullmatch(r"/api/manual-exclusions/proposals/([a-f0-9]{32})/execute", path):
+                confirmation = self.json_body()
+                if confirmation.get("confirmed") is not True:
+                    raise ValueError("Confirmation manuelle explicite requise pour exclure un objet")
+                self.send_json(self.app.execute_manual_exclusion(match.group(1)))
             elif path == "/api/reports/snapshot":
                 self.json_body()
                 self.send_json(self.app.archive_supervision_report())
@@ -3385,7 +3508,7 @@ HTML = r'''<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name
 body.embedded .spools-card{order:1!important}body.embedded .printer-card{order:2!important}.inventory-card{display:none}.catalog-fields{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.catalog-actions button{width:100%}#catalogWindow{display:none}.catalog-window{max-width:1400px;margin:auto}.catalog-toolbar{display:flex;justify-content:space-between;align-items:end;gap:18px}.catalog-toolbar h2{font-size:24px;margin:0}.table-wrap{overflow:auto;border:1px solid #dfe3e7;border-radius:12px;background:white}.catalog-table{width:100%;border-collapse:collapse;min-width:1120px}.catalog-table th{background:#f0f3f5;color:#4e5863;text-align:left;font-size:12px;white-space:nowrap}.catalog-table th,.catalog-table td{padding:9px;border-bottom:1px solid #e7eaed;vertical-align:middle}.catalog-table tr:last-child td{border-bottom:0}.catalog-table tr[data-spool]{cursor:pointer}.catalog-table tr.selected td{background:#eaf8ef}.catalog-table input,.catalog-table select{min-width:90px;padding:7px;border:1px solid transparent;background:transparent;border-radius:6px}.catalog-table input:focus,.catalog-table select:focus{background:white;border-color:#00ae42;outline:none}.catalog-table .id-cell{color:#69717b;font-variant-numeric:tabular-nums}.catalog-table .actions{white-space:nowrap}.catalog-table .actions button{margin:0 3px 0 0;padding:8px 10px;font-size:12px}.catalog-add{display:grid;grid-template-columns:1.5fr repeat(3,1fr) .8fr .8fr .9fr auto;gap:8px;align-items:end;margin-top:14px;padding:14px;background:white;border:1px solid #dfe3e7;border-radius:12px}.catalog-add label{margin-top:0}.spool-timeline{margin-top:16px;padding:16px;background:white;border:1px solid #dfe3e7;border-radius:12px}.spool-timeline h3{margin:0 0 4px}.timeline{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(170px,1fr);gap:12px;overflow-x:auto;padding:26px 4px 6px;position:relative}.timeline:before{content:'';position:absolute;left:26px;right:26px;top:34px;height:3px;background:#cdebd8}.timeline-event{position:relative;z-index:1;padding-top:20px}.timeline-dot{position:absolute;top:0;left:12px;width:18px;height:18px;border-radius:50%;background:#00ae42;border:4px solid #eaf8ef}.timeline-event.remove .timeline-dot{background:#ef9b20}.timeline-event.deduct .timeline-dot{background:#3976db}.timeline-event .when{font-size:11px;color:#69717b}.timeline-event .what{font-weight:700;font-size:13px;margin:5px 0}.timeline-event .detail{font-size:12px;color:#505861}.timeline-empty{color:#69717b;padding:16px 0}body.catalog-view .wrap{max-width:none;padding:20px}body.catalog-view h1,body.catalog-view .sub,body.catalog-view .grid{display:none}body.catalog-view #catalogWindow{display:block}@media(max-width:700px){.catalog-fields{grid-template-columns:1fr 1fr}.catalog-add{grid-template-columns:1fr 1fr}}
 .catalog-summary{margin:16px 0}.catalog-summary h3{margin:0 0 8px}.summary-table{min-width:720px}.level-track{width:130px;height:8px;background:#e8edf0;border-radius:99px;overflow:hidden;margin-top:4px}.level-fill{height:100%;background:#00a23d;border-radius:99px}.weight-chart{margin:14px 0 4px;padding:12px;border:1px solid #e7eaed;border-radius:10px;background:#fbfcfc}.weight-chart h4{margin:0 0 4px}.weight-chart svg{width:100%;height:190px;display:block}.weight-chart .axis{stroke:#dfe3e7;stroke-width:1}.weight-chart .line{fill:none;stroke:#00a23d;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}.weight-chart .point{fill:#fff;stroke:#00a23d;stroke-width:3}.weight-chart .point:hover{fill:#00a23d;cursor:help}.chart-label{font-size:11px;fill:#69717b}.supervision-card{background:linear-gradient(135deg,#f8fcf9,#f2f7f4)}.supervision-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.supervision-head h2{margin-bottom:4px}.supervision-head p{margin:0}.supervision-badge{display:inline-block;padding:6px 10px;border-radius:99px;font-size:12px;font-weight:800;background:#eef1f3;color:#4e5863}.supervision-badge.ok{background:#e3f7ea;color:#087535}.supervision-badge.warning{background:#fff0e7;color:#ad4d18}.supervision-badge.critical{background:#ffe7e5;color:#ad2620}.supervision-badge.offline{background:#ebedf0;color:#59636e}.supervision-grid{display:grid;grid-template-columns:repeat(3,minmax(180px,1fr));gap:10px;margin-top:14px}.supervision-item{border:1px solid #dfe6e1;border-left:4px solid #88939d;border-radius:10px;padding:11px;background:#fff}.supervision-item.ok{border-left-color:#00a23d}.supervision-item.warning{border-left-color:#e28a20}.supervision-item.critical{border-left-color:#cc3a32}.supervision-item.offline{border-left-color:#7b8691}.supervision-item b{display:block;font-size:13px;margin-bottom:4px}.supervision-item span{display:block;color:#59636e;font-size:12px;line-height:1.35}.supervision-meta{display:flex;flex-wrap:wrap;gap:8px;margin-top:13px}.supervision-meta span{background:#eef2f3;border-radius:7px;padding:6px 8px;font-size:12px;color:#4e5863}.report-list{display:grid;gap:9px}.report-item{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:center;border-top:1px solid #e5e9e7;padding:10px 0}.report-item:first-child{border-top:0;padding-top:0}.report-item b{display:block;font-size:13px}.report-item span{font-size:12px;color:#69717b}.report-item button{margin:0}.vision-history{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}.vision-history span{padding:5px 8px;border-radius:7px;background:#f1f4f3;font-size:12px;color:#55616a}@media(max-width:700px){.supervision-grid{grid-template-columns:1fr 1fr}.supervision-head{align-items:flex-start}.report-item{grid-template-columns:1fr}}
 :root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#20242a;background:#f4f5f6}body{margin:0}.wrap{max-width:1050px;margin:auto;padding:24px}h1{margin:0 0 4px}.sub{color:#69717b;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}.card{background:white;border:1px solid #dfe3e7;border-radius:14px;padding:18px;box-shadow:0 2px 10px #0000000b}.wide{grid-column:1/-1}h2{font-size:17px;margin:0 0 14px}label{display:block;font-size:12px;color:#656d76;margin:9px 0 4px}input,select,button{box-sizing:border-box;border:1px solid #cbd1d7;border-radius:8px;padding:9px;font:inherit}input,select{width:100%}input[type=checkbox]{width:auto;margin-right:7px}button{background:#00ae42;color:white;border:0;font-weight:600;cursor:pointer;margin-top:12px}button.secondary{background:#59636e}.status{display:inline-flex;gap:7px;align-items:center;font-weight:600}.dot{width:10px;height:10px;border-radius:50%;background:#d33}.on .dot{background:#00ae42}.spools{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.spool{padding:12px;border:1px solid #e1e4e7;border-radius:10px}.spool b{color:#00a23d}.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.bridge-map,.catalog-form{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.catalog{display:grid;grid-template-columns:1fr 160px;gap:12px;align-items:end;border-top:1px solid #eee;padding:12px 0}.catalog:first-child{border-top:0;padding-top:0}.check{font-size:14px;color:#20242a}.notice{padding:10px;border-radius:8px;background:#eef8f1;margin:10px 0}.guardian-alert{background:#fff4e9;color:#8a3d00}.guardian-actions{display:flex;gap:8px;flex-wrap:wrap}.guardian-actions button{margin-top:8px}.object-map{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}.object-chip{border:1px solid #dfe3e7;border-radius:8px;padding:9px;font-size:12px;overflow-wrap:anywhere}.object-chip b{color:#0b6d32}.object-chip span{color:#69717b}.error{background:#ffecec;color:#a11}.muted{color:#69717b;font-size:13px;overflow-wrap:anywhere}.line{display:grid;grid-template-columns:1fr 100px 90px;gap:8px;align-items:end}.history{font-size:13px;border-top:1px solid #eee;padding:8px 0}body.embedded .wrap{padding:10px;max-width:none}body.embedded h1,body.embedded .sub,body.embedded .manual-card,body.embedded .shutdown-card,body.embedded .inventory-card{display:none}body.embedded .grid{grid-template-columns:1fr;gap:10px}body.embedded .wide{grid-column:auto}body.embedded .card{padding:14px;border-radius:10px;box-shadow:none}body.embedded .spools-card{order:1}body.embedded .printer-card{order:2}body.embedded .bridge-card{order:3}body.embedded .guardian-card{order:4}body.embedded .gcode-card{order:5}body.embedded .history-card{order:6}@media(max-width:700px){.spools,.bridge-map,.catalog-form{grid-template-columns:1fr 1fr}.catalog{grid-template-columns:1fr}.line{grid-template-columns:1fr}.wrap{padding:12px}}</style></head><body><div class="wrap">
-<h1>AMS Lite Companion V2</h1><div class="sub">Compteur local v3.0.0 — alertes locales uniquement, sans action imprimante.</div><div id="msg"></div>
+<h1>AMS Lite Companion V2</h1><div class="sub">Compteur local v3.0.1 — alertes locales, exclusion uniquement manuelle et confirmée.</div><div id="msg"></div>
 <div class="grid"><section class="card printer-card"><h2>Imprimante locale</h2><div id="conn" class="status"><span class="dot"></span><span>Déconnectée</span></div><div id="pstate"></div>
 <label>Adresse IP</label><input id="ip" placeholder="192.168.1.50"><label>Numéro de série</label><input id="serial" placeholder="01S00A..."><label>Code d’accès LAN <span class="muted">(laisse vide pour conserver le code enregistré)</span></label><input id="code" type="password" placeholder="8 chiffres"><button onclick="saveConfig()">Enregistrer et connecter</button></section>
 <section class="card bridge-card"><h2>Passerelle Bambu Studio</h2><div id="bridgeStatus" class="notice">En attente de Bambu Studio</div><label class="check"><input id="autoEnabled" type="checkbox">Récupérer automatiquement le .gcode.3mf</label><label class="check"><input id="fallbackEnabled" type="checkbox">Armer avec la correspondance A1–A4 enregistrée ci-dessous</label><div class="bridge-map" id="bridgeMap"></div><button onclick="saveBridge()">Enregistrer la passerelle</button><div id="bridgeDetails" class="muted"></div></section>
@@ -3433,8 +3556,9 @@ async function saveConfig(){try{await api('/api/config',{method:'POST',body:JSON
 async function saveBridge(){let m={};for(let i=1;i<=4;i++)m[i]=$('bm'+i).value;try{await api('/api/bridge',{method:'POST',body:JSON.stringify({enabled:$('autoEnabled').checked,fallback_enabled:$('fallbackEnabled').checked,default_mapping:m})});formDirty=false;msg('Passerelle enregistrée.');refresh()}catch(e){msg(e.message,true)}}
 async function saveSpools(){let x={};for(let i=1;i<=4;i++)if(S.spools[i]?.spool_id)x[i]={name:$('n'+i).value,initial_g:+$('i'+i).value,remaining_g:+$('r'+i).value};try{await api('/api/spools',{method:'POST',body:JSON.stringify(x)});formDirty=false;msg('Poids enregistrés.');refresh()}catch(e){msg(e.message,true)}}
 async function decideGuardian(id,decision){try{await api('/api/guardian/proposals/'+id+'/decision',{method:'POST',body:JSON.stringify({decision})});msg('Décision enregistrée. Aucune commande n’a été envoyée à l’imprimante.');refresh()}catch(e){msg(e.message,true)}}
-async function prepareManualExclusion(id){if(!confirm('Préparer cette exclusion manuelle ? Companion ne l’enverra pas à l’imprimante.'))return;try{let prepared=await api('/api/manual-exclusions/proposals/'+id+'/prepare',{method:'POST',body:'{}'});msg(prepared.message||'Exclusion manuelle préparée localement.');refresh()}catch(e){msg(e.message,true)}}
-async function prepareExclusion(id){return prepareManualExclusion(id)}
+async function executeManualExclusion(id){if(!confirm('Exclure réellement cet objet de l’impression en cours ? Cette demande est envoyée une seule fois à l’imprimante et ne peut pas être annulée par Companion.'))return;try{let result=await api('/api/manual-exclusions/proposals/'+id+'/execute',{method:'POST',body:JSON.stringify({confirmed:true})});msg(result.message||'Demande d’exclusion envoyée. Vérifie Bambu Studio.');refresh()}catch(e){msg(e.message,true)}}
+async function prepareManualExclusion(id){return executeManualExclusion(id)}
+async function prepareExclusion(id){return executeManualExclusion(id)}
 async function createSpool(){try{await api('/api/inventory/spools',{method:'POST',body:JSON.stringify({name:$('newSpoolName').value,material:$('newSpoolMaterial').value,brand:$('newSpoolBrand').value,color:$('newSpoolColor').value,initial_g:+$('newSpoolInitial').value,remaining_g:+$('newSpoolRemaining').value,created_at:$('newSpoolDate').value})});['newSpoolName','newSpoolMaterial','newSpoolBrand','newSpoolColor'].forEach(id=>$(id).value='');delete $('newSpoolName').dataset.custom;formDirty=false;catalogLoaded=false;msg('Bobine ajoutée au catalogue. Choisis maintenant sa voie AMS.');refresh()}catch(e){msg(e.message,true)}}
 async function saveCatalogSpool(id,event){event?.stopPropagation();let slot=$('catalogSlot'+id).value;try{await api('/api/inventory/spools/'+id,{method:'POST',body:JSON.stringify({name:$('cn'+id).value,material:$('cm'+id).value,brand:$('cb'+id).value,color:$('cc'+id).value,initial_g:+$('ci'+id).value,remaining_g:+$('cr'+id).value,created_at:$('cd'+id).value})});let placement=await api('/api/inventory/assign',{method:'POST',body:JSON.stringify({spool_id:id,slot})});formDirty=false;catalogLoaded=false;msg(placement.message||'Bobine enregistrée.');refresh()}catch(e){msg(e.message,true)}}
 async function deleteSpool(id,event){event?.stopPropagation();if(pendingDeleteId!==id){pendingDeleteId=id;event.currentTarget.textContent='Confirmer';msg('Clique encore sur Confirmer pour supprimer définitivement cette bobine et son historique.');return}try{let result=await api('/api/inventory/spools/'+id+'/delete',{method:'POST',body:'{}'});pendingDeleteId=null;if(selectedSpoolId===id){selectedSpoolId=null;$('timelineTitle').textContent='Historique de la bobine';$('timelineSummary').textContent='Clique une ligne du catalogue pour afficher sa frise chronologique.';$('timeline').className='timeline-empty';$('timeline').textContent='Aucune bobine sélectionnée.'}formDirty=false;catalogLoaded=false;msg(result.message||'Bobine supprimée.');refresh()}catch(e){msg(e.message,true)}}
@@ -3476,7 +3600,7 @@ async function discoverVision(){try{let result=await api('/api/camera/discover',
 if(visionView){let button=document.createElement('button');button.className='secondary';button.textContent='Détecter la caméra';button.onclick=discoverVision;$('visionFingerprint').before(button)}
 if(visionView){clearInterval(refreshTimer);document.body.innerHTML='<main class="wrap"><h1>Centre Vision</h1><p class="sub">Surveillance locale : aucune commande n’est envoyée à l’imprimante.</p><section class="card"><div id="visionStatus" class="notice">Chargement…</div><label class="check"><input id="visionEnabled" type="checkbox">Activer les captures automatiques</label><label>Empreinte TLS de la caméra</label><input id="visionFingerprint" placeholder="64 caractères hexadécimaux"><button onclick="saveVision()">Enregistrer la configuration</button><p id="visionMeta" class="muted"></p></section><section class="card wide"><h2>Captures</h2><div id="visionGallery" class="vision-gallery"></div></section></main>';let style=document.createElement('style');style.textContent='.vision-gallery{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.vision-gallery article{border:1px solid #dfe3e7;padding:12px;border-radius:8px}.vision-gallery code{font-size:11px;overflow-wrap:anywhere}';document.head.append(style);api('/api/state').then(renderVision).catch(e=>{$('visionStatus').textContent=e.message})}else{let dashboardRender=render;render=function(s){dashboardRender(s);let host=document.querySelector(".spools-card");if(host&&!$('openVisionButton')){let button=document.createElement('button');button.id='openVisionButton';button.className='secondary';button.textContent='Ouvrir le centre Vision…';button.onclick=openVision;host.append(button)}}}
 if(!visionView){let removeLegacyVisionButton=render;render=function(s){removeLegacyVisionButton(s);$('openVisionButton')?.remove()}}
-const v3AlertStyle=document.createElement('style');v3AlertStyle.textContent='.alert-modal{position:fixed;inset:0;z-index:30;display:grid;place-items:center;padding:20px;background:#15201980}.alert-modal[hidden]{display:none}.alert-dialog{width:min(480px,calc(100vw - 40px));background:#fff;border-radius:14px;padding:22px;box-shadow:0 18px 60px #0006;border-top:5px solid #c84237}.alert-dialog h2{margin:0 0 9px}.alert-dialog p{line-height:1.45}.alert-dialog .muted{margin-top:12px}.alert-dialog button{margin:8px 8px 0 0}';document.head.append(v3AlertStyle);let v3SeenAlertIds=new Set();function dismissV3Alert(){let modal=$('v3AlertModal');if(modal)modal.hidden=true}function renderV3Alerts(s){if(visionView)return;let guardian=s.guardian||{},pending=guardian.pending_proposals||[],autopilot=s.autopilot||{},pilotAlerts=autopilot.alerts||[];if(pending.length){let proposal=pending[0],plan=(autopilot.plans||[]).find(item=>item.proposal_id===proposal.id),manual=plan?.status==='ready_for_manual_preparation';$('guardianStatus').className='notice guardian-alert';$('guardianStatus').textContent=`Alerte ${proposal.defect_type||'anomalie'} à vérifier : ${proposal.object_label} (${proposal.evidence_count} images, confiance ${Math.round(100*proposal.confidence)} %)`;$('guardianDetails').innerHTML=`Alerte humaine : Companion n’envoie jamais de commande automatiquement.<div class="guardian-actions">${manual?`<button class="secondary" onclick="prepareManualExclusion('${proposal.id}')">Préparer l’exclusion manuelle</button>`:'<span class="muted">Exclusion manuelle indisponible : objet ou travail non vérifié.</span>'}<button class="secondary" onclick="decideGuardian('${proposal.id}','continue')">Continuer à surveiller</button><button class="secondary" onclick="decideGuardian('${proposal.id}','dismiss')">Écarter l’alerte</button></div>`}$('autopilot').textContent=pilotAlerts.length?`${pilotAlerts.length} alerte(s) à examiner. Une exclusion reste une décision manuelle explicite et n’est jamais envoyée par Companion.`:(autopilot.capability?.reason||'Mode alerte uniquement.');let alerts=Array.isArray(s.alerts)?s.alerts:[],next=alerts.find(alert=>alert&&alert.id&&!v3SeenAlertIds.has(alert.id));if(!next)return;v3SeenAlertIds.add(next.id);let modal=$('v3AlertModal');if(!modal){modal=document.createElement('div');modal.id='v3AlertModal';modal.className='alert-modal';modal.innerHTML='<section class="alert-dialog" role="alertdialog" aria-modal="true"><h2 id="v3AlertTitle"></h2><p id="v3AlertMessage"></p><p class="muted">Vérifie l’impression puis décide manuellement dans le Gardien. Aucune commande n’est envoyée à l’imprimante.</p><button class="secondary" onclick="dismissV3Alert()">J’ai compris</button></section>';document.body.append(modal)}$('v3AlertTitle').textContent=next.title||'Alerte Companion';$('v3AlertMessage').textContent=next.message||'Vérifie l’impression.';modal.hidden=false}if(!visionView){let v3AlertRender=render;render=function(s){v3AlertRender(s);renderV3Alerts(s)}}
+const v3AlertStyle=document.createElement('style');v3AlertStyle.textContent='.alert-modal{position:fixed;inset:0;z-index:30;display:grid;place-items:center;padding:20px;background:#15201980}.alert-modal[hidden]{display:none}.alert-dialog{width:min(480px,calc(100vw - 40px));background:#fff;border-radius:14px;padding:22px;box-shadow:0 18px 60px #0006;border-top:5px solid #c84237}.alert-dialog h2{margin:0 0 9px}.alert-dialog p{line-height:1.45}.alert-dialog .muted{margin-top:12px}.alert-dialog button{margin:8px 8px 0 0}';document.head.append(v3AlertStyle);let v3SeenAlertIds=new Set();function dismissV3Alert(){let modal=$('v3AlertModal');if(modal)modal.hidden=true}function renderV3Alerts(s){if(visionView)return;let guardian=s.guardian||{},pending=guardian.pending_proposals||[],autopilot=s.autopilot||{},pilotAlerts=autopilot.alerts||[],canSend=!!(s.printer?.connected&&['RUNNING','PRINTING','PREPARE','PREPARING','SLICING'].includes(String(s.printer?.state||'').toUpperCase()));if(pending.length){let proposal=pending[0],plan=(autopilot.plans||[]).find(item=>item.proposal_id===proposal.id),manual=plan?.status==='ready_for_manual_preparation'&&canSend;$('guardianStatus').className='notice guardian-alert';$('guardianStatus').textContent=`Alerte ${proposal.defect_type||'anomalie'} à vérifier : ${proposal.object_label} (${proposal.evidence_count} images, confiance ${Math.round(100*proposal.confidence)} %)`;$('guardianDetails').innerHTML=`Alerte humaine : aucun envoi automatique n’est possible.<div class="guardian-actions">${manual?`<button class="secondary" onclick="executeManualExclusion('${proposal.id}')">Exclure réellement cet objet…</button>`:'<span class="muted">Exclusion manuelle disponible seulement pendant une impression MQTT connectée, avec objet vérifié.</span>'}<button class="secondary" onclick="decideGuardian('${proposal.id}','continue')">Continuer à surveiller</button><button class="secondary" onclick="decideGuardian('${proposal.id}','dismiss')">Écarter l’alerte</button></div>`}$('autopilot').textContent=pilotAlerts.length?`${pilotAlerts.length} alerte(s) à examiner. L’exclusion nécessite un clic volontaire, une confirmation puis une connexion MQTT active.`:(autopilot.capability?.reason||'Mode alerte uniquement.');let alerts=Array.isArray(s.alerts)?s.alerts:[],next=alerts.find(alert=>alert&&alert.id&&!v3SeenAlertIds.has(alert.id));if(!next)return;v3SeenAlertIds.add(next.id);let modal=$('v3AlertModal');if(!modal){modal=document.createElement('div');modal.id='v3AlertModal';modal.className='alert-modal';modal.innerHTML='<section class="alert-dialog" role="alertdialog" aria-modal="true"><h2 id="v3AlertTitle"></h2><p id="v3AlertMessage"></p><p class="muted">Vérifie l’impression puis décide manuellement dans le Gardien. Ce popup ne peut envoyer aucune commande.</p><button class="secondary" onclick="dismissV3Alert()">J’ai compris</button></section>';document.body.append(modal)}$('v3AlertTitle').textContent=next.title||'Alerte Companion';$('v3AlertMessage').textContent=next.message||'Vérifie l’impression.';modal.hidden=false}if(!visionView){let v3AlertRender=render;render=function(s){v3AlertRender(s);renderV3Alerts(s)}}
 </script></body></html>'''
 
 
