@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.0.0 — 2026-07-28
+
+- V3 adopte un fonctionnement **alertes uniquement** : une détection Vision
+  confirmée apparaît dans le tableau de bord et dans une notification macOS
+  locale, dédupliquée pendant la session. Aucun de ces mécanismes ne prépare
+  ou n’envoie une commande à l’imprimante.
+- L’exclusion d’un objet est conservée comme décision manuelle explicite. Le
+  tableau de bord permet de préparer une instruction unitaire canonique après
+  confirmation ; elle est journalisée localement et Companion ne la transmet
+  jamais à l’imprimante.
+- Les préparations locales V2.3 existantes sont migrées dans cet historique
+  manuel, sans jamais être exécutées pendant la mise à niveau.
+
 ## 2.5.0 — 2026-07-28
 
 - Historique Vision/Gardien enrichi par type de défaut et état de décision,

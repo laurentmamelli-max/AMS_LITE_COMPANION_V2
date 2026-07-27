@@ -88,7 +88,7 @@ class CompanionTests(unittest.TestCase):
         self.assertIn("Piece test.stl", objects["944"]["label"])
         self.assertTrue(objects["955"]["protocol_skipped"])
 
-    def test_prepares_a_guardian_exclusion_without_controlling_the_printer(self):
+    def test_prepares_a_manual_guardian_exclusion_without_controlling_the_printer(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = ac.Companion(Path(tmp) / "state.json")
             app.state["active_job"] = {
@@ -99,9 +99,11 @@ class CompanionTests(unittest.TestCase):
                     "object_id": "944", "object_label": "Piece test", "confidence": 0.95,
                     "source": "test", "frame_sha256": f"{index:064x}",
                 })
-            prepared = app.prepare_autopilot_exclusion(result["proposal"]["id"])
-            self.assertEqual([944], prepared["command"]["print"]["obj_list"])
-            self.assertEqual("prepared", prepared["status"])
+            state = app.public_state()
+            self.assertEqual("notify_only", state["autopilot"]["alerts"][0]["action"])
+            prepared = app.prepare_manual_exclusion(result["proposal"]["id"])
+            self.assertEqual([944], prepared["instruction"]["print"]["obj_list"])
+            self.assertEqual("prepared_manually", prepared["status"])
             self.assertEqual(1, len(app.public_state()["autopilot"]["prepared"]))
 
     def test_finish_deducts_once(self):
@@ -212,7 +214,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("2.5.0", report["application"]["version"])
+            self.assertEqual("3.0.0", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -1068,7 +1070,7 @@ class CompanionTests(unittest.TestCase):
                 self.assertIn("Arrêter Companion", html)
                 self.assertIn("Passerelle Bambu Studio", html)
                 self.assertIn("Cartographie G-code", html)
-                self.assertIn("prepareExclusion", html)
+                self.assertIn("prepareManualExclusion", html)
                 self.assertIn("Gestionnaire de bobines", html)
                 self.assertIn("catalogView=", html)
                 self.assertIn("catalog-table", html)
@@ -1080,16 +1082,16 @@ class CompanionTests(unittest.TestCase):
                 self.assertIn(server.api_token, html)
                 self.assertEqual(1000, state["spools"]["1"]["remaining_g"])
                 prepare_request = urllib.request.Request(
-                    base + f"/api/autopilot/proposals/{proposal['id']}/prepare",
+                    base + f"/api/manual-exclusions/proposals/{proposal['id']}/prepare",
                     data=b"{}", method="POST", headers=headers,
                 )
                 prepared = json.loads(urllib.request.urlopen(prepare_request, timeout=2).read())
-                self.assertEqual([944], prepared["command"]["print"]["obj_list"])
-                self.assertEqual("prepared", prepared["status"])
+                self.assertEqual([944], prepared["instruction"]["print"]["obj_list"])
+                self.assertEqual("prepared_manually", prepared["status"])
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("2.5.0", report["application"]["version"])
+                self.assertEqual("3.0.0", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
                 self.assertIn("Poste de supervision", html)
                 self.assertIn("Historique Vision et rapports", html)

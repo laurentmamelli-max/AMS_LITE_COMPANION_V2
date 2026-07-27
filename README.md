@@ -29,8 +29,11 @@ estimations et peuvent être corrigés manuellement après une pesée.
 
 - application native macOS avec un Centre Vision indépendant ;
 - captures caméra locales toutes les cinq couches, regroupées par impression ;
-- cartographie des objets Bambu Studio et préparation locale, unitaire et
-  journalisée d’une exclusion ; aucune commande n’est envoyée à l’imprimante ;
+- cartographie des objets Bambu Studio, alertes Vision locales et exclusion
+  unitaire préparée uniquement après un choix manuel ; aucune commande n’est
+  envoyée à l’imprimante ;
+- popups locaux dédupliqués pour les alertes Vision confirmées, sans action
+  automatique ni bouton de commande dans la notification ;
 - journal durable des événements MQTT importants, conservé après redémarrage ;
 - poste de supervision qui explique l’état de l’imprimante, Vision, MQTT,
   Gardien, AutoPilot et cartographie sans jamais commander l’imprimante ;

@@ -1,8 +1,9 @@
-"""Auditable single-object exclusion preparation for Bambu prints.
+"""V3 safety policy: alerts first, manual exclusion only on explicit request.
 
-V2.3 prepares the exact local MQTT command but does not publish it.  A future
-physical actuator must explicitly consume this journal after hardware
-validation; planning alone never controls a printer.
+AutoPilot never publishes to a printer.  A user may explicitly prepare one
+canonical Bambu ``skip_objects`` instruction from the dashboard, where it is
+stored locally for review.  No popup, detector, timer or background task can
+call that path.
 """
 
 from __future__ import annotations
@@ -17,12 +18,12 @@ from typing import Any
 
 
 def skip_objects_payload(object_ids: list[int], *, timestamp: int | None = None) -> dict[str, Any]:
-    """Build the documented local MQTT request without any transport side effect."""
+    """Build one locally stored manual instruction, with no transport side effect."""
     ids = sorted({int(value) for value in object_ids})
     if not ids or any(value <= 0 for value in ids):
         raise ValueError("Au moins un identifiant d’objet Bambu positif est requis")
     if len(ids) != 1:
-        raise ValueError("V2.3 prépare exclusivement une exclusion unitaire")
+        raise ValueError("Une exclusion manuelle ne peut viser qu’un seul objet")
     return {
         "print": {
             "sequence_id": "0",
@@ -34,12 +35,16 @@ def skip_objects_payload(object_ids: list[int], *, timestamp: int | None = None)
 
 
 class AutoPilotPlanner:
+    """Build reviewable alerts and opt-in manual exclusion instructions only."""
+
     capability = {
-        "mode": "prepared_command_only",
+        "mode": "alert_only_with_manual_exclusion",
         "enabled": False,
+        "manual_exclusion_available": True,
         "reason": (
-            "V2.3 prépare et journalise une exclusion unitaire, mais ne publie aucune "
-            "commande tant que le protocole n’est pas validé sur l’imprimante ciblée."
+            "V3 n’automatise aucune décision : les alertes demandent une vérification. "
+            "L’exclusion ne peut être préparée que manuellement depuis le tableau de bord "
+            "et n’est jamais envoyée par Companion."
         ),
     }
 
@@ -60,18 +65,34 @@ class AutoPilotPlanner:
         with self._connect() as connection:
             connection.executescript(
                 """
-                CREATE TABLE IF NOT EXISTS autopilot_plans (
+                CREATE TABLE IF NOT EXISTS manual_exclusions (
                     id TEXT PRIMARY KEY,
                     proposal_id TEXT NOT NULL UNIQUE,
                     job_token TEXT NOT NULL,
                     object_id TEXT NOT NULL,
                     protocol_object_id INTEGER NOT NULL,
-                    command_json TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK(status IN ('prepared')),
+                    instruction_json TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('prepared_manually')),
                     created_at REAL NOT NULL
                 );
                 """
             )
+            # V2.3 stored locally prepared, never-published instructions in
+            # ``autopilot_plans``.  Preserve them when upgrading so the manual
+            # audit history is not silently lost.
+            legacy = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'autopilot_plans'"
+            ).fetchone()
+            if legacy:
+                connection.execute(
+                    """INSERT OR IGNORE INTO manual_exclusions(
+                           id, proposal_id, job_token, object_id, protocol_object_id,
+                           instruction_json, status, created_at
+                       )
+                       SELECT id, proposal_id, job_token, object_id, protocol_object_id,
+                              command_json, 'prepared_manually', created_at
+                       FROM autopilot_plans"""
+                )
 
     @staticmethod
     def _mapped_objects(active_job: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
@@ -90,19 +111,19 @@ class AutoPilotPlanner:
         valid_protocol_id = isinstance(protocol_id, int) and protocol_id > 0
         task_token = str((active_job or {}).get("token") or "")
         ready = bool(item and valid_protocol_id and task_token and not item.get("protocol_skipped"))
-        payload = skip_objects_payload([protocol_id], timestamp=0) if valid_protocol_id else None
+        preview = skip_objects_payload([protocol_id], timestamp=0) if valid_protocol_id else None
         return {
-            "proposal_id": proposal.get("id"),
+            "proposal_id": str(proposal.get("id") or ""),
             "object_id": object_id,
-            "object_label": proposal.get("object_label") or (item or {}).get("label") or object_id,
-            "defect_type": proposal.get("defect_type", "anomaly"),
+            "object_label": str(proposal.get("object_label") or (item or {}).get("label") or object_id),
+            "defect_type": str(proposal.get("defect_type") or "anomaly"),
             "object_known": item is not None,
             "protocol_object_id": protocol_id if valid_protocol_id else None,
             "protocol_identity": (item or {}).get("protocol_identity", "unavailable"),
             "bounds_xy": (item or {}).get("bounds_xy"),
-            "action": "skip_objects",
-            "request_preview": payload,
-            "status": "ready_to_prepare" if ready else "blocked_by_preflight",
+            "action": "manual_exclusion",
+            "request_preview": preview,
+            "status": "ready_for_manual_preparation" if ready else "blocked_by_preflight",
             "preflight": {
                 "active_job": bool(task_token),
                 "object_mapped": item is not None,
@@ -111,58 +132,78 @@ class AutoPilotPlanner:
             },
         }
 
+    @staticmethod
+    def _alert_for(proposal: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "proposal_id": plan["proposal_id"],
+            "object_id": plan["object_id"],
+            "object_label": plan["object_label"],
+            "defect_type": plan["defect_type"],
+            "confidence": proposal.get("confidence"),
+            "evidence_count": proposal.get("evidence_count"),
+            "object_mapped": plan["object_known"],
+            "status": "review_required",
+            "action": "notify_only",
+        }
+
     def _saved(self) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM autopilot_plans ORDER BY created_at DESC LIMIT 30"
+                "SELECT * FROM manual_exclusions ORDER BY created_at DESC LIMIT 30"
             ).fetchall()
         return [{
             "id": row["id"], "proposal_id": row["proposal_id"], "job_token": row["job_token"],
             "object_id": row["object_id"], "protocol_object_id": int(row["protocol_object_id"]),
-            "command": json.loads(row["command_json"]), "status": row["status"],
+            "instruction": json.loads(row["instruction_json"]), "status": row["status"],
             "created_at": float(row["created_at"]),
         } for row in rows]
 
     def state(self, guardian: dict[str, Any], active_job: dict[str, Any] | None) -> dict[str, Any]:
-        plans = [self._plan_for(proposal, active_job)
-                 for proposal in guardian.get("pending_proposals", []) if isinstance(proposal, dict)]
-        return {"capability": dict(self.capability), "plans": plans, "prepared": self._saved()}
+        proposals = [item for item in guardian.get("pending_proposals", []) if isinstance(item, dict)]
+        plans = [self._plan_for(item, active_job) for item in proposals]
+        alerts = [self._alert_for(proposal, plan) for proposal, plan in zip(proposals, plans)]
+        return {"capability": dict(self.capability), "alerts": alerts, "plans": plans, "prepared": self._saved()}
 
-    def prepare(self, proposal_id: str, guardian: dict[str, Any], active_job: dict[str, Any] | None) -> dict[str, Any]:
+    def prepare_manual(self, proposal_id: str, guardian: dict[str, Any], active_job: dict[str, Any] | None) -> dict[str, Any]:
+        """Persist an explicit user request; it deliberately does not control hardware."""
         proposal = next(
             (item for item in guardian.get("pending_proposals", [])
              if isinstance(item, dict) and str(item.get("id")) == proposal_id), None
         )
         if proposal is None:
-            raise ValueError("Proposition AutoPilot introuvable ou déjà décidée")
+            raise ValueError("Alerte introuvable ou déjà décidée")
         plan = self._plan_for(proposal, active_job)
-        if plan["status"] != "ready_to_prepare":
-            raise ValueError("Préconditions d’exclusion unitaire non satisfaites")
+        if plan["status"] != "ready_for_manual_preparation":
+            raise ValueError("Préconditions de l’exclusion manuelle non satisfaites")
         job_token = str((active_job or {}).get("token"))
         protocol_id = int(plan["protocol_object_id"])
-        plan_id = hashlib.sha256(f"{proposal_id}:{job_token}:{protocol_id}".encode()).hexdigest()[:32]
-        command = skip_objects_payload([protocol_id])
+        instruction_id = hashlib.sha256(f"manual:{proposal_id}:{job_token}:{protocol_id}".encode()).hexdigest()[:32]
+        instruction = skip_objects_payload([protocol_id])
         now = time.time()
         with self.lock, self._connect() as connection:
             existing = connection.execute(
-                "SELECT * FROM autopilot_plans WHERE proposal_id = ?", (proposal_id,)
+                "SELECT * FROM manual_exclusions WHERE proposal_id = ?", (proposal_id,)
             ).fetchone()
             if existing is None:
                 connection.execute(
-                    """INSERT INTO autopilot_plans(
+                    """INSERT INTO manual_exclusions(
                            id, proposal_id, job_token, object_id, protocol_object_id,
-                           command_json, status, created_at
-                       ) VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?)""",
-                    (plan_id, proposal_id, job_token, plan["object_id"], protocol_id,
-                     json.dumps(command, separators=(",", ":"), sort_keys=True), now),
+                           instruction_json, status, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, 'prepared_manually', ?)""",
+                    (instruction_id, proposal_id, job_token, plan["object_id"], protocol_id,
+                     json.dumps(instruction, separators=(",", ":"), sort_keys=True), now),
                 )
-                row = connection.execute("SELECT * FROM autopilot_plans WHERE id = ?", (plan_id,)).fetchone()
+                row = connection.execute(
+                    "SELECT * FROM manual_exclusions WHERE id = ?", (instruction_id,)
+                ).fetchone()
             else:
                 row = existing
         return {
             "id": row["id"], "proposal_id": row["proposal_id"], "object_id": row["object_id"],
             "protocol_object_id": int(row["protocol_object_id"]),
-            "command": json.loads(row["command_json"]), "status": row["status"],
+            "instruction": json.loads(row["instruction_json"]), "status": row["status"],
             "created_at": float(row["created_at"]),
-            "message": "Exclusion unitaire préparée et journalisée ; aucune commande n’a été envoyée.",
+            "message": (
+                "Exclusion manuelle préparée et journalisée. Companion ne l’a pas envoyée à l’imprimante."
+            ),
         }

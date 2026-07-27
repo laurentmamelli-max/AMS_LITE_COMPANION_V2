@@ -58,7 +58,7 @@ EVENTS_FILE = APP_DIR / "events.sqlite3"
 AUTOPILOT_FILE = APP_DIR / "autopilot.sqlite3"
 REPORTS_FILE = APP_DIR / "reports.sqlite3"
 HOST, PORT = "127.0.0.1", 8766
-__version__ = "2.5.0"
+__version__ = "3.0.0"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -113,7 +113,7 @@ def build_supervision_snapshot(
     failed_events = sum(1 for event in events if str(event.get("outcome") or "") == "failed")
     pending_events = sum(1 for event in events if str(event.get("outcome") or "received") == "received")
     pending_proposals = guardian.get("pending_proposals") if isinstance(guardian.get("pending_proposals"), list) else []
-    prepared = autopilot.get("prepared") if isinstance(autopilot.get("prepared"), list) else []
+    autopilot_alerts = autopilot.get("alerts") if isinstance(autopilot.get("alerts"), list) else []
     canonical_objects = sum(1 for item in objects if isinstance(item, dict) and item.get("protocol_object_id"))
     skipped_objects = sum(1 for item in objects if isinstance(item, dict) and item.get("protocol_skipped"))
 
@@ -153,13 +153,11 @@ def build_supervision_snapshot(
     else:
         guardian_level, guardian_message = "ok", "Aucune alerte Gardien en attente"
 
-    if prepared:
+    if autopilot_alerts:
         autopilot_level = "warning"
-        autopilot_message = f"{len(prepared)} exclusion(s) préparée(s), jamais envoyée(s)"
-    elif autopilot.get("plans"):
-        autopilot_level, autopilot_message = "info", "Proposition(s) AutoPilot en attente de préparation"
+        autopilot_message = f"{len(autopilot_alerts)} alerte(s) à examiner ; exclusion uniquement sur choix manuel"
     else:
-        autopilot_level, autopilot_message = "ok", "Aucune exclusion préparée"
+        autopilot_level, autopilot_message = "ok", "Mode alerte : aucune action automatique"
 
     if not active_job:
         mapping_level, mapping_message = "info", "Aucun travail actif à cartographier"
@@ -200,11 +198,40 @@ def build_supervision_snapshot(
                      "pending_count": len(pending_proposals),
                      "observations_count": int(guardian.get("observations_count") or 0)},
         "autopilot": {"level": autopilot_level, "message": autopilot_message,
-                      "prepared_count": len(prepared)},
+                      "alert_count": len(autopilot_alerts)},
         "mapping": {"level": mapping_level, "message": mapping_message,
                     "object_count": len(objects), "canonical_object_count": canonical_objects,
                     "skipped_object_count": skipped_objects},
     }
+
+
+def build_alert_queue(state: dict[str, Any]) -> list[dict[str, str]]:
+    """Build local, review-only alerts for UI and native notifications.
+
+    This queue never contains a command, a printer identifier, or an automatic
+    follow-up action.  Its stable IDs let every presentation layer avoid
+    repeating the same warning while the user reviews it.
+    """
+    guardian = state.get("guardian") if isinstance(state.get("guardian"), dict) else {}
+    pending = guardian.get("pending_proposals") if isinstance(guardian.get("pending_proposals"), list) else []
+    alerts: list[dict[str, str]] = []
+    for proposal in pending:
+        if not isinstance(proposal, dict):
+            continue
+        proposal_id = str(proposal.get("id") or "")
+        if not re.fullmatch(r"[a-f0-9]{32}", proposal_id):
+            continue
+        label = str(proposal.get("object_label") or proposal.get("object_id") or "objet inconnu")[:120]
+        defect = str(proposal.get("defect_type") or "anomalie")[:60]
+        evidence = int(_float(proposal.get("evidence_count") or 0))
+        confidence = max(0, min(100, round(100 * _float(proposal.get("confidence") or 0))))
+        alerts.append({
+            "id": f"guardian:{proposal_id}", "severity": "critical", "source": "guardian",
+            "title": f"Alerte Vision : {defect}",
+            "message": f"{label} · {evidence} image(s) · confiance {confidence} %. Vérifie l’impression.",
+            "created_at": str(proposal.get("created_at") or ""), "action": "review_only",
+        })
+    return alerts
 
 
 def capture_print_folder(name: str, task_id: str, started_at: str | None = None) -> str:
@@ -2031,6 +2058,7 @@ class Companion:
             clean["events"] = self.events.recent()
             clean["vision_storage"] = self.vision_storage()
             clean["supervision"] = build_supervision_snapshot(clean, clean["events"])
+            clean["alerts"] = build_alert_queue(clean)
             clean["report_history"] = self.reports.recent(12)
             return clean
 
@@ -2158,14 +2186,13 @@ class Companion:
         log(f"Gardien de plateau: décision humaine {result['status']} pour {result['object_label']}")
         return result
 
-    def prepare_autopilot_exclusion(self, proposal_id: str) -> dict[str, Any]:
-        """Persist the exact single-object skip command, without publishing it."""
-        with self.lock:
-            guardian = self.guardian.state()
-            result = self.autopilot.prepare(proposal_id, guardian, self.state.get("active_job"))
-            self.save()
-        log(f"AutoPilot: exclusion unitaire préparée pour l’objet {result['object_id']}")
-        return result
+    def prepare_manual_exclusion(self, proposal_id: str) -> dict[str, Any]:
+        """Handle an explicit dashboard choice without controlling the printer."""
+        return self.autopilot.prepare_manual(
+            proposal_id,
+            self.guardian.state(),
+            self.state.get("active_job"),
+        )
 
     def mqtt_config(self) -> MQTTConfig:
         with self.lock:
@@ -3334,9 +3361,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(self.app.observe_plate_guardian(self.json_body()), 201)
             elif match := re.fullmatch(r"/api/guardian/proposals/([a-f0-9]{32})/decision", path):
                 self.send_json(self.app.decide_plate_guardian(match.group(1), self.json_body()))
-            elif match := re.fullmatch(r"/api/autopilot/proposals/([a-f0-9]{32})/prepare", path):
+            elif match := re.fullmatch(r"/api/manual-exclusions/proposals/([a-f0-9]{32})/prepare", path):
                 self.json_body()
-                self.send_json(self.app.prepare_autopilot_exclusion(match.group(1)))
+                self.send_json(self.app.prepare_manual_exclusion(match.group(1)))
             elif path == "/api/reports/snapshot":
                 self.json_body()
                 self.send_json(self.app.archive_supervision_report())
@@ -3358,7 +3385,7 @@ HTML = r'''<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name
 body.embedded .spools-card{order:1!important}body.embedded .printer-card{order:2!important}.inventory-card{display:none}.catalog-fields{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.catalog-actions button{width:100%}#catalogWindow{display:none}.catalog-window{max-width:1400px;margin:auto}.catalog-toolbar{display:flex;justify-content:space-between;align-items:end;gap:18px}.catalog-toolbar h2{font-size:24px;margin:0}.table-wrap{overflow:auto;border:1px solid #dfe3e7;border-radius:12px;background:white}.catalog-table{width:100%;border-collapse:collapse;min-width:1120px}.catalog-table th{background:#f0f3f5;color:#4e5863;text-align:left;font-size:12px;white-space:nowrap}.catalog-table th,.catalog-table td{padding:9px;border-bottom:1px solid #e7eaed;vertical-align:middle}.catalog-table tr:last-child td{border-bottom:0}.catalog-table tr[data-spool]{cursor:pointer}.catalog-table tr.selected td{background:#eaf8ef}.catalog-table input,.catalog-table select{min-width:90px;padding:7px;border:1px solid transparent;background:transparent;border-radius:6px}.catalog-table input:focus,.catalog-table select:focus{background:white;border-color:#00ae42;outline:none}.catalog-table .id-cell{color:#69717b;font-variant-numeric:tabular-nums}.catalog-table .actions{white-space:nowrap}.catalog-table .actions button{margin:0 3px 0 0;padding:8px 10px;font-size:12px}.catalog-add{display:grid;grid-template-columns:1.5fr repeat(3,1fr) .8fr .8fr .9fr auto;gap:8px;align-items:end;margin-top:14px;padding:14px;background:white;border:1px solid #dfe3e7;border-radius:12px}.catalog-add label{margin-top:0}.spool-timeline{margin-top:16px;padding:16px;background:white;border:1px solid #dfe3e7;border-radius:12px}.spool-timeline h3{margin:0 0 4px}.timeline{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(170px,1fr);gap:12px;overflow-x:auto;padding:26px 4px 6px;position:relative}.timeline:before{content:'';position:absolute;left:26px;right:26px;top:34px;height:3px;background:#cdebd8}.timeline-event{position:relative;z-index:1;padding-top:20px}.timeline-dot{position:absolute;top:0;left:12px;width:18px;height:18px;border-radius:50%;background:#00ae42;border:4px solid #eaf8ef}.timeline-event.remove .timeline-dot{background:#ef9b20}.timeline-event.deduct .timeline-dot{background:#3976db}.timeline-event .when{font-size:11px;color:#69717b}.timeline-event .what{font-weight:700;font-size:13px;margin:5px 0}.timeline-event .detail{font-size:12px;color:#505861}.timeline-empty{color:#69717b;padding:16px 0}body.catalog-view .wrap{max-width:none;padding:20px}body.catalog-view h1,body.catalog-view .sub,body.catalog-view .grid{display:none}body.catalog-view #catalogWindow{display:block}@media(max-width:700px){.catalog-fields{grid-template-columns:1fr 1fr}.catalog-add{grid-template-columns:1fr 1fr}}
 .catalog-summary{margin:16px 0}.catalog-summary h3{margin:0 0 8px}.summary-table{min-width:720px}.level-track{width:130px;height:8px;background:#e8edf0;border-radius:99px;overflow:hidden;margin-top:4px}.level-fill{height:100%;background:#00a23d;border-radius:99px}.weight-chart{margin:14px 0 4px;padding:12px;border:1px solid #e7eaed;border-radius:10px;background:#fbfcfc}.weight-chart h4{margin:0 0 4px}.weight-chart svg{width:100%;height:190px;display:block}.weight-chart .axis{stroke:#dfe3e7;stroke-width:1}.weight-chart .line{fill:none;stroke:#00a23d;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}.weight-chart .point{fill:#fff;stroke:#00a23d;stroke-width:3}.weight-chart .point:hover{fill:#00a23d;cursor:help}.chart-label{font-size:11px;fill:#69717b}.supervision-card{background:linear-gradient(135deg,#f8fcf9,#f2f7f4)}.supervision-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.supervision-head h2{margin-bottom:4px}.supervision-head p{margin:0}.supervision-badge{display:inline-block;padding:6px 10px;border-radius:99px;font-size:12px;font-weight:800;background:#eef1f3;color:#4e5863}.supervision-badge.ok{background:#e3f7ea;color:#087535}.supervision-badge.warning{background:#fff0e7;color:#ad4d18}.supervision-badge.critical{background:#ffe7e5;color:#ad2620}.supervision-badge.offline{background:#ebedf0;color:#59636e}.supervision-grid{display:grid;grid-template-columns:repeat(3,minmax(180px,1fr));gap:10px;margin-top:14px}.supervision-item{border:1px solid #dfe6e1;border-left:4px solid #88939d;border-radius:10px;padding:11px;background:#fff}.supervision-item.ok{border-left-color:#00a23d}.supervision-item.warning{border-left-color:#e28a20}.supervision-item.critical{border-left-color:#cc3a32}.supervision-item.offline{border-left-color:#7b8691}.supervision-item b{display:block;font-size:13px;margin-bottom:4px}.supervision-item span{display:block;color:#59636e;font-size:12px;line-height:1.35}.supervision-meta{display:flex;flex-wrap:wrap;gap:8px;margin-top:13px}.supervision-meta span{background:#eef2f3;border-radius:7px;padding:6px 8px;font-size:12px;color:#4e5863}.report-list{display:grid;gap:9px}.report-item{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:center;border-top:1px solid #e5e9e7;padding:10px 0}.report-item:first-child{border-top:0;padding-top:0}.report-item b{display:block;font-size:13px}.report-item span{font-size:12px;color:#69717b}.report-item button{margin:0}.vision-history{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}.vision-history span{padding:5px 8px;border-radius:7px;background:#f1f4f3;font-size:12px;color:#55616a}@media(max-width:700px){.supervision-grid{grid-template-columns:1fr 1fr}.supervision-head{align-items:flex-start}.report-item{grid-template-columns:1fr}}
 :root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#20242a;background:#f4f5f6}body{margin:0}.wrap{max-width:1050px;margin:auto;padding:24px}h1{margin:0 0 4px}.sub{color:#69717b;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}.card{background:white;border:1px solid #dfe3e7;border-radius:14px;padding:18px;box-shadow:0 2px 10px #0000000b}.wide{grid-column:1/-1}h2{font-size:17px;margin:0 0 14px}label{display:block;font-size:12px;color:#656d76;margin:9px 0 4px}input,select,button{box-sizing:border-box;border:1px solid #cbd1d7;border-radius:8px;padding:9px;font:inherit}input,select{width:100%}input[type=checkbox]{width:auto;margin-right:7px}button{background:#00ae42;color:white;border:0;font-weight:600;cursor:pointer;margin-top:12px}button.secondary{background:#59636e}.status{display:inline-flex;gap:7px;align-items:center;font-weight:600}.dot{width:10px;height:10px;border-radius:50%;background:#d33}.on .dot{background:#00ae42}.spools{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.spool{padding:12px;border:1px solid #e1e4e7;border-radius:10px}.spool b{color:#00a23d}.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.bridge-map,.catalog-form{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.catalog{display:grid;grid-template-columns:1fr 160px;gap:12px;align-items:end;border-top:1px solid #eee;padding:12px 0}.catalog:first-child{border-top:0;padding-top:0}.check{font-size:14px;color:#20242a}.notice{padding:10px;border-radius:8px;background:#eef8f1;margin:10px 0}.guardian-alert{background:#fff4e9;color:#8a3d00}.guardian-actions{display:flex;gap:8px;flex-wrap:wrap}.guardian-actions button{margin-top:8px}.object-map{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}.object-chip{border:1px solid #dfe3e7;border-radius:8px;padding:9px;font-size:12px;overflow-wrap:anywhere}.object-chip b{color:#0b6d32}.object-chip span{color:#69717b}.error{background:#ffecec;color:#a11}.muted{color:#69717b;font-size:13px;overflow-wrap:anywhere}.line{display:grid;grid-template-columns:1fr 100px 90px;gap:8px;align-items:end}.history{font-size:13px;border-top:1px solid #eee;padding:8px 0}body.embedded .wrap{padding:10px;max-width:none}body.embedded h1,body.embedded .sub,body.embedded .manual-card,body.embedded .shutdown-card,body.embedded .inventory-card{display:none}body.embedded .grid{grid-template-columns:1fr;gap:10px}body.embedded .wide{grid-column:auto}body.embedded .card{padding:14px;border-radius:10px;box-shadow:none}body.embedded .spools-card{order:1}body.embedded .printer-card{order:2}body.embedded .bridge-card{order:3}body.embedded .guardian-card{order:4}body.embedded .gcode-card{order:5}body.embedded .history-card{order:6}@media(max-width:700px){.spools,.bridge-map,.catalog-form{grid-template-columns:1fr 1fr}.catalog{grid-template-columns:1fr}.line{grid-template-columns:1fr}.wrap{padding:12px}}</style></head><body><div class="wrap">
-<h1>AMS Lite Companion V2</h1><div class="sub">Compteur local v2.5.0 — environnement indépendant lié à Bambu Studio officiel.</div><div id="msg"></div>
+<h1>AMS Lite Companion V2</h1><div class="sub">Compteur local v3.0.0 — alertes locales uniquement, sans action imprimante.</div><div id="msg"></div>
 <div class="grid"><section class="card printer-card"><h2>Imprimante locale</h2><div id="conn" class="status"><span class="dot"></span><span>Déconnectée</span></div><div id="pstate"></div>
 <label>Adresse IP</label><input id="ip" placeholder="192.168.1.50"><label>Numéro de série</label><input id="serial" placeholder="01S00A..."><label>Code d’accès LAN <span class="muted">(laisse vide pour conserver le code enregistré)</span></label><input id="code" type="password" placeholder="8 chiffres"><button onclick="saveConfig()">Enregistrer et connecter</button></section>
 <section class="card bridge-card"><h2>Passerelle Bambu Studio</h2><div id="bridgeStatus" class="notice">En attente de Bambu Studio</div><label class="check"><input id="autoEnabled" type="checkbox">Récupérer automatiquement le .gcode.3mf</label><label class="check"><input id="fallbackEnabled" type="checkbox">Armer avec la correspondance A1–A4 enregistrée ci-dessous</label><div class="bridge-map" id="bridgeMap"></div><button onclick="saveBridge()">Enregistrer la passerelle</button><div id="bridgeDetails" class="muted"></div></section>
@@ -3406,7 +3433,8 @@ async function saveConfig(){try{await api('/api/config',{method:'POST',body:JSON
 async function saveBridge(){let m={};for(let i=1;i<=4;i++)m[i]=$('bm'+i).value;try{await api('/api/bridge',{method:'POST',body:JSON.stringify({enabled:$('autoEnabled').checked,fallback_enabled:$('fallbackEnabled').checked,default_mapping:m})});formDirty=false;msg('Passerelle enregistrée.');refresh()}catch(e){msg(e.message,true)}}
 async function saveSpools(){let x={};for(let i=1;i<=4;i++)if(S.spools[i]?.spool_id)x[i]={name:$('n'+i).value,initial_g:+$('i'+i).value,remaining_g:+$('r'+i).value};try{await api('/api/spools',{method:'POST',body:JSON.stringify(x)});formDirty=false;msg('Poids enregistrés.');refresh()}catch(e){msg(e.message,true)}}
 async function decideGuardian(id,decision){try{await api('/api/guardian/proposals/'+id+'/decision',{method:'POST',body:JSON.stringify({decision})});msg('Décision enregistrée. Aucune commande n’a été envoyée à l’imprimante.');refresh()}catch(e){msg(e.message,true)}}
-async function prepareExclusion(id){try{let prepared=await api('/api/autopilot/proposals/'+id+'/prepare',{method:'POST',body:'{}'});msg(prepared.message||'Exclusion préparée localement.');refresh()}catch(e){msg(e.message,true)}}
+async function prepareManualExclusion(id){if(!confirm('Préparer cette exclusion manuelle ? Companion ne l’enverra pas à l’imprimante.'))return;try{let prepared=await api('/api/manual-exclusions/proposals/'+id+'/prepare',{method:'POST',body:'{}'});msg(prepared.message||'Exclusion manuelle préparée localement.');refresh()}catch(e){msg(e.message,true)}}
+async function prepareExclusion(id){return prepareManualExclusion(id)}
 async function createSpool(){try{await api('/api/inventory/spools',{method:'POST',body:JSON.stringify({name:$('newSpoolName').value,material:$('newSpoolMaterial').value,brand:$('newSpoolBrand').value,color:$('newSpoolColor').value,initial_g:+$('newSpoolInitial').value,remaining_g:+$('newSpoolRemaining').value,created_at:$('newSpoolDate').value})});['newSpoolName','newSpoolMaterial','newSpoolBrand','newSpoolColor'].forEach(id=>$(id).value='');delete $('newSpoolName').dataset.custom;formDirty=false;catalogLoaded=false;msg('Bobine ajoutée au catalogue. Choisis maintenant sa voie AMS.');refresh()}catch(e){msg(e.message,true)}}
 async function saveCatalogSpool(id,event){event?.stopPropagation();let slot=$('catalogSlot'+id).value;try{await api('/api/inventory/spools/'+id,{method:'POST',body:JSON.stringify({name:$('cn'+id).value,material:$('cm'+id).value,brand:$('cb'+id).value,color:$('cc'+id).value,initial_g:+$('ci'+id).value,remaining_g:+$('cr'+id).value,created_at:$('cd'+id).value})});let placement=await api('/api/inventory/assign',{method:'POST',body:JSON.stringify({spool_id:id,slot})});formDirty=false;catalogLoaded=false;msg(placement.message||'Bobine enregistrée.');refresh()}catch(e){msg(e.message,true)}}
 async function deleteSpool(id,event){event?.stopPropagation();if(pendingDeleteId!==id){pendingDeleteId=id;event.currentTarget.textContent='Confirmer';msg('Clique encore sur Confirmer pour supprimer définitivement cette bobine et son historique.');return}try{let result=await api('/api/inventory/spools/'+id+'/delete',{method:'POST',body:'{}'});pendingDeleteId=null;if(selectedSpoolId===id){selectedSpoolId=null;$('timelineTitle').textContent='Historique de la bobine';$('timelineSummary').textContent='Clique une ligne du catalogue pour afficher sa frise chronologique.';$('timeline').className='timeline-empty';$('timeline').textContent='Aucune bobine sélectionnée.'}formDirty=false;catalogLoaded=false;msg(result.message||'Bobine supprimée.');refresh()}catch(e){msg(e.message,true)}}
@@ -3448,6 +3476,7 @@ async function discoverVision(){try{let result=await api('/api/camera/discover',
 if(visionView){let button=document.createElement('button');button.className='secondary';button.textContent='Détecter la caméra';button.onclick=discoverVision;$('visionFingerprint').before(button)}
 if(visionView){clearInterval(refreshTimer);document.body.innerHTML='<main class="wrap"><h1>Centre Vision</h1><p class="sub">Surveillance locale : aucune commande n’est envoyée à l’imprimante.</p><section class="card"><div id="visionStatus" class="notice">Chargement…</div><label class="check"><input id="visionEnabled" type="checkbox">Activer les captures automatiques</label><label>Empreinte TLS de la caméra</label><input id="visionFingerprint" placeholder="64 caractères hexadécimaux"><button onclick="saveVision()">Enregistrer la configuration</button><p id="visionMeta" class="muted"></p></section><section class="card wide"><h2>Captures</h2><div id="visionGallery" class="vision-gallery"></div></section></main>';let style=document.createElement('style');style.textContent='.vision-gallery{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.vision-gallery article{border:1px solid #dfe3e7;padding:12px;border-radius:8px}.vision-gallery code{font-size:11px;overflow-wrap:anywhere}';document.head.append(style);api('/api/state').then(renderVision).catch(e=>{$('visionStatus').textContent=e.message})}else{let dashboardRender=render;render=function(s){dashboardRender(s);let host=document.querySelector(".spools-card");if(host&&!$('openVisionButton')){let button=document.createElement('button');button.id='openVisionButton';button.className='secondary';button.textContent='Ouvrir le centre Vision…';button.onclick=openVision;host.append(button)}}}
 if(!visionView){let removeLegacyVisionButton=render;render=function(s){removeLegacyVisionButton(s);$('openVisionButton')?.remove()}}
+const v3AlertStyle=document.createElement('style');v3AlertStyle.textContent='.alert-modal{position:fixed;inset:0;z-index:30;display:grid;place-items:center;padding:20px;background:#15201980}.alert-modal[hidden]{display:none}.alert-dialog{width:min(480px,calc(100vw - 40px));background:#fff;border-radius:14px;padding:22px;box-shadow:0 18px 60px #0006;border-top:5px solid #c84237}.alert-dialog h2{margin:0 0 9px}.alert-dialog p{line-height:1.45}.alert-dialog .muted{margin-top:12px}.alert-dialog button{margin:8px 8px 0 0}';document.head.append(v3AlertStyle);let v3SeenAlertIds=new Set();function dismissV3Alert(){let modal=$('v3AlertModal');if(modal)modal.hidden=true}function renderV3Alerts(s){if(visionView)return;let guardian=s.guardian||{},pending=guardian.pending_proposals||[],autopilot=s.autopilot||{},pilotAlerts=autopilot.alerts||[];if(pending.length){let proposal=pending[0],plan=(autopilot.plans||[]).find(item=>item.proposal_id===proposal.id),manual=plan?.status==='ready_for_manual_preparation';$('guardianStatus').className='notice guardian-alert';$('guardianStatus').textContent=`Alerte ${proposal.defect_type||'anomalie'} à vérifier : ${proposal.object_label} (${proposal.evidence_count} images, confiance ${Math.round(100*proposal.confidence)} %)`;$('guardianDetails').innerHTML=`Alerte humaine : Companion n’envoie jamais de commande automatiquement.<div class="guardian-actions">${manual?`<button class="secondary" onclick="prepareManualExclusion('${proposal.id}')">Préparer l’exclusion manuelle</button>`:'<span class="muted">Exclusion manuelle indisponible : objet ou travail non vérifié.</span>'}<button class="secondary" onclick="decideGuardian('${proposal.id}','continue')">Continuer à surveiller</button><button class="secondary" onclick="decideGuardian('${proposal.id}','dismiss')">Écarter l’alerte</button></div>`}$('autopilot').textContent=pilotAlerts.length?`${pilotAlerts.length} alerte(s) à examiner. Une exclusion reste une décision manuelle explicite et n’est jamais envoyée par Companion.`:(autopilot.capability?.reason||'Mode alerte uniquement.');let alerts=Array.isArray(s.alerts)?s.alerts:[],next=alerts.find(alert=>alert&&alert.id&&!v3SeenAlertIds.has(alert.id));if(!next)return;v3SeenAlertIds.add(next.id);let modal=$('v3AlertModal');if(!modal){modal=document.createElement('div');modal.id='v3AlertModal';modal.className='alert-modal';modal.innerHTML='<section class="alert-dialog" role="alertdialog" aria-modal="true"><h2 id="v3AlertTitle"></h2><p id="v3AlertMessage"></p><p class="muted">Vérifie l’impression puis décide manuellement dans le Gardien. Aucune commande n’est envoyée à l’imprimante.</p><button class="secondary" onclick="dismissV3Alert()">J’ai compris</button></section>';document.body.append(modal)}$('v3AlertTitle').textContent=next.title||'Alerte Companion';$('v3AlertMessage').textContent=next.message||'Vérifie l’impression.';modal.hidden=false}if(!visionView){let v3AlertRender=render;render=function(s){v3AlertRender(s);renderV3Alerts(s)}}
 </script></body></html>'''
 
 

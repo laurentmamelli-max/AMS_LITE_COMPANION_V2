@@ -4,8 +4,8 @@ Branche de développement : `companion-v2`.
 
 V2 démarre sur la V1.5 stable, mais ses évolutions restent isolées de la
 branche `main` jusqu'à leur validation. La première livraison stable est
-`2.0.1`. La livraison locale en cours prépare le socle `2.5.0` et l’architecture
-V3 est documentée dans `V3_ARCHITECTURE.md`.
+`2.0.1`. La livraison locale a atteint `3.0.0` ; l’architecture V3 est
+documentée dans `V3_ARCHITECTURE.md`.
 
 ## Isolation avec V1
 
@@ -66,6 +66,7 @@ temps, afin d'éviter deux suivis du même travail.
 | V2-3 | Exclusion unitaire préparée, canonique et journalisée | Fait, publication MQTT bloquée |
 | V2-4 | Poste de supervision, santé expliquée et signaux de fiabilité | Fait |
 | V2-5 | Historique Vision/Gardien et rapports locaux archivés | Fait |
+| V3-0 | Alertes locales et popups, exclusion uniquement manuelle | Fait |
 
 ## Règle de livraison
 

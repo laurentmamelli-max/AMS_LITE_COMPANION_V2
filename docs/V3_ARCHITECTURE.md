@@ -10,7 +10,7 @@ flowchart LR
   C --> G["G-Code\nobjets, lignes, zones XY"]
   V --> D["Dashboard\nalertes et supervision"]
   G --> D
-  V --> A["AutoPilot\ncommande préparée + garde-fous"]
+  V --> A["AutoPilot\nalertes + exclusion manuelle"]
   G --> A
   A --> D
 ```
@@ -41,26 +41,23 @@ G-code (balises `OBJECT`/`PRINTING_OBJECT` et fin d’objet). Chaque objet porte
 sa plage de lignes et son enveloppe XY. Sans balise fiable, l’état reste
 `unavailable` : aucune association inventée n’est autorisée.
 
-## AutoPilot — V2.3 et V3.0
+## AutoPilot — V3.0
 
-AutoPilot élabore une exclusion unitaire préparée et vérifie que l’objet est
-connu de la cartographie et de `slice_info.config`. La commande est journalisée
-dans SQLite, de façon idempotente, mais son état reste
-`prepared_command_only` : aucun transport n’est invoqué. Le passage à une
-action physique exige simultanément :
+V3 est en mode `alert_only_with_manual_exclusion`. Une détection confirmée ne
+fait qu’ouvrir une alerte locale, dans le tableau de bord et dans la fenêtre
+macOS. Aucun popup, minuteur, détecteur ou traitement en arrière-plan ne peut
+préparer ni transmettre une action.
 
-1. une commande Bambu documentée pour le modèle et firmware visés ;
-2. une exécution idempotente vérifiée sur plateau de test ;
-3. une réponse machine qui prouve l’exclusion du seul objet demandé ;
-4. un journal de commande persistant et une validation utilisateur de la
-   politique d’automatisation.
-
-Tant qu’un de ces critères manque, V3 reste en observation et alerte humaine.
+Après vérification visuelle, l’utilisateur peut choisir **Préparer
+l’exclusion manuelle** pour un seul objet. Cette option recoupe l’identité
+canonique de `slice_info.config`, conserve une instruction locale idempotente
+et n’a aucun transport réseau. Companion ne publie jamais cette instruction à
+l’imprimante : l’exclusion reste une décision et une opération humaine.
 
 ## Dashboard et rapports — V2.4/V2.5
 
 Le tableau de bord agrège l’état MQTT, la cartographie, les alertes Vision,
-les plans AutoPilot, l’espace de stockage Vision et le journal durable. Les
+les alertes AutoPilot, l’espace de stockage Vision et le journal durable. Les
 rapports doivent rester exportables localement et ne jamais inclure code LAN,
 jetons ou données non nécessaires.
 

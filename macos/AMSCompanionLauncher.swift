@@ -37,6 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private var panelDocked = true
     private var apiToken = ""
     private var mappingPromptKey: String?
+    private var safetyPromptKey: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         UserDefaults.standard.register(defaults: ["panelDocked": true])
@@ -402,6 +403,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
                    let state = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                     self.updateMenu(state)
                     self.presentMappingConfirmationIfNeeded(state)
+                    self.presentSafetyAlertIfNeeded(state)
                 } else {
                     self.statusLine.title = "Moteur arrêté"
                 }
@@ -470,6 +472,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
                              promptKey: promptKey)
         } else if !conflictText.isEmpty && result == .alertSecondButtonReturn {
             sendBridgeChoice(useSavedBridgeURL, promptKey: promptKey)
+        }
+    }
+
+    private func presentSafetyAlertIfNeeded(_ state: [String: Any]) {
+        guard let alerts = state["alerts"] as? [[String: Any]],
+              let alert = alerts.first,
+              let alertKey = alert["id"] as? String,
+              !alertKey.isEmpty else {
+            safetyPromptKey = nil
+            return
+        }
+        guard safetyPromptKey != alertKey else { return }
+        safetyPromptKey = alertKey
+
+        let title = alert["title"] as? String ?? "Alerte Companion"
+        let message = alert["message"] as? String ?? "Vérifie l’impression."
+        let popup = NSAlert()
+        popup.messageText = title
+        popup.informativeText = "\(message)\n\nAucune commande n’est envoyée à l’imprimante."
+        popup.alertStyle = .warning
+        popup.addButton(withTitle: "Afficher le Gardien")
+        popup.addButton(withTitle: "Plus tard")
+        NSApp.activate(ignoringOtherApps: true)
+        if popup.runModal() == .alertFirstButtonReturn {
+            showPanel()
         }
     }
 
