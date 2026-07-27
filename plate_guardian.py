@@ -290,10 +290,20 @@ class PlateGuardian:
                 "SELECT * FROM guardian_proposals ORDER BY created_at DESC LIMIT 10"
             ).fetchall()
             observations = connection.execute("SELECT COUNT(*) FROM guardian_observations").fetchone()[0]
+            breakdown = connection.execute(
+                """SELECT defect_type, status, COUNT(*) AS count
+                   FROM guardian_proposals GROUP BY defect_type, status
+                   ORDER BY defect_type, status"""
+            ).fetchall()
+        by_defect: dict[str, dict[str, int]] = {}
+        for row in breakdown:
+            defect = str(row["defect_type"])
+            by_defect.setdefault(defect, {})[str(row["status"])] = int(row["count"])
         return {
             "mode": "observation_only",
             "capability": dict(self.capability),
             "observations_count": int(observations),
             "pending_proposals": [self._proposal_dict(row) for row in pending],
             "recent_proposals": [self._proposal_dict(row) for row in latest],
+            "history_by_defect": by_defect,
         }

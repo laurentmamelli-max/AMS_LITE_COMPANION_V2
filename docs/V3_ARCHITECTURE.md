@@ -63,3 +63,10 @@ Le tableau de bord agrège l’état MQTT, la cartographie, les alertes Vision,
 les plans AutoPilot, l’espace de stockage Vision et le journal durable. Les
 rapports doivent rester exportables localement et ne jamais inclure code LAN,
 jetons ou données non nécessaires.
+
+V2.4 transforme ces faits en signaux expliqués (stable, information, à
+vérifier, intervention ou hors ligne), notamment la fraîcheur MQTT pendant une
+impression. V2.5 archive des instantanés redigés dans `reports.sqlite3` à la
+demande et à chaque fin d’impression idempotente. L’historique Vision indique
+les catégories et décisions du Gardien ; il ne prétend jamais qu’une
+observation est une commande appliquée.

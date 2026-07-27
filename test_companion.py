@@ -212,7 +212,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("2.3.0", report["application"]["version"])
+            self.assertEqual("2.5.0", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -221,6 +221,50 @@ class CompanionTests(unittest.TestCase):
             self.assertNotIn("87654321", encoded)
             self.assertNotIn("192.168.1.24", encoded)
             self.assertNotIn("SECRET-SERIAL", encoded)
+
+    def test_supervision_snapshot_explains_healthy_and_attention_states(self):
+        state = ac.default_state()
+        state["printer"] = {"connected": True, "state": "RUNNING", "progress": 42, "job": "piece.3mf"}
+        state["camera"].update({"enabled": True, "certificate_sha256": "a" * 64,
+                                "active_print": {"id": "vision-1"}})
+        state["active_job"] = {"object_map": {"status": "mapped", "objects": [{
+            "id": "944", "protocol_object_id": 944,
+        }]}}
+        state["guardian"] = {"pending_proposals": [], "observations_count": 3}
+        state["autopilot"] = {"prepared": [], "plans": []}
+        state["vision_storage"] = {"count": 2}
+        stamp = "2026-07-28T00:00:00+0200"
+        summary = ac.build_supervision_snapshot(
+            state, [{"received_at": stamp, "outcome": "processed"}],
+            now_epoch=ac.iso_epoch(stamp) + 15,
+        )
+        self.assertEqual("ok", summary["overall"]["level"])
+        self.assertEqual(1, summary["mapping"]["canonical_object_count"])
+        self.assertEqual(15, summary["reliability"]["latest_event_age_seconds"])
+        summary = ac.build_supervision_snapshot(
+            state, [{"received_at": stamp, "outcome": "failed"}],
+            now_epoch=ac.iso_epoch(stamp) + 15,
+        )
+        self.assertEqual("critical", summary["overall"]["level"])
+        self.assertEqual(1, summary["reliability"]["failed_events"])
+
+    def test_archives_redacted_manual_and_finished_print_reports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.configure({"access_code": "87654321", "ip": "192.168.1.24", "serial": "SECRET-SERIAL"})
+            manual = app.archive_supervision_report()
+            archived = app.archived_supervision_report(manual["id"])
+            self.assertEqual("manual", manual["reason"])
+            self.assertNotIn("87654321", json.dumps(archived))
+            self.assertNotIn("192.168.1.24", json.dumps(archived))
+            app.last_import = ac.parse_3mf(sample_3mf(4), "rapport.gcode.3mf")
+            app.arm({"plate": "1", "mappings": [{"filament_id": "1", "slot": "1"}]})
+            app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-42"}})
+            app.on_message({"print": {"gcode_state": "FINISH", "subtask_id": "report-42"}})
+            history = app.reports.recent()
+            self.assertIn("print_finished", [item["reason"] for item in history])
+            restarted = ac.Companion(Path(tmp) / "state.json")
+            self.assertGreaterEqual(len(restarted.reports.recent()), 2)
 
     def test_vision_storage_reports_only_indexed_capture_files(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1045,8 +1089,21 @@ class CompanionTests(unittest.TestCase):
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("2.3.0", report["application"]["version"])
+                self.assertEqual("2.5.0", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
+                self.assertIn("Poste de supervision", html)
+                self.assertIn("Historique Vision et rapports", html)
+                snapshot_request = urllib.request.Request(
+                    base + "/api/reports/snapshot", data=b"{}", method="POST", headers=headers,
+                )
+                snapshot = json.loads(urllib.request.urlopen(snapshot_request, timeout=2).read())
+                self.assertEqual("manual", snapshot["reason"])
+                reports = json.loads(urllib.request.urlopen(urllib.request.Request(
+                    base + "/api/reports", headers=headers), timeout=2).read())
+                self.assertIn(snapshot["id"], [item["id"] for item in reports["reports"]])
+                archived = json.loads(urllib.request.urlopen(urllib.request.Request(
+                    base + f"/api/reports/{snapshot['id']}.json", headers=headers), timeout=2).read())
+                self.assertIn("supervision", archived)
                 bridge_request = urllib.request.Request(
                     base + "/api/bridge",
                     data=json.dumps({"enabled": True, "fallback_enabled": True,

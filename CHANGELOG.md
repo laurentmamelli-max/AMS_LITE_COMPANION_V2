@@ -1,5 +1,27 @@
 # Changelog
 
+## 2.5.0 — 2026-07-28
+
+- Historique Vision/Gardien enrichi par type de défaut et état de décision,
+  sans confondre une observation avec une action sur l’imprimante.
+- Les instantanés de supervision peuvent être archivés à la demande et un
+  rapport redigé est créé automatiquement à la fin d’une impression suivie.
+  Chaque rapport est durable, téléchargeable individuellement, borné à 500
+  entrées et ne contient ni code LAN, ni adresse IP, ni numéro de série.
+- Une même fin d’impression ne peut créer qu’un rapport automatique grâce à
+  une clé idempotente locale.
+
+## 2.4.0 — 2026-07-28
+
+- Nouveau poste de supervision : santé de l’imprimante, Vision, fraîcheur et
+  erreurs MQTT, Gardien, AutoPilot et cartographie apparaissent dans une seule
+  vue avec un niveau et une explication explicite.
+- Les indicateurs sont calculés depuis les faits persistés ; une caméra sans
+  empreinte TLS, un MQTT silencieux durant une impression ou une alerte en
+  attente sont signalés sans jamais provoquer de commande matérielle.
+- Le rapport JSON inclut cette synthèse opérationnelle, avec les mêmes règles
+  de redaction des données sensibles.
+
 ## 2.3.0 — 2026-07-28
 
 - L’identité d’exclusion est désormais l’identifiant canonique `identify_id`

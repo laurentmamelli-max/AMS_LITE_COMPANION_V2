@@ -32,6 +32,10 @@ estimations et peuvent être corrigés manuellement après une pesée.
 - cartographie des objets Bambu Studio et préparation locale, unitaire et
   journalisée d’une exclusion ; aucune commande n’est envoyée à l’imprimante ;
 - journal durable des événements MQTT importants, conservé après redémarrage ;
+- poste de supervision qui explique l’état de l’imprimante, Vision, MQTT,
+  Gardien, AutoPilot et cartographie sans jamais commander l’imprimante ;
+- rapports locaux redigés, archivés à la demande et après chaque impression
+  suivie, avec historique Vision/Gardien par type de défaut ;
 - lancement de Bambu Studio officiel sans erreur de signature ;
 - suivi indépendant des emplacements A1 à A4 ;
 - catalogue local de bobines avec poids conservé lors des échanges A1–A4 ;

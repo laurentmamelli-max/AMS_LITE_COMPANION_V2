@@ -4,7 +4,7 @@ Branche de développement : `companion-v2`.
 
 V2 démarre sur la V1.5 stable, mais ses évolutions restent isolées de la
 branche `main` jusqu'à leur validation. La première livraison stable est
-`2.0.1`. La livraison locale en cours prépare le socle `2.3.0` et l’architecture
+`2.0.1`. La livraison locale en cours prépare le socle `2.5.0` et l’architecture
 V3 est documentée dans `V3_ARCHITECTURE.md`.
 
 ## Isolation avec V1
@@ -64,7 +64,8 @@ temps, afin d'éviter deux suivis du même travail.
 | V2-1 | Vision : preuves, catégories de défaut et alertes | Fait, modèle local à brancher |
 | V2-2 | Cartographie G-code d’objets, zones XY et segments Bambu Studio | Fait, validé sur un 3MF Bambu réel |
 | V2-3 | Exclusion unitaire préparée, canonique et journalisée | Fait, publication MQTT bloquée |
-| V2-4 | Journal durable, supervision, migrations et paquet macOS | En validation continue |
+| V2-4 | Poste de supervision, santé expliquée et signaux de fiabilité | Fait |
+| V2-5 | Historique Vision/Gardien et rapports locaux archivés | Fait |
 
 ## Règle de livraison
 

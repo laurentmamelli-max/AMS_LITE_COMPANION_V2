@@ -56,8 +56,9 @@ INVENTORY_FILE = APP_DIR / "inventory.sqlite3"
 GUARDIAN_FILE = APP_DIR / "guardian.sqlite3"
 EVENTS_FILE = APP_DIR / "events.sqlite3"
 AUTOPILOT_FILE = APP_DIR / "autopilot.sqlite3"
+REPORTS_FILE = APP_DIR / "reports.sqlite3"
 HOST, PORT = "127.0.0.1", 8766
-__version__ = "2.3.0"
+__version__ = "2.5.0"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -77,6 +78,133 @@ TERMINAL_STATES = TERMINAL_OK | TERMINAL_BAD
 
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def iso_epoch(value: Any) -> float | None:
+    """Parse Companion's local ISO timestamps without raising in a dashboard."""
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%dT%H:%M:%S%z").timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def build_supervision_snapshot(
+    state: dict[str, Any], events: list[dict[str, Any]], *, now_epoch: float | None = None,
+) -> dict[str, Any]:
+    """Return a compact, secret-free explanation of operational health.
+
+    This is deliberately derived from persisted local facts.  It does not
+    infer printer actions, alter state, or treat a missing camera frame as a
+    defect detection.
+    """
+    now = time.time() if now_epoch is None else float(now_epoch)
+    printer = state.get("printer") if isinstance(state.get("printer"), dict) else {}
+    camera = state.get("camera") if isinstance(state.get("camera"), dict) else {}
+    guardian = state.get("guardian") if isinstance(state.get("guardian"), dict) else {}
+    autopilot = state.get("autopilot") if isinstance(state.get("autopilot"), dict) else {}
+    active_job = state.get("active_job") if isinstance(state.get("active_job"), dict) else {}
+    object_map = active_job.get("object_map") if isinstance(active_job.get("object_map"), dict) else {}
+    objects = object_map.get("objects") if isinstance(object_map.get("objects"), list) else []
+    running = str(printer.get("state") or "").upper() in RUNNING
+    connected = bool(printer.get("connected"))
+    latest = events[0] if events and isinstance(events[0], dict) else {}
+    latest_epoch = iso_epoch(latest.get("received_at"))
+    event_age = max(0, int(now - latest_epoch)) if latest_epoch is not None else None
+    failed_events = sum(1 for event in events if str(event.get("outcome") or "") == "failed")
+    pending_events = sum(1 for event in events if str(event.get("outcome") or "received") == "received")
+    pending_proposals = guardian.get("pending_proposals") if isinstance(guardian.get("pending_proposals"), list) else []
+    prepared = autopilot.get("prepared") if isinstance(autopilot.get("prepared"), list) else []
+    canonical_objects = sum(1 for item in objects if isinstance(item, dict) and item.get("protocol_object_id"))
+    skipped_objects = sum(1 for item in objects if isinstance(item, dict) and item.get("protocol_skipped"))
+
+    if not connected:
+        printer_level, printer_message = "offline", "Imprimante locale non connectée"
+    elif running:
+        printer_level, printer_message = "ok", "Impression suivie en direct"
+    else:
+        printer_level, printer_message = "info", "Connexion établie, impression non active"
+
+    if not camera.get("enabled"):
+        vision_level, vision_message = "info", "Captures Vision désactivées"
+    elif not camera.get("certificate_sha256"):
+        vision_level, vision_message = "warning", "Caméra activée sans empreinte TLS approuvée"
+    elif running and not camera.get("active_print"):
+        vision_level, vision_message = "warning", "Impression active sans session de captures"
+    else:
+        vision_level, vision_message = "ok", "Surveillance Vision configurée localement"
+
+    if failed_events:
+        reliability_level = "critical"
+        reliability_message = f"{failed_events} événement(s) MQTT à vérifier"
+    elif running and (event_age is None or event_age > 120):
+        reliability_level = "warning"
+        reliability_message = "Aucun rapport MQTT récent pendant l’impression"
+    elif pending_events:
+        reliability_level = "warning"
+        reliability_message = f"{pending_events} événement(s) MQTT en attente de traitement"
+    elif events:
+        reliability_level, reliability_message = "ok", "Journal MQTT traité sans erreur récente"
+    else:
+        reliability_level, reliability_message = "info", "En attente du premier rapport MQTT"
+
+    if pending_proposals:
+        guardian_level = "critical"
+        guardian_message = f"{len(pending_proposals)} alerte(s) Vision à examiner"
+    else:
+        guardian_level, guardian_message = "ok", "Aucune alerte Gardien en attente"
+
+    if prepared:
+        autopilot_level = "warning"
+        autopilot_message = f"{len(prepared)} exclusion(s) préparée(s), jamais envoyée(s)"
+    elif autopilot.get("plans"):
+        autopilot_level, autopilot_message = "info", "Proposition(s) AutoPilot en attente de préparation"
+    else:
+        autopilot_level, autopilot_message = "ok", "Aucune exclusion préparée"
+
+    if not active_job:
+        mapping_level, mapping_message = "info", "Aucun travail actif à cartographier"
+    elif object_map.get("status") == "mapped" and canonical_objects:
+        mapping_level = "ok"
+        mapping_message = f"{canonical_objects} objet(s) avec identité Bambu canonique"
+    elif object_map.get("status") == "mapped":
+        mapping_level, mapping_message = "warning", "Objets cartographiés sans identité Bambu canonique"
+    else:
+        mapping_level, mapping_message = "warning", "Cartographie G-code indisponible pour le travail actif"
+
+    levels = [printer_level, vision_level, reliability_level, guardian_level, autopilot_level, mapping_level]
+    if "critical" in levels:
+        overall_level, overall_message = "critical", "Une intervention ou une vérification est requise"
+    elif "warning" in levels:
+        overall_level, overall_message = "warning", "Supervision active avec point(s) à vérifier"
+    elif not connected:
+        overall_level, overall_message = "offline", "Companion attend la connexion à l’imprimante"
+    elif running:
+        overall_level, overall_message = "ok", "Tous les signaux de supervision sont cohérents"
+    else:
+        overall_level, overall_message = "info", "Companion est prêt à superviser la prochaine impression"
+
+    return {
+        "generated_at": now_iso(),
+        "overall": {"level": overall_level, "message": overall_message},
+        "printer": {"level": printer_level, "message": printer_message, "running": running,
+                    "progress": max(0, min(100, int(_float(printer.get("progress", 0))))),
+                    "job": str(printer.get("job") or "")},
+        "vision": {"level": vision_level, "message": vision_message,
+                   "enabled": bool(camera.get("enabled")),
+                   "capture_count": int((state.get("vision_storage") or {}).get("count") or 0)},
+        "reliability": {"level": reliability_level, "message": reliability_message,
+                        "event_count": len(events), "failed_events": failed_events,
+                        "pending_events": pending_events, "latest_event_at": latest.get("received_at") or "",
+                        "latest_event_age_seconds": event_age},
+        "guardian": {"level": guardian_level, "message": guardian_message,
+                     "pending_count": len(pending_proposals),
+                     "observations_count": int(guardian.get("observations_count") or 0)},
+        "autopilot": {"level": autopilot_level, "message": autopilot_message,
+                      "prepared_count": len(prepared)},
+        "mapping": {"level": mapping_level, "message": mapping_message,
+                    "object_count": len(objects), "canonical_object_count": canonical_objects,
+                    "skipped_object_count": skipped_objects},
+    }
 
 
 def capture_print_folder(name: str, task_id: str, started_at: str | None = None) -> str:
@@ -240,6 +368,10 @@ def autopilot_path_for_state(state_path: Path) -> Path:
     return AUTOPILOT_FILE if state_path == STATE_FILE else state_path.with_name("autopilot.sqlite3")
 
 
+def reports_path_for_state(state_path: Path) -> Path:
+    return REPORTS_FILE if state_path == STATE_FILE else state_path.with_name("reports.sqlite3")
+
+
 class EventJournal:
     """Small, local-only audit journal for MQTT print reports.
 
@@ -336,6 +468,105 @@ class EventJournal:
                    FROM mqtt_events ORDER BY received_at DESC LIMIT ?""", (limit,)
             ).fetchall()
         return [dict(row) for row in rows]
+
+
+class ReportArchive:
+    """Durable, redacted supervision snapshots for V2.5 review."""
+
+    MAX_REPORTS = 500
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.lock = threading.RLock()
+        self.initialize()
+
+    def _connect(self) -> sqlite3.Connection:
+        secure_directory(self.path.parent)
+        connection = sqlite3.connect(self.path, timeout=5)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA journal_mode = WAL")
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
+        return connection
+
+    def initialize(self) -> None:
+        with self.lock, self._connect() as connection:
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS supervision_reports (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    reason TEXT NOT NULL CHECK(reason IN ('manual', 'print_finished')),
+                    print_key TEXT NOT NULL DEFAULT '',
+                    report_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS supervision_reports_created
+                    ON supervision_reports(created_at DESC);
+                CREATE UNIQUE INDEX IF NOT EXISTS supervision_reports_terminal_once
+                    ON supervision_reports(reason, print_key)
+                    WHERE reason = 'print_finished' AND print_key != '';
+                """
+            )
+
+    @staticmethod
+    def _summary(row: sqlite3.Row) -> dict[str, Any]:
+        report = json.loads(row["report_json"])
+        print_data = report.get("print") if isinstance(report.get("print"), dict) else {}
+        supervision = report.get("supervision") if isinstance(report.get("supervision"), dict) else {}
+        overall = supervision.get("overall") if isinstance(supervision.get("overall"), dict) else {}
+        return {
+            "id": row["id"], "created_at": row["created_at"], "reason": row["reason"],
+            "print_state": str(print_data.get("state") or "INCONNU"),
+            "job": Path(str(print_data.get("job") or "")).name,
+            "overall_level": str(overall.get("level") or "info"),
+            "overall_message": str(overall.get("message") or ""),
+        }
+
+    def record(self, report: dict[str, Any], reason: str, print_key: str = "") -> dict[str, Any]:
+        if reason not in {"manual", "print_finished"}:
+            raise ValueError("Type de rapport invalide")
+        key = str(print_key or "")[:160]
+        created_at = now_iso()
+        encoded = json.dumps(report, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        with self.lock, self._connect() as connection:
+            if reason == "print_finished" and key:
+                existing = connection.execute(
+                    "SELECT * FROM supervision_reports WHERE reason = ? AND print_key = ?", (reason, key)
+                ).fetchone()
+                if existing is not None:
+                    return {**self._summary(existing), "created": False}
+            report_id = secrets.token_hex(16)
+            connection.execute(
+                "INSERT INTO supervision_reports(id, created_at, reason, print_key, report_json) VALUES (?, ?, ?, ?, ?)",
+                (report_id, created_at, reason, key, encoded),
+            )
+            connection.execute(
+                """DELETE FROM supervision_reports WHERE id IN (
+                       SELECT id FROM supervision_reports ORDER BY created_at DESC LIMIT -1 OFFSET ?
+                   )""", (self.MAX_REPORTS,),
+            )
+            row = connection.execute("SELECT * FROM supervision_reports WHERE id = ?", (report_id,)).fetchone()
+        return {**self._summary(row), "created": True}
+
+    def recent(self, limit: int = 20) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 100))
+        with self.lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM supervision_reports ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [self._summary(row) for row in rows]
+
+    def get(self, report_id: str) -> dict[str, Any]:
+        if not re.fullmatch(r"[a-f0-9]{32}", report_id):
+            raise ValueError("Identifiant de rapport invalide")
+        with self.lock, self._connect() as connection:
+            row = connection.execute("SELECT report_json FROM supervision_reports WHERE id = ?", (report_id,)).fetchone()
+        if row is None:
+            raise ValueError("Rapport introuvable")
+        return json.loads(row["report_json"])
 
 
 class Inventory:
@@ -1707,6 +1938,7 @@ class Companion:
         self.events = EventJournal(events_path_for_state(state_path))
         self.events.initialize()
         self.autopilot = AutoPilotPlanner(autopilot_path_for_state(state_path))
+        self.reports = ReportArchive(reports_path_for_state(state_path))
         previous_spools = json.dumps(self.state.get("spools", {}), sort_keys=True)
         self._sync_spools_from_inventory()
         if json.dumps(self.state["spools"], sort_keys=True) != previous_spools:
@@ -1798,6 +2030,8 @@ class Companion:
             clean["autopilot"] = self.autopilot.state(clean["guardian"], clean.get("active_job"))
             clean["events"] = self.events.recent()
             clean["vision_storage"] = self.vision_storage()
+            clean["supervision"] = build_supervision_snapshot(clean, clean["events"])
+            clean["report_history"] = self.reports.recent(12)
             return clean
 
     def supervision_report(self) -> dict[str, Any]:
@@ -1823,7 +2057,7 @@ class Companion:
             "print": {
                 "state": state.get("printer", {}).get("state", ""),
                 "progress": state.get("printer", {}).get("progress", 0),
-                "job": state.get("printer", {}).get("job", ""),
+                "job": Path(str(state.get("printer", {}).get("job") or "")).name,
                 "tracking_active": bool(active_job),
                 "object_map": object_map_summary(object_map.get("objects", [])) if isinstance(object_map, dict) else {
                     "status": "unavailable", "object_count": 0,
@@ -1837,8 +2071,41 @@ class Companion:
             },
             "guardian": state.get("guardian", {}),
             "autopilot": state.get("autopilot", {}),
+            "supervision": state.get("supervision", {}),
             "reliability": {"event_count": len(events), "outcomes": outcomes, "events": events},
         }
+
+    def archive_supervision_report(self, reason: str = "manual", print_key: str = "") -> dict[str, Any]:
+        """Persist a redacted report snapshot without any printer side effect."""
+        report = self.supervision_report()
+        return self.reports.record(report, reason, print_key)
+
+    def archived_supervision_report(self, report_id: str) -> dict[str, Any]:
+        return self.reports.get(report_id)
+
+    def _archive_terminal_report(self, payload: dict[str, Any]) -> None:
+        report = payload.get("print")
+        if not isinstance(report, dict):
+            return
+        state = str(report.get("gcode_state") or report.get("print_status") or "").upper()
+        if state not in TERMINAL_STATES:
+            return
+        task_id = str(report.get("subtask_id") or report.get("task_id") or "")
+        with self.lock:
+            history = next(
+                (item for item in self.state.get("history", [])
+                 if isinstance(item, dict) and item.get("result") == state
+                 and (not task_id or str(item.get("task_id") or "") == task_id)),
+                None,
+            )
+        if history is None:
+            return
+        stable_key = task_id or hashlib.sha256(
+            f"{history.get('file', '')}:{history.get('ended_at', '')}".encode("utf-8")
+        ).hexdigest()
+        archived = self.archive_supervision_report("print_finished", stable_key)
+        if archived.get("created"):
+            log(f"Rapport de supervision archivé pour le travail terminé {archived['id']}")
 
     def vision_storage(self) -> dict[str, int]:
         """Return the exact local footprint of indexed Vision captures."""
@@ -2397,6 +2664,7 @@ class Companion:
             self.events.mark(event_id, "failed", str(exc))
             raise
         self.events.mark(event_id, "processed")
+        self._archive_terminal_report(payload)
 
     def _on_message(self, payload: dict[str, Any]) -> None:
         report = payload.get("print")
@@ -2593,7 +2861,10 @@ class Companion:
                     self.state["accounted"].append(key)
                     self.state["accounted"] = self.state["accounted"][-1000:]
                     self.state["history"].insert(0, {**active, "result": state, "ended_at": now_iso(), "deducted": True, "deductions": deductions})
-                    log(f"Travail {'terminé et débité' if newly_settled else 'déjà comptabilisé'}: {key}")
+                    log(
+                        f"Travail {'terminé et débité' if newly_settled else 'déjà comptabilisé'}: "
+                        f"task={active.get('task_id') or 'sans-id'}"
+                    )
                 self._finalize_camera_print_session_locked(state, task_id, str(active.get("file") or ""))
                 self.state["history"] = self.state["history"][:100]
                 self.state["active_job"] = None
@@ -2993,6 +3264,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"events": self.app.events.recent(100)})
         elif path == "/api/report.json":
             self.send_json(self.app.supervision_report())
+        elif path == "/api/reports":
+            self.send_json({"reports": self.app.reports.recent(100)})
+        elif match := re.fullmatch(r"/api/reports/([a-f0-9]{32})\.json", path):
+            self.send_json(self.app.archived_supervision_report(match.group(1)))
         elif path == "/api/inventory/export.csv":
             self.send_csv(self.app.inventory_csv())
         elif match := re.fullmatch(r"/api/inventory/spools/(\d+)/history", path):
@@ -3062,6 +3337,9 @@ class Handler(BaseHTTPRequestHandler):
             elif match := re.fullmatch(r"/api/autopilot/proposals/([a-f0-9]{32})/prepare", path):
                 self.json_body()
                 self.send_json(self.app.prepare_autopilot_exclusion(match.group(1)))
+            elif path == "/api/reports/snapshot":
+                self.json_body()
+                self.send_json(self.app.archive_supervision_report())
             elif path == "/api/shutdown":
                 self.json_body()
                 self.send_json({"ok": True, "message": "Companion arrêté proprement"})
@@ -3078,25 +3356,32 @@ class Handler(BaseHTTPRequestHandler):
 HTML = r'''<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AMS Lite Companion V2</title><style>
 body.embedded .spools-card{order:1!important}body.embedded .printer-card{order:2!important}.inventory-card{display:none}.catalog-fields{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.catalog-actions button{width:100%}#catalogWindow{display:none}.catalog-window{max-width:1400px;margin:auto}.catalog-toolbar{display:flex;justify-content:space-between;align-items:end;gap:18px}.catalog-toolbar h2{font-size:24px;margin:0}.table-wrap{overflow:auto;border:1px solid #dfe3e7;border-radius:12px;background:white}.catalog-table{width:100%;border-collapse:collapse;min-width:1120px}.catalog-table th{background:#f0f3f5;color:#4e5863;text-align:left;font-size:12px;white-space:nowrap}.catalog-table th,.catalog-table td{padding:9px;border-bottom:1px solid #e7eaed;vertical-align:middle}.catalog-table tr:last-child td{border-bottom:0}.catalog-table tr[data-spool]{cursor:pointer}.catalog-table tr.selected td{background:#eaf8ef}.catalog-table input,.catalog-table select{min-width:90px;padding:7px;border:1px solid transparent;background:transparent;border-radius:6px}.catalog-table input:focus,.catalog-table select:focus{background:white;border-color:#00ae42;outline:none}.catalog-table .id-cell{color:#69717b;font-variant-numeric:tabular-nums}.catalog-table .actions{white-space:nowrap}.catalog-table .actions button{margin:0 3px 0 0;padding:8px 10px;font-size:12px}.catalog-add{display:grid;grid-template-columns:1.5fr repeat(3,1fr) .8fr .8fr .9fr auto;gap:8px;align-items:end;margin-top:14px;padding:14px;background:white;border:1px solid #dfe3e7;border-radius:12px}.catalog-add label{margin-top:0}.spool-timeline{margin-top:16px;padding:16px;background:white;border:1px solid #dfe3e7;border-radius:12px}.spool-timeline h3{margin:0 0 4px}.timeline{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(170px,1fr);gap:12px;overflow-x:auto;padding:26px 4px 6px;position:relative}.timeline:before{content:'';position:absolute;left:26px;right:26px;top:34px;height:3px;background:#cdebd8}.timeline-event{position:relative;z-index:1;padding-top:20px}.timeline-dot{position:absolute;top:0;left:12px;width:18px;height:18px;border-radius:50%;background:#00ae42;border:4px solid #eaf8ef}.timeline-event.remove .timeline-dot{background:#ef9b20}.timeline-event.deduct .timeline-dot{background:#3976db}.timeline-event .when{font-size:11px;color:#69717b}.timeline-event .what{font-weight:700;font-size:13px;margin:5px 0}.timeline-event .detail{font-size:12px;color:#505861}.timeline-empty{color:#69717b;padding:16px 0}body.catalog-view .wrap{max-width:none;padding:20px}body.catalog-view h1,body.catalog-view .sub,body.catalog-view .grid{display:none}body.catalog-view #catalogWindow{display:block}@media(max-width:700px){.catalog-fields{grid-template-columns:1fr 1fr}.catalog-add{grid-template-columns:1fr 1fr}}
-.catalog-summary{margin:16px 0}.catalog-summary h3{margin:0 0 8px}.summary-table{min-width:720px}.level-track{width:130px;height:8px;background:#e8edf0;border-radius:99px;overflow:hidden;margin-top:4px}.level-fill{height:100%;background:#00a23d;border-radius:99px}.weight-chart{margin:14px 0 4px;padding:12px;border:1px solid #e7eaed;border-radius:10px;background:#fbfcfc}.weight-chart h4{margin:0 0 4px}.weight-chart svg{width:100%;height:190px;display:block}.weight-chart .axis{stroke:#dfe3e7;stroke-width:1}.weight-chart .line{fill:none;stroke:#00a23d;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}.weight-chart .point{fill:#fff;stroke:#00a23d;stroke-width:3}.weight-chart .point:hover{fill:#00a23d;cursor:help}.chart-label{font-size:11px;fill:#69717b}
+.catalog-summary{margin:16px 0}.catalog-summary h3{margin:0 0 8px}.summary-table{min-width:720px}.level-track{width:130px;height:8px;background:#e8edf0;border-radius:99px;overflow:hidden;margin-top:4px}.level-fill{height:100%;background:#00a23d;border-radius:99px}.weight-chart{margin:14px 0 4px;padding:12px;border:1px solid #e7eaed;border-radius:10px;background:#fbfcfc}.weight-chart h4{margin:0 0 4px}.weight-chart svg{width:100%;height:190px;display:block}.weight-chart .axis{stroke:#dfe3e7;stroke-width:1}.weight-chart .line{fill:none;stroke:#00a23d;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}.weight-chart .point{fill:#fff;stroke:#00a23d;stroke-width:3}.weight-chart .point:hover{fill:#00a23d;cursor:help}.chart-label{font-size:11px;fill:#69717b}.supervision-card{background:linear-gradient(135deg,#f8fcf9,#f2f7f4)}.supervision-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.supervision-head h2{margin-bottom:4px}.supervision-head p{margin:0}.supervision-badge{display:inline-block;padding:6px 10px;border-radius:99px;font-size:12px;font-weight:800;background:#eef1f3;color:#4e5863}.supervision-badge.ok{background:#e3f7ea;color:#087535}.supervision-badge.warning{background:#fff0e7;color:#ad4d18}.supervision-badge.critical{background:#ffe7e5;color:#ad2620}.supervision-badge.offline{background:#ebedf0;color:#59636e}.supervision-grid{display:grid;grid-template-columns:repeat(3,minmax(180px,1fr));gap:10px;margin-top:14px}.supervision-item{border:1px solid #dfe6e1;border-left:4px solid #88939d;border-radius:10px;padding:11px;background:#fff}.supervision-item.ok{border-left-color:#00a23d}.supervision-item.warning{border-left-color:#e28a20}.supervision-item.critical{border-left-color:#cc3a32}.supervision-item.offline{border-left-color:#7b8691}.supervision-item b{display:block;font-size:13px;margin-bottom:4px}.supervision-item span{display:block;color:#59636e;font-size:12px;line-height:1.35}.supervision-meta{display:flex;flex-wrap:wrap;gap:8px;margin-top:13px}.supervision-meta span{background:#eef2f3;border-radius:7px;padding:6px 8px;font-size:12px;color:#4e5863}.report-list{display:grid;gap:9px}.report-item{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:center;border-top:1px solid #e5e9e7;padding:10px 0}.report-item:first-child{border-top:0;padding-top:0}.report-item b{display:block;font-size:13px}.report-item span{font-size:12px;color:#69717b}.report-item button{margin:0}.vision-history{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}.vision-history span{padding:5px 8px;border-radius:7px;background:#f1f4f3;font-size:12px;color:#55616a}@media(max-width:700px){.supervision-grid{grid-template-columns:1fr 1fr}.supervision-head{align-items:flex-start}.report-item{grid-template-columns:1fr}}
 :root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#20242a;background:#f4f5f6}body{margin:0}.wrap{max-width:1050px;margin:auto;padding:24px}h1{margin:0 0 4px}.sub{color:#69717b;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}.card{background:white;border:1px solid #dfe3e7;border-radius:14px;padding:18px;box-shadow:0 2px 10px #0000000b}.wide{grid-column:1/-1}h2{font-size:17px;margin:0 0 14px}label{display:block;font-size:12px;color:#656d76;margin:9px 0 4px}input,select,button{box-sizing:border-box;border:1px solid #cbd1d7;border-radius:8px;padding:9px;font:inherit}input,select{width:100%}input[type=checkbox]{width:auto;margin-right:7px}button{background:#00ae42;color:white;border:0;font-weight:600;cursor:pointer;margin-top:12px}button.secondary{background:#59636e}.status{display:inline-flex;gap:7px;align-items:center;font-weight:600}.dot{width:10px;height:10px;border-radius:50%;background:#d33}.on .dot{background:#00ae42}.spools{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.spool{padding:12px;border:1px solid #e1e4e7;border-radius:10px}.spool b{color:#00a23d}.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.bridge-map,.catalog-form{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.catalog{display:grid;grid-template-columns:1fr 160px;gap:12px;align-items:end;border-top:1px solid #eee;padding:12px 0}.catalog:first-child{border-top:0;padding-top:0}.check{font-size:14px;color:#20242a}.notice{padding:10px;border-radius:8px;background:#eef8f1;margin:10px 0}.guardian-alert{background:#fff4e9;color:#8a3d00}.guardian-actions{display:flex;gap:8px;flex-wrap:wrap}.guardian-actions button{margin-top:8px}.object-map{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}.object-chip{border:1px solid #dfe3e7;border-radius:8px;padding:9px;font-size:12px;overflow-wrap:anywhere}.object-chip b{color:#0b6d32}.object-chip span{color:#69717b}.error{background:#ffecec;color:#a11}.muted{color:#69717b;font-size:13px;overflow-wrap:anywhere}.line{display:grid;grid-template-columns:1fr 100px 90px;gap:8px;align-items:end}.history{font-size:13px;border-top:1px solid #eee;padding:8px 0}body.embedded .wrap{padding:10px;max-width:none}body.embedded h1,body.embedded .sub,body.embedded .manual-card,body.embedded .shutdown-card,body.embedded .inventory-card{display:none}body.embedded .grid{grid-template-columns:1fr;gap:10px}body.embedded .wide{grid-column:auto}body.embedded .card{padding:14px;border-radius:10px;box-shadow:none}body.embedded .spools-card{order:1}body.embedded .printer-card{order:2}body.embedded .bridge-card{order:3}body.embedded .guardian-card{order:4}body.embedded .gcode-card{order:5}body.embedded .history-card{order:6}@media(max-width:700px){.spools,.bridge-map,.catalog-form{grid-template-columns:1fr 1fr}.catalog{grid-template-columns:1fr}.line{grid-template-columns:1fr}.wrap{padding:12px}}</style></head><body><div class="wrap">
-<h1>AMS Lite Companion V2</h1><div class="sub">Compteur local v2.2.0 — environnement indépendant lié à Bambu Studio officiel.</div><div id="msg"></div>
+<h1>AMS Lite Companion V2</h1><div class="sub">Compteur local v2.5.0 — environnement indépendant lié à Bambu Studio officiel.</div><div id="msg"></div>
 <div class="grid"><section class="card printer-card"><h2>Imprimante locale</h2><div id="conn" class="status"><span class="dot"></span><span>Déconnectée</span></div><div id="pstate"></div>
 <label>Adresse IP</label><input id="ip" placeholder="192.168.1.50"><label>Numéro de série</label><input id="serial" placeholder="01S00A..."><label>Code d’accès LAN <span class="muted">(laisse vide pour conserver le code enregistré)</span></label><input id="code" type="password" placeholder="8 chiffres"><button onclick="saveConfig()">Enregistrer et connecter</button></section>
 <section class="card bridge-card"><h2>Passerelle Bambu Studio</h2><div id="bridgeStatus" class="notice">En attente de Bambu Studio</div><label class="check"><input id="autoEnabled" type="checkbox">Récupérer automatiquement le .gcode.3mf</label><label class="check"><input id="fallbackEnabled" type="checkbox">Armer avec la correspondance A1–A4 enregistrée ci-dessous</label><div class="bridge-map" id="bridgeMap"></div><button onclick="saveBridge()">Enregistrer la passerelle</button><div id="bridgeDetails" class="muted"></div></section>
 <section class="card wide guardian-card"><h2>Gardien de plateau</h2><div id="guardianStatus" class="notice">Initialisation du gardien…</div><div id="guardianDetails" class="muted"></div></section>
 <section class="card wide autopilot-card"><h2>AutoPilot</h2><div id="autopilot" class="notice">Vérification des garde-fous…</div></section>
 <section class="card wide gcode-card"><h2>Cartographie G-code</h2><div id="gcodeMap" class="muted">Analyse du plateau…</div></section>
+<section class="card wide supervision-card"><div class="supervision-head"><div><h2>Poste de supervision</h2><p id="supervisionMessage" class="muted">Analyse des signaux locaux…</p></div><span id="supervisionBadge" class="supervision-badge" role="status" aria-live="polite">Initialisation</span></div><div id="supervisionGrid" class="supervision-grid"></div><div id="supervisionMeta" class="supervision-meta"></div></section>
 <section class="card wide spools-card"><h2>Bobines actuellement dans l’AMS Lite</h2><div id="rfidStatus" class="muted">En attente de lecture RFID</div><div class="spools" id="spools"></div><button onclick="saveSpools()">Enregistrer les poids</button><button class="secondary" onclick="openCatalog()">Gérer le catalogue de bobines…</button><button class="secondary" onclick="openVision()">Ouvrir le centre Vision…</button></section>
 <section class="card wide history-card"><h2>Historique</h2><div id="history">Aucun travail comptabilisé.</div></section>
 <section class="card wide audit-card"><h2>Journal de fiabilité</h2><div id="audit" class="muted">Aucun événement MQTT enregistré.</div><button class="secondary" onclick="exportSupervisionReport()">Télécharger le rapport de supervision</button></section>
+<section class="card wide reports-card"><h2>Historique Vision et rapports</h2><div id="visionHistory" class="vision-history"></div><div id="reportHistory" class="report-list muted">Aucun rapport archivé.</div><button class="secondary" onclick="archiveSupervisionSnapshot()">Archiver un instantané de supervision</button></section>
 <section class="card wide shutdown-card"><h2>Companion</h2><p>Utilise ce bouton après l’impression pour enregistrer et arrêter complètement Companion.</p><button class="secondary" onclick="shutdownCompanion()">Arrêter Companion</button></section></div><section id="catalogWindow" class="catalog-window"><div class="catalog-toolbar"><div><h2>Gestionnaire de bobines</h2><p class="muted">Stock, emplacement, alertes et historique. Conçu pour rester fluide avec plusieurs centaines de bobines.</p></div><button class="secondary no-top" onclick="exportCatalog()">Exporter CSV</button></div><section id="inventoryKpis" class="inventory-kpis"></section><section class="catalog-controls"><input id="catalogSearch" type="search" oninput="setCatalogFilter('query',this.value)" placeholder="Rechercher nom, matière, marque, couleur, emplacement…"><select id="catalogMaterial" onchange="setCatalogFilter('material',this.value)"></select><select id="catalogBrand" onchange="setCatalogFilter('brand',this.value)"></select><select id="catalogLocation" onchange="setCatalogFilter('location',this.value)"></select><select id="catalogStatus" onchange="setCatalogFilter('status',this.value)"><option value="all">Tous les états</option><option value="low">À commander</option><option value="ams">Dans l’AMS</option><option value="unlocated">Emplacement à définir</option></select><select id="catalogSort" onchange="setCatalogFilter('sort',this.value)"><option value="name">Trier : nom</option><option value="remaining">Trier : stock restant</option><option value="recent">Trier : dernière utilisation</option><option value="created">Trier : ajout récent</option></select></section><section id="bulkBar" class="bulk-bar"><strong id="selectionCount">Aucune sélection</strong><input id="bulkLocation" placeholder="Emplacement, ex. Étagère B-03"><button class="secondary no-top" onclick="runBulk('location')">Déplacer</button><input id="bulkThreshold" type="number" min="0" step="1" placeholder="Seuil g"><button class="secondary no-top" onclick="runBulk('threshold')">Seuil</button><button class="danger no-top" onclick="runBulk('archive')">Archiver</button></section><div class="table-wrap scalable-table"><table class="catalog-table"><thead><tr><th><input id="selectAllCatalog" type="checkbox" onchange="togglePageSelection(this.checked)" title="Sélectionner la page"></th><th>Bobine</th><th>Matière / couleur</th><th>Emplacement</th><th>Stock</th><th>Dernière utilisation</th><th>Impr.</th><th></th></tr></thead><tbody id="catalog"></tbody></table></div><div id="catalogPager" class="catalog-pager"></div><section id="spoolDetail" class="spool-detail"><h3>Fiche de bobine</h3><p class="muted">Sélectionne une bobine dans la liste pour consulter ou modifier sa fiche.</p></section><section class="catalog-add"><div><label>Nom descriptif <span class="muted">(automatique)</span></label><input id="newSpoolName" oninput="this.dataset.custom='1'" placeholder="PLA bleu mat"></div><div><label>Matière</label><input id="newSpoolMaterial" oninput="autoNewSpoolName()" placeholder="PLA"></div><div><label>Marque</label><input id="newSpoolBrand" placeholder="Bambu Lab"></div><div><label>Couleur</label><input id="newSpoolColor" oninput="autoNewSpoolName()" placeholder="Bleu"></div><div><label>Initial (g)</label><input id="newSpoolInitial" type="number" min="0" step="0.1" value="1000"></div><div><label>Restant (g)</label><input id="newSpoolRemaining" type="number" min="0" step="0.1" value="1000"></div><div><label>Emplacement</label><input id="newSpoolLocation" placeholder="Étagère B-03"></div><div><label>Seuil (g)</label><input id="newSpoolThreshold" type="number" min="0" step="1" value="100"></div><div><label>Date d’ajout</label><input id="newSpoolDate" type="date"></div><button onclick="createSpool()">Ajouter</button></section></section></div>
 <script>
 const embedded=new URLSearchParams(location.search).get('embedded')==='1',catalogView=new URLSearchParams(location.search).get('catalog')==='1',apiToken='__API_TOKEN__';if(embedded)document.body.classList.add('embedded');if(catalogView)document.body.classList.add('catalog-view');let S=null, imported=null, formDirty=false, selectedSpoolId=null, pendingDeleteId=null, catalogLoaded=false,catalogState={query:'',material:'all',brand:'all',location:'all',status:'all',sort:'name',page:0,pageSize:50,selected:new Set()};const $=id=>document.getElementById(id);function msg(t,e=false){$('msg').textContent=t||'';$('msg').className=t?`notice ${e?'error':''}`:''}function openCatalog(){if(window.webkit?.messageHandlers?.companion)window.webkit.messageHandlers.companion.postMessage('openCatalog');else window.open('/?catalog=1','ams-lite-catalog')}
 const visualStyle=document.createElement('style');visualStyle.textContent='.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}.catalog-summary{margin:16px 0}.catalog-summary h3{margin:0 0 8px}.summary-table{min-width:720px}.level-track{width:130px;height:8px;background:#e8edf0;border-radius:99px;overflow:hidden;margin-top:4px}.level-fill{height:100%;background:#00a23d;border-radius:99px}.weight-chart{margin:14px 0 4px;padding:12px;border:1px solid #e7eaed;border-radius:10px;background:#fbfcfc}.weight-chart h4{margin:0 0 4px}.weight-chart svg{width:100%;height:190px;display:block}.weight-chart .axis{stroke:#dfe3e7;stroke-width:1}.weight-chart .line{fill:none;stroke:#00a23d;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}.weight-chart .point{fill:#fff;stroke:#00a23d;stroke-width:3}.weight-chart .point:hover{fill:#00a23d;cursor:help}.chart-label{font-size:11px;fill:#69717b}';document.head.append(visualStyle);
 const advancedStyle=document.createElement('style');advancedStyle.textContent='.no-top{margin-top:0}.inventory-kpis{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:10px;margin:18px 0}.kpi{padding:14px;border:1px solid #dfe3e7;border-radius:12px;background:#fff}.kpi b{display:block;font-size:23px;color:#19222b}.kpi span{font-size:12px;color:#69717b}.kpi.alert b{color:#c34918}.catalog-controls{display:grid;grid-template-columns:2fr repeat(5,minmax(120px,1fr));gap:8px;margin:12px 0}.catalog-controls input,.catalog-controls select{margin:0}.bulk-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:12px 0;padding:10px 12px;border:1px solid #cfe6d7;border-radius:10px;background:#f5fbf7}.bulk-bar input{width:170px}.danger{background:#b5392e}.scalable-table{max-height:610px}.catalog-table tr.catalog-row:hover td{background:#f4fbf6}.catalog-table tr.catalog-row.selected td{background:#e9f7ee}.catalog-table .stock-cell{min-width:160px}.stock-line{display:flex;align-items:center;gap:8px;white-space:nowrap}.stock-line .level-track{width:76px;margin:0}.stock-low{color:#b94018;font-weight:700}.status-chip{display:inline-block;border-radius:99px;padding:3px 7px;background:#edf1f3;color:#4e5863;font-size:11px}.status-chip.low{background:#fff0e9;color:#b94018}.status-chip.ams{background:#e6f8ec;color:#087535}.catalog-pager{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:12px 0}.catalog-pager button{margin:0}.spool-detail{margin:18px 0;padding:18px;border:1px solid #dfe3e7;border-radius:12px;background:#fff}.detail-grid{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:10px}.detail-grid .detail-wide{grid-column:span 2}.detail-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}.detail-actions button{margin:0}.catalog-add{grid-template-columns:repeat(5,minmax(120px,1fr)) auto}.catalog-add label{display:block}@media(max-width:900px){.inventory-kpis{grid-template-columns:repeat(2,1fr)}.catalog-controls{grid-template-columns:1fr 1fr}.detail-grid{grid-template-columns:1fr 1fr}.detail-grid .detail-wide{grid-column:span 2}.catalog-add{grid-template-columns:1fr 1fr}}';document.head.append(advancedStyle);
 async function api(path,opt={}){let headers=new Headers(opt.headers||{});headers.set('X-AMS-Token',apiToken);if(opt.body&&typeof opt.body==='string'&&!headers.has('Content-Type'))headers.set('Content-Type','application/json');let r=await fetch(path,{...opt,headers,credentials:'same-origin'}),j=await r.json();if(!r.ok)throw Error(j.error||'Erreur');return j}
-function render(s){S=s;if(catalogView){if(!catalogLoaded){renderCatalog(s.inventory);catalogLoaded=true}return}$('conn').className='status '+(s.printer.connected?'on':'');$('conn').lastElementChild.textContent=s.printer.connected?'Connectée':'Déconnectée';$('pstate').textContent=`${s.printer.state||''} ${s.printer.progress||0}% ${s.printer.job||''}`;$('rfidStatus').textContent=s.printer.rfid_status||'En attente de lecture RFID';
+function supervisionLabel(level){return({ok:'Stable',info:'Information',warning:'À vérifier',critical:'Intervention',offline:'Hors ligne'})[level]||'Inconnu'}
+function supervisionAge(seconds){if(seconds==null)return 'aucun rapport';if(seconds<60)return `il y a ${seconds} s`;let minutes=Math.floor(seconds/60);return `il y a ${minutes} min`}
+function renderSupervision(s){let summary=s.supervision||{},overall=summary.overall||{},badge=$('supervisionBadge');if(!badge)return;let level=overall.level||'info';badge.className='supervision-badge '+level;badge.textContent=supervisionLabel(level);$('supervisionMessage').textContent=overall.message||'Aucun signal de supervision disponible.';let cards=[['Imprimante',summary.printer],['Vision',summary.vision],['Fiabilité MQTT',summary.reliability],['Gardien',summary.guardian],['AutoPilot',summary.autopilot],['Cartographie',summary.mapping]];$('supervisionGrid').innerHTML=cards.map(([title,item])=>{item=item||{};let itemLevel=item.level||'info';return `<article class="supervision-item ${esc(itemLevel)}"><b>${esc(title)} · ${esc(supervisionLabel(itemLevel))}</b><span>${esc(item.message||'État indisponible')}</span></article>`}).join('');let printer=summary.printer||{},reliability=summary.reliability||{},mapping=summary.mapping||{};$('supervisionMeta').innerHTML=[printer.running?`Impression : ${esc(printer.job||'sans nom')} · ${Number(printer.progress||0)} %`:'Aucune impression active',`Dernier MQTT : ${esc(supervisionAge(reliability.latest_event_age_seconds))}`,`Objets Bambu : ${Number(mapping.canonical_object_count||0)} / ${Number(mapping.object_count||0)}`,`Rapports traités : ${Number(reliability.event_count||0)}`].map(item=>`<span>${item}</span>`).join('')}
+function defectLabel(value){return({spaghetti:'spaghetti',detachment:'décollement',warping:'warping',extrusion_anomaly:'extrusion anormale',anomaly:'anomalie'})[value]||value||'anomalie'}
+function renderReportHistory(s){let guardian=s.guardian||{},history=guardian.history_by_defect||{},chips=[];Object.entries(history).forEach(([defect,statuses])=>{let count=Object.values(statuses||{}).reduce((total,value)=>total+Number(value||0),0);chips.push(`${count} × ${defectLabel(defect)}`)});$('visionHistory').innerHTML=chips.length?chips.map(text=>`<span>${esc(text)}</span>`).join(''):'<span>Aucune alerte Vision historique.</span>';let reports=Array.isArray(s.report_history)?s.report_history:[];$('reportHistory').innerHTML=reports.length?reports.map(report=>`<article class="report-item"><div><b>${esc(report.reason==='print_finished'?'Fin d’impression':'Instantané manuel')} · ${esc(supervisionLabel(report.overall_level))}</b><span>${esc(timelineDate(report.created_at))}${report.job?` · ${esc(report.job)}`:''}<br>${esc(report.overall_message||'')}</span></div><button class="secondary" onclick="downloadArchivedReport('${report.id}')">Télécharger</button></article>`).join(''):'Aucun rapport archivé. Les rapports de fin d’impression et les instantanés manuels apparaîtront ici.'}
+function render(s){S=s;if(catalogView){if(!catalogLoaded){renderCatalog(s.inventory);catalogLoaded=true}return}renderSupervision(s);renderReportHistory(s);$('conn').className='status '+(s.printer.connected?'on':'');$('conn').lastElementChild.textContent=s.printer.connected?'Connectée':'Déconnectée';$('pstate').textContent=`${s.printer.state||''} ${s.printer.progress||0}% ${s.printer.job||''}`;$('rfidStatus').textContent=s.printer.rfid_status||'En attente de lecture RFID';
 if(!formDirty){$('ip').value=s.config.ip||'';$('serial').value=s.config.serial||'';$('code').placeholder=s.config.access_code?'Code enregistré':'8 chiffres';
 $('autoEnabled').checked=!!s.bridge.enabled;$('fallbackEnabled').checked=!!s.bridge.fallback_enabled;
 $('bridgeMap').innerHTML=[1,2,3,4].map(i=>`<div><label>Filament ${i}</label><select id="bm${i}">${[1,2,3,4].map(slot=>`<option value="${slot}" ${String(s.bridge.default_mapping[i])==String(slot)?'selected':''}>A${slot}</option>`).join('')}</select></div>`).join('');
@@ -3152,6 +3437,8 @@ async function deleteSelectedSpool(){if(!selectedSpoolId||!confirm('Supprimer d�
 async function runBulk(action){let ids=[...catalogState.selected];if(!ids.length)return msg('Sélectionne au moins une bobine.',true);if(action==='archive'&&!confirm(`Archiver ${ids.length} bobine(s) ? Leur historique sera conservé.`))return;let body={ids,action};if(action==='location')body.storage_location=$('bulkLocation').value;if(action==='threshold')body.low_stock_g=+$('bulkThreshold').value;try{let result=await api('/api/inventory/bulk',{method:'POST',body:JSON.stringify(body)});if(action==='archive'){catalogState.selected.clear();selectedSpoolId=null}catalogLoaded=false;msg(result.message);refresh()}catch(e){msg(e.message,true)}}
 async function exportCatalog(){try{let response=await fetch('/api/inventory/export.csv',{headers:{'X-AMS-Token':apiToken},credentials:'same-origin'});if(!response.ok)throw Error('Export impossible');let blob=await response.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download='ams-lite-catalogue.csv';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);msg('Export CSV téléchargé.')}catch(e){msg(e.message,true)}}
 async function exportSupervisionReport(){try{let response=await fetch('/api/report.json',{headers:{'X-AMS-Token':apiToken},credentials:'same-origin'});if(!response.ok)throw Error('Rapport impossible');let blob=await response.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download='ams-lite-rapport-supervision.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);msg('Rapport de supervision téléchargé.')}catch(e){msg(e.message,true)}}
+async function archiveSupervisionSnapshot(){try{let report=await api('/api/reports/snapshot',{method:'POST',body:'{}'});msg(`Instantané archivé (${report.id}).`);refresh()}catch(e){msg(e.message,true)}}
+async function downloadArchivedReport(id){try{let response=await fetch('/api/reports/'+encodeURIComponent(id)+'.json',{headers:{'X-AMS-Token':apiToken},credentials:'same-origin'});if(!response.ok)throw Error('Rapport archivé introuvable');let blob=await response.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download='ams-lite-rapport-'+id+'.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000)}catch(e){msg(e.message,true)}}
 createSpool=async function(){try{await api('/api/inventory/spools',{method:'POST',body:JSON.stringify({name:$('newSpoolName').value,material:$('newSpoolMaterial').value,brand:$('newSpoolBrand').value,color:$('newSpoolColor').value,initial_g:+$('newSpoolInitial').value,remaining_g:+$('newSpoolRemaining').value,storage_location:$('newSpoolLocation').value,low_stock_g:+$('newSpoolThreshold').value,created_at:$('newSpoolDate').value})});['newSpoolName','newSpoolMaterial','newSpoolBrand','newSpoolColor','newSpoolLocation'].forEach(id=>$(id).value='');delete $('newSpoolName').dataset.custom;catalogLoaded=false;msg('Bobine ajoutée au catalogue.');refresh()}catch(e){msg(e.message,true)}};
 const visionView=new URLSearchParams(location.search).get('vision')==='1';
 function openVision(){if(window.webkit?.messageHandlers?.companion)window.webkit.messageHandlers.companion.postMessage('openVision');else window.open('/?vision=1','ams-lite-vision')}
