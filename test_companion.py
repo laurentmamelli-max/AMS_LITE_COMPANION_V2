@@ -170,7 +170,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("2.1.0", report["application"]["version"])
+            self.assertEqual("2.2.0", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -970,6 +970,7 @@ class CompanionTests(unittest.TestCase):
                 self.assertIn("AMS Lite Companion", html)
                 self.assertIn("Arrêter Companion", html)
                 self.assertIn("Passerelle Bambu Studio", html)
+                self.assertIn("Cartographie G-code", html)
                 self.assertIn("Gestionnaire de bobines", html)
                 self.assertIn("catalogView=", html)
                 self.assertIn("catalog-table", html)
@@ -983,7 +984,7 @@ class CompanionTests(unittest.TestCase):
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("2.1.0", report["application"]["version"])
+                self.assertEqual("2.2.0", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
                 bridge_request = urllib.request.Request(
                     base + "/api/bridge",

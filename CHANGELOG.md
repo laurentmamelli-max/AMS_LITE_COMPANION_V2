@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.2.0 — 2026-07-28
+
+- Cartographie G-code étendue au format réel de Bambu Studio : les marqueurs
+  `start/stop printing object` sont agrégés sur toutes les couches d’un même
+  objet, avec enveloppe XY et plages de lignes de l’outil de découpe.
+- La cartographie est affichée directement dans le tableau de bord ; le
+  gardien et AutoPilot utilisent désormais les identifiants objets Bambu réels.
+- Validation effectuée sur le 3MF Bambu Studio local : sept objets ont été
+  retrouvés, chacun avec une zone XY et des segments multi-couches.
+
 ## 2.1.0 — 2026-07-27
 
 - Ajout d’un journal durable local des événements MQTT d’impression. Chaque
