@@ -140,6 +140,79 @@ class CompanionTests(unittest.TestCase):
             persisted = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(5, persisted["camera"]["pending_capture_layer"])
 
+    def test_mqtt_events_are_durable_and_never_store_the_lan_code(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            app = ac.Companion(path)
+            app.configure({"access_code": "87654321"})
+            app.on_message({"print": {
+                "gcode_state": "RUNNING", "subtask_id": "audit-1",
+                "subtask_name": "audit.gcode.3mf", "layer_num": 15, "mc_percent": 42,
+                "access_code": "87654321",
+            }})
+            event = app.public_state()["events"][0]
+            self.assertEqual("processed", event["outcome"])
+            self.assertEqual("audit-1", event["task_id"])
+            self.assertEqual(15, event["layer"])
+            self.assertNotIn("87654321", json.dumps(event))
+            restarted = ac.Companion(path)
+            restored = restarted.events.recent()[0]
+            self.assertEqual("audit-1", restored["task_id"])
+            self.assertEqual("processed", restored["outcome"])
+
+    def test_supervision_report_is_compact_and_never_contains_lan_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.configure({"access_code": "87654321", "ip": "192.168.1.24", "serial": "SECRET-SERIAL"})
+            app.state["active_job"] = {"object_map": {
+                "status": "mapped", "objects": [{"id": "cube", "label": "Cube"}],
+            }}
+            app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
+            report = app.supervision_report()
+            self.assertEqual(1, report["schema_version"])
+            self.assertEqual("2.1.0", report["application"]["version"])
+            self.assertEqual(1, report["reliability"]["event_count"])
+            self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
+            self.assertEqual("mapped", report["print"]["object_map"]["status"])
+            self.assertEqual(1, report["print"]["object_map"]["object_count"])
+            encoded = json.dumps(report)
+            self.assertNotIn("87654321", encoded)
+            self.assertNotIn("192.168.1.24", encoded)
+            self.assertNotIn("SECRET-SERIAL", encoded)
+
+    def test_vision_storage_reports_only_indexed_capture_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            app = ac.Companion(path)
+            root = path.parent / "captures"
+            root.mkdir()
+            active = "layer-00005-20260727-230000.jpg"
+            completed = "layer-00010-20260727-230500.jpg"
+            folder = "print-20260727-job-impression"
+            (root / active).write_bytes(b"abc")
+            (root / folder).mkdir()
+            (root / folder / completed).write_bytes(b"defgh")
+            (root / "orphan.jpg").write_bytes(b"ignored")
+            app.state["camera"]["captures"] = [
+                {"file": active}, {"file": completed, "folder": folder},
+            ]
+            self.assertEqual(
+                {"count": 2, "bytes": 8, "completed": 1, "active": 1},
+                app.vision_storage(),
+            )
+
+    def test_guardian_rejects_an_object_missing_from_active_gcode_map(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.state["active_job"] = {
+                "object_map": {"status": "mapped", "objects": [{"id": "cube", "label": "Cube"}]},
+            }
+            with self.assertRaisesRegex(ValueError, "cartographie G-code"):
+                app.observe_plate_guardian({
+                    "object_id": "inconnu", "object_label": "Inconnu", "confidence": 0.99,
+                    "source": "test", "frame_sha256": "a" * 64,
+                })
+
     def test_finished_print_moves_its_captures_into_a_dedicated_folder_and_can_delete_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.json"
@@ -907,6 +980,11 @@ class CompanionTests(unittest.TestCase):
                 self.assertIn("embedded=new URLSearchParams", html)
                 self.assertIn(server.api_token, html)
                 self.assertEqual(1000, state["spools"]["1"]["remaining_g"])
+                report = json.loads(urllib.request.urlopen(urllib.request.Request(
+                    base + "/api/report.json", headers=headers), timeout=2).read())
+                self.assertEqual(1, report["schema_version"])
+                self.assertEqual("2.1.0", report["application"]["version"])
+                self.assertNotIn("access_code", json.dumps(report))
                 bridge_request = urllib.request.Request(
                     base + "/api/bridge",
                     data=json.dumps({"enabled": True, "fallback_enabled": True,

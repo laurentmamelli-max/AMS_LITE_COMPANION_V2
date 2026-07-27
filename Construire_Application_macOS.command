@@ -53,9 +53,11 @@ xcrun lipo -create \
 cp "$ROOT/ams_companion.py" "$RESOURCES/ams_companion.py"
 cp "$ROOT/plate_guardian.py" "$RESOURCES/plate_guardian.py"
 cp "$ROOT/bambu_camera.py" "$RESOURCES/bambu_camera.py"
+cp "$ROOT/gcode_mapper.py" "$RESOURCES/gcode_mapper.py"
+cp "$ROOT/autopilot.py" "$RESOURCES/autopilot.py"
 cp "$ROOT/macos/Info.plist" "$CONTENTS/Info.plist"
 chmod 755 "$MACOS/AMS-Lite-Companion-V2"
-chmod 644 "$RESOURCES/ams_companion.py" "$RESOURCES/plate_guardian.py" "$RESOURCES/bambu_camera.py" "$CONTENTS/Info.plist"
+chmod 644 "$RESOURCES/ams_companion.py" "$RESOURCES/plate_guardian.py" "$RESOURCES/bambu_camera.py" "$RESOURCES/gcode_mapper.py" "$RESOURCES/autopilot.py" "$CONTENTS/Info.plist"
 
 codesign --force --deep --options runtime --sign "$SIGNING_IDENTITY" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"

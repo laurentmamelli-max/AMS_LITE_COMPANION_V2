@@ -1,5 +1,32 @@
 # Changelog
 
+## 2.1.0 — 2026-07-27
+
+- Ajout d’un journal durable local des événements MQTT d’impression. Chaque
+  rapport utile est écrit avant son traitement, puis marqué traité ou en échec
+  afin de rendre une coupure réseau ou un redémarrage vérifiable.
+- Le journal ne stocke ni le code LAN ni le contenu brut des messages MQTT ;
+  il conserve uniquement l’état, le travail, la couche, la progression et le
+  résultat du traitement.
+- Le tableau de bord affiche les derniers événements de fiabilité, et l’API
+  locale expose le journal complet protégé par le même jeton de session.
+- Un rapport de supervision JSON peut être téléchargé depuis le tableau de
+  bord. Il rassemble l’état d’impression, Vision, Gardien, AutoPilot et le
+  journal de fiabilité sans jamais inclure d’identifiant d’imprimante, chemin,
+  code LAN ou message MQTT brut.
+- Centre Vision indique désormais le nombre d’images indexées et leur espace
+  disque réel. Les fichiers non référencés ne sont pas comptés.
+- Première cartographie G-code : les objets explicitement balisés par le
+  trancheur sont associés à leurs plages de lignes et zones XY. Le Gardien
+  refuse une observation qui cible un objet absent de cette carte.
+- AutoPilot fournit désormais des plans d’exclusion simulés et auditables. Une
+  action physique reste volontairement bloquée tant que le protocole Bambu
+  n’est pas documenté et validé.
+- Les alertes Vision distinguent spaghetti, décollement, warping et extrusion
+  anormale : les preuves de catégories différentes ne sont jamais mélangées.
+- Documentation V2 corrigée : port local, répertoire de données et lien de
+  release correspondent désormais à l’application V2.
+
 ## 1.5.0 — 2026-07-27
 
 - La passerelle arme automatiquement lorsque Bambu Studio et la correspondance

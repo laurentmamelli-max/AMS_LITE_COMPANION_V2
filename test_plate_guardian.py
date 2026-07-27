@@ -55,6 +55,25 @@ class PlateGuardianTests(unittest.TestCase):
             self.assertEqual(2, guardian.state()["observations_count"])
             self.assertEqual([], guardian.state()["pending_proposals"])
 
+    def test_different_defect_types_keep_separate_evidence_streams(self):
+        with tempfile.TemporaryDirectory() as directory:
+            guardian, clock = self.guardian(directory)
+            for index in range(3):
+                guardian.observe({
+                    "object_id": "cube", "object_label": "Cube", "defect_type": "warping",
+                    "confidence": 0.95, "source": "camera", "frame_sha256": f"{index:064x}",
+                    "observed_at": clock[0],
+                })
+                clock[0] += 1
+            proposal = guardian.state()["pending_proposals"][0]
+            self.assertEqual("warping", proposal["defect_type"])
+            result = guardian.observe({
+                "object_id": "cube", "object_label": "Cube", "defect_type": "spaghetti",
+                "confidence": 0.99, "source": "camera", "frame_sha256": "f" * 64,
+                "observed_at": clock[0],
+            })
+            self.assertIsNone(result["proposal"])
+
     def test_human_decision_is_persisted_and_idempotent(self):
         with tempfile.TemporaryDirectory() as directory:
             guardian, clock = self.guardian(directory)

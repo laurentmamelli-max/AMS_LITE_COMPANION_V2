@@ -1,4 +1,4 @@
-# AMS Lite Companion
+# AMS Lite Companion V2
 
 Application macOS communautaire pour suivre le filament restant sur une
 **Bambu Lab A1 mini équipée d’un AMS Lite**.
@@ -27,8 +27,9 @@ estimations et peuvent être corrigés manuellement après une pesée.
 
 ## Points principaux
 
-- application native dans la barre des menus macOS ;
-- panneau intégré accolé à la fenêtre de Bambu Studio, sans onglet navigateur ;
+- application native macOS avec un Centre Vision indépendant ;
+- captures caméra locales toutes les cinq couches, regroupées par impression ;
+- journal durable des événements MQTT importants, conservé après redémarrage ;
 - lancement de Bambu Studio officiel sans erreur de signature ;
 - suivi indépendant des emplacements A1 à A4 ;
 - catalogue local de bobines avec poids conservé lors des échanges A1–A4 ;
@@ -146,9 +147,9 @@ L’icône Companion dans la barre des menus permet de :
 Lorsque Bambu Studio est fermé, Companion se ferme automatiquement après deux
 contrôles successifs, soit environ six secondes.
 
-## Panneau intégré
+## Panneau intégré et Centre Vision
 
-La version 1.3 affiche le tableau de bord dans une fenêtre macOS native à côté
+V2 affiche le tableau de bord dans une fenêtre macOS native à côté
 de Bambu Studio. Le panneau présente d’abord les bobines, puis l’état de
 l’imprimante, la passerelle automatique et l’historique. Il suit les
 déplacements de Bambu Studio tant que l’option **Suivre la fenêtre Bambu
@@ -156,8 +157,10 @@ Studio** est cochée dans le menu.
 
 Pour déplacer le panneau librement, décochez cette option. Sa fermeture masque
 seulement l’interface : le suivi continue et le panneau peut être réaffiché
-depuis l’icône de la barre des menus. Le tableau complet reste accessible dans
-le navigateur pour l’import manuel de secours et l’arrêt du moteur.
+depuis l’icône de la barre des menus. Le Centre Vision s’ouvre depuis le bouton
+du tableau de bord : il présente les captures dans une fenêtre séparée, les
+range par impression terminée et permet de supprimer un groupe pour libérer
+l’espace local.
 
 ## Catalogue de bobines
 
@@ -197,23 +200,23 @@ nouvelle bobine par erreur.
 
 ## Données et confidentialité
 
-L’interface web écoute uniquement sur `127.0.0.1:8765`. Les données restent
+L’interface web écoute uniquement sur `127.0.0.1:8766`. Les données restent
 sur le Mac dans :
 
 ```text
-~/Library/Application Support/AMS Lite Companion/state.json
+~/Library/Application Support/AMS Lite Companion V2/state.json
 ```
 
 Le catalogue est stocké à côté dans :
 
 ```text
-~/Library/Application Support/AMS Lite Companion/inventory.sqlite3
+~/Library/Application Support/AMS Lite Companion V2/inventory.sqlite3
 ```
 
 Le journal de diagnostic se trouve dans :
 
 ```text
-~/Library/Application Support/AMS Lite Companion/companion.log
+~/Library/Application Support/AMS Lite Companion V2/companion.log
 ```
 
 Le dossier, `state.json`, la base SQLite et le journal sont créés avec des

@@ -40,6 +40,8 @@ from typing import Any
 
 from plate_guardian import PlateGuardian
 from bambu_camera import CameraError, capture_jpeg, discover_certificate_sha256
+from autopilot import AutoPilotPlanner
+from gcode_mapper import map_gcode_objects, object_map_summary
 
 
 APP_DIR = Path.home() / "Library" / "Application Support" / "AMS Lite Companion V2"
@@ -52,8 +54,9 @@ _log_override = os.environ.get("AMS_COMPANION_LOG_FILE", "").strip()
 LOG_FILE = Path(_log_override).expanduser() if _log_override else APP_DIR / "companion.log"
 INVENTORY_FILE = APP_DIR / "inventory.sqlite3"
 GUARDIAN_FILE = APP_DIR / "guardian.sqlite3"
+EVENTS_FILE = APP_DIR / "events.sqlite3"
 HOST, PORT = "127.0.0.1", 8766
-__version__ = "2.0.1"
+__version__ = "2.1.0"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -224,6 +227,109 @@ def inventory_path_for_state(state_path: Path) -> Path:
 def guardian_path_for_state(state_path: Path) -> Path:
     """Keep a test instance's guardian journal out of the real V2 data."""
     return GUARDIAN_FILE if state_path == STATE_FILE else state_path.with_name("guardian.sqlite3")
+
+
+def events_path_for_state(state_path: Path) -> Path:
+    """Keep the durable MQTT audit trail beside the state it describes."""
+    return EVENTS_FILE if state_path == STATE_FILE else state_path.with_name("events.sqlite3")
+
+
+class EventJournal:
+    """Small, local-only audit journal for MQTT print reports.
+
+    The raw MQTT payload is deliberately never persisted: reports can vary by
+    firmware and may contain fields that are irrelevant to an audit.  The
+    compact summary is written before Companion changes local state, then
+    marked processed (or failed) afterwards.
+    """
+
+    MAX_EVENTS = 2_000
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.lock = threading.RLock()
+
+    def _connect(self) -> sqlite3.Connection:
+        secure_directory(self.path.parent)
+        connection = sqlite3.connect(self.path)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA journal_mode = WAL")
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
+        return connection
+
+    def initialize(self) -> None:
+        with self.lock, self._connect() as connection:
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS mqtt_events (
+                    id TEXT PRIMARY KEY,
+                    received_at TEXT NOT NULL,
+                    task_id TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL DEFAULT '',
+                    layer INTEGER,
+                    progress INTEGER,
+                    job TEXT NOT NULL DEFAULT '',
+                    outcome TEXT NOT NULL DEFAULT 'received',
+                    processed_at TEXT NOT NULL DEFAULT '',
+                    detail TEXT NOT NULL DEFAULT ''
+                )"""
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS mqtt_events_received ON mqtt_events(received_at DESC)"
+            )
+
+    def record(self, payload: dict[str, Any]) -> str | None:
+        report = payload.get("print")
+        if not isinstance(report, dict):
+            return None
+        raw_state = report.get("gcode_state") or report.get("print_status") or ""
+        try:
+            layer = int(float(report.get("layer_num", report.get("layer", report.get("current_layer", 0)))))
+        except (TypeError, ValueError):
+            layer = None
+        try:
+            progress = max(0, min(100, int(_float(report.get("mc_percent", 0)))))
+        except (TypeError, ValueError):
+            progress = None
+        event_id = secrets.token_hex(16)
+        values = (
+            event_id, now_iso(),
+            str(report.get("subtask_id") or report.get("task_id") or ""),
+            str(raw_state).upper(), layer, progress,
+            str(report.get("subtask_name") or report.get("gcode_file") or "")[:240],
+        )
+        with self.lock, self._connect() as connection:
+            connection.execute(
+                """INSERT INTO mqtt_events(id, received_at, task_id, state, layer, progress, job)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""", values
+            )
+            connection.execute(
+                """DELETE FROM mqtt_events WHERE id IN (
+                    SELECT id FROM mqtt_events ORDER BY received_at DESC LIMIT -1 OFFSET ?
+                )""", (self.MAX_EVENTS,)
+            )
+        return event_id
+
+    def mark(self, event_id: str | None, outcome: str, detail: str = "") -> None:
+        if not event_id:
+            return
+        with self.lock, self._connect() as connection:
+            connection.execute(
+                "UPDATE mqtt_events SET outcome = ?, processed_at = ?, detail = ? WHERE id = ?",
+                (outcome, now_iso(), detail[:240], event_id),
+            )
+
+    def recent(self, limit: int = 25) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 100))
+        with self.lock, self._connect() as connection:
+            rows = connection.execute(
+                """SELECT received_at, task_id, state, layer, progress, job, outcome, processed_at, detail
+                   FROM mqtt_events ORDER BY received_at DESC LIMIT ?""", (limit,)
+            ).fetchall()
+        return [dict(row) for row in rows]
 
 
 class Inventory:
@@ -1186,6 +1292,20 @@ def validate_3mf_archive(archive: zipfile.ZipFile) -> None:
             raise ValueError("Archive 3MF trop volumineuse après décompression")
 
 
+def extract_3mf_object_map(archive: zipfile.ZipFile) -> dict[str, Any]:
+    """Read only explicit object markers from the bounded 3MF archive."""
+    names = [name for name in archive.namelist() if re.search(r"(?:metadata/)?plate_\d+\.gcode$", name, re.I)]
+    objects: list[dict[str, Any]] = []
+    for name in sorted(names):
+        number_match = re.search(r"plate_(\d+)", name, re.I)
+        plate = number_match.group(1) if number_match else ""
+        with archive.open(name) as source:
+            text = source.read(2_000_000).decode("utf-8", "replace")
+        for item in map_gcode_objects(text):
+            objects.append({"plate": plate, **item})
+    return {**object_map_summary(objects), "objects": objects}
+
+
 def extract_3mf_plates(archive: zipfile.ZipFile) -> list[dict[str, Any]]:
     validate_3mf_archive(archive)
     names = archive.namelist()
@@ -1204,10 +1324,13 @@ def extract_3mf_plates(archive: zipfile.ZipFile) -> list[dict[str, Any]]:
     return plates
 
 
-def parsed_3mf_result(plates: list[dict[str, Any]], digest: str, filename: str) -> dict[str, Any]:
+def parsed_3mf_result(plates: list[dict[str, Any]], digest: str, filename: str,
+                      object_map: dict[str, Any] | None = None) -> dict[str, Any]:
     if not plates:
         raise ValueError("Aucune consommation used_g trouvée. Exportez d’abord le plateau tranché en .gcode.3mf.")
-    return {"filename": Path(filename).name, "sha256": digest, "plates": plates}
+    return {"filename": Path(filename).name, "sha256": digest, "plates": plates,
+            "object_map": object_map or {"status": "unavailable", "object_count": 0,
+                                          "reason": "Cartographie non analysée", "objects": []}}
 
 
 def parse_3mf(raw: bytes, filename: str = "travail.3mf") -> dict[str, Any]:
@@ -1216,7 +1339,8 @@ def parse_3mf(raw: bytes, filename: str = "travail.3mf") -> dict[str, Any]:
     digest = hashlib.sha256(raw).hexdigest()
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         plates = extract_3mf_plates(archive)
-    return parsed_3mf_result(plates, digest, filename)
+        object_map = extract_3mf_object_map(archive)
+    return parsed_3mf_result(plates, digest, filename, object_map)
 
 
 def parse_3mf_path(path: Path) -> dict[str, Any]:
@@ -1231,7 +1355,8 @@ def parse_3mf_path(path: Path) -> dict[str, Any]:
             digest.update(chunk)
     with zipfile.ZipFile(path) as archive:
         plates = extract_3mf_plates(archive)
-    return parsed_3mf_result(plates, digest.hexdigest(), path.name)
+        object_map = extract_3mf_object_map(archive)
+    return parsed_3mf_result(plates, digest.hexdigest(), path.name, object_map)
 
 
 def encode_varint(value: int) -> bytes:
@@ -1521,6 +1646,9 @@ class Companion:
         self.inventory = Inventory(inventory_path_for_state(state_path))
         self.inventory.initialize(self.state)
         self.guardian = PlateGuardian(guardian_path_for_state(state_path))
+        self.events = EventJournal(events_path_for_state(state_path))
+        self.events.initialize()
+        self.autopilot = AutoPilotPlanner()
         previous_spools = json.dumps(self.state.get("spools", {}), sort_keys=True)
         self._sync_spools_from_inventory()
         if json.dumps(self.state["spools"], sort_keys=True) != previous_spools:
@@ -1609,10 +1737,84 @@ class Companion:
             clean["inventory_summary"] = self.inventory.summary()
             clean["inventory_overview"] = self.inventory.catalog_overview()
             clean["guardian"] = self.guardian.state()
+            clean["autopilot"] = self.autopilot.state(clean["guardian"], clean.get("active_job"))
+            clean["events"] = self.events.recent()
+            clean["vision_storage"] = self.vision_storage()
             return clean
+
+    def supervision_report(self) -> dict[str, Any]:
+        """Build a portable, local-only supervision report without secrets.
+
+        The report deliberately exposes a compact operational snapshot rather
+        than the complete state file: LAN credentials, printer identifiers,
+        absolute paths and raw MQTT payloads never leave the application data
+        store through this endpoint.
+        """
+        state = self.public_state()
+        active_job = state.get("active_job") or {}
+        object_map = active_job.get("object_map") if isinstance(active_job, dict) else {}
+        events = self.events.recent(100)
+        outcomes: dict[str, int] = {}
+        for event in events:
+            outcome = str(event.get("outcome") or "received")
+            outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        return {
+            "schema_version": 1,
+            "generated_at": now_iso(),
+            "application": {"name": "AMS Lite Companion V2", "version": __version__},
+            "print": {
+                "state": state.get("printer", {}).get("state", ""),
+                "progress": state.get("printer", {}).get("progress", 0),
+                "job": state.get("printer", {}).get("job", ""),
+                "tracking_active": bool(active_job),
+                "object_map": object_map_summary(object_map.get("objects", [])) if isinstance(object_map, dict) else {
+                    "status": "unavailable", "object_count": 0,
+                },
+            },
+            "vision": {
+                "enabled": bool(state.get("camera", {}).get("enabled")),
+                "status": state.get("camera", {}).get("status", ""),
+                "capture_every_layers": state.get("camera", {}).get("capture_every_layers", 5),
+                "storage": state.get("vision_storage", {}),
+            },
+            "guardian": state.get("guardian", {}),
+            "autopilot": state.get("autopilot", {}),
+            "reliability": {"event_count": len(events), "outcomes": outcomes, "events": events},
+        }
+
+    def vision_storage(self) -> dict[str, int]:
+        """Return the exact local footprint of indexed Vision captures."""
+        root = self.state_path.parent / "captures"
+        count = completed = active = total_bytes = 0
+        for image in self.state.get("camera", {}).get("captures", []):
+            if not isinstance(image, dict):
+                continue
+            filename = str(image.get("file") or "")
+            folder = str(image.get("folder") or "")
+            if not re.fullmatch(r"layer-\d{5}-\d{8}-\d{6}\.jpg", filename):
+                continue
+            if folder and not re.fullmatch(r"print-[a-zA-Z0-9._-]+", folder):
+                continue
+            try:
+                total_bytes += (root / folder / filename if folder else root / filename).stat().st_size
+            except OSError:
+                continue
+            count += 1
+            if folder:
+                completed += 1
+            else:
+                active += 1
+        return {"count": count, "bytes": total_bytes, "completed": completed, "active": active}
 
     def observe_plate_guardian(self, data: dict[str, Any]) -> dict[str, Any]:
         """Accept detector evidence; the guardian has no printer-control path."""
+        with self.lock:
+            object_map = (self.state.get("active_job") or {}).get("object_map") or {}
+            mapped = object_map.get("objects") if isinstance(object_map, dict) else []
+            if isinstance(object_map, dict) and object_map.get("status") == "mapped" and isinstance(mapped, list):
+                known = {str(item.get("id") or "") for item in mapped if isinstance(item, dict)}
+                if known and str(data.get("object_id") or "") not in known:
+                    raise ValueError("Objet détecté absent de la cartographie G-code active")
         result = self.guardian.observe(data)
         proposal = result.get("proposal")
         if proposal and result.get("accepted"):
@@ -1873,6 +2075,7 @@ class Companion:
             "armed_epoch": time.time(),
             "auto_bridge": True,
             "mapping_source": mapping_source,
+            "object_map": self.auto_import.get("object_map", {}),
         }
         bridge["mapping_source"] = mapping_source
         bridge["mapping_confirmation_required"] = False
@@ -2075,6 +2278,7 @@ class Companion:
             self.state["armed_job"] = {
                 "token": token, "file": self.last_import["filename"], "plate": plate_id,
                 "lines": lines, "armed_at": now_iso(),
+                "object_map": self.last_import.get("object_map", {}),
             }
             self.save()
             return self.state["armed_job"]
@@ -2118,6 +2322,16 @@ class Companion:
         return True
 
     def on_message(self, payload: dict[str, Any]) -> None:
+        """Journalise un rapport avant de le traiter, sans bloquer MQTT."""
+        event_id = self.events.record(payload)
+        try:
+            self._on_message(payload)
+        except Exception as exc:
+            self.events.mark(event_id, "failed", str(exc))
+            raise
+        self.events.mark(event_id, "processed")
+
+    def _on_message(self, payload: dict[str, Any]) -> None:
         report = payload.get("print")
         if not isinstance(report, dict):
             return
@@ -2547,7 +2761,7 @@ class Companion:
             image_path.write_bytes(frame.jpeg)
             os.chmod(image_path, 0o600)
             result = {"layer": layer, "captured_at": now_iso(), "file": filename,
-                      "sha256": frame.sha256, "print_id": session_id}
+                      "sha256": frame.sha256, "size_bytes": len(frame.jpeg), "print_id": session_id}
             if completed_folder:
                 result["folder"] = completed_folder
                 result["print_name"] = str(completed.get("name") or "Impression Bambu")
@@ -2708,6 +2922,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         elif path == "/api/state":
             self.send_json(self.app.public_state())
+        elif path == "/api/events":
+            self.send_json({"events": self.app.events.recent(100)})
+        elif path == "/api/report.json":
+            self.send_json(self.app.supervision_report())
         elif path == "/api/inventory/export.csv":
             self.send_csv(self.app.inventory_csv())
         elif match := re.fullmatch(r"/api/inventory/spools/(\d+)/history", path):
@@ -2792,13 +3010,15 @@ HTML = r'''<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name
 body.embedded .spools-card{order:1!important}body.embedded .printer-card{order:2!important}.inventory-card{display:none}.catalog-fields{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.catalog-actions button{width:100%}#catalogWindow{display:none}.catalog-window{max-width:1400px;margin:auto}.catalog-toolbar{display:flex;justify-content:space-between;align-items:end;gap:18px}.catalog-toolbar h2{font-size:24px;margin:0}.table-wrap{overflow:auto;border:1px solid #dfe3e7;border-radius:12px;background:white}.catalog-table{width:100%;border-collapse:collapse;min-width:1120px}.catalog-table th{background:#f0f3f5;color:#4e5863;text-align:left;font-size:12px;white-space:nowrap}.catalog-table th,.catalog-table td{padding:9px;border-bottom:1px solid #e7eaed;vertical-align:middle}.catalog-table tr:last-child td{border-bottom:0}.catalog-table tr[data-spool]{cursor:pointer}.catalog-table tr.selected td{background:#eaf8ef}.catalog-table input,.catalog-table select{min-width:90px;padding:7px;border:1px solid transparent;background:transparent;border-radius:6px}.catalog-table input:focus,.catalog-table select:focus{background:white;border-color:#00ae42;outline:none}.catalog-table .id-cell{color:#69717b;font-variant-numeric:tabular-nums}.catalog-table .actions{white-space:nowrap}.catalog-table .actions button{margin:0 3px 0 0;padding:8px 10px;font-size:12px}.catalog-add{display:grid;grid-template-columns:1.5fr repeat(3,1fr) .8fr .8fr .9fr auto;gap:8px;align-items:end;margin-top:14px;padding:14px;background:white;border:1px solid #dfe3e7;border-radius:12px}.catalog-add label{margin-top:0}.spool-timeline{margin-top:16px;padding:16px;background:white;border:1px solid #dfe3e7;border-radius:12px}.spool-timeline h3{margin:0 0 4px}.timeline{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(170px,1fr);gap:12px;overflow-x:auto;padding:26px 4px 6px;position:relative}.timeline:before{content:'';position:absolute;left:26px;right:26px;top:34px;height:3px;background:#cdebd8}.timeline-event{position:relative;z-index:1;padding-top:20px}.timeline-dot{position:absolute;top:0;left:12px;width:18px;height:18px;border-radius:50%;background:#00ae42;border:4px solid #eaf8ef}.timeline-event.remove .timeline-dot{background:#ef9b20}.timeline-event.deduct .timeline-dot{background:#3976db}.timeline-event .when{font-size:11px;color:#69717b}.timeline-event .what{font-weight:700;font-size:13px;margin:5px 0}.timeline-event .detail{font-size:12px;color:#505861}.timeline-empty{color:#69717b;padding:16px 0}body.catalog-view .wrap{max-width:none;padding:20px}body.catalog-view h1,body.catalog-view .sub,body.catalog-view .grid{display:none}body.catalog-view #catalogWindow{display:block}@media(max-width:700px){.catalog-fields{grid-template-columns:1fr 1fr}.catalog-add{grid-template-columns:1fr 1fr}}
 .catalog-summary{margin:16px 0}.catalog-summary h3{margin:0 0 8px}.summary-table{min-width:720px}.level-track{width:130px;height:8px;background:#e8edf0;border-radius:99px;overflow:hidden;margin-top:4px}.level-fill{height:100%;background:#00a23d;border-radius:99px}.weight-chart{margin:14px 0 4px;padding:12px;border:1px solid #e7eaed;border-radius:10px;background:#fbfcfc}.weight-chart h4{margin:0 0 4px}.weight-chart svg{width:100%;height:190px;display:block}.weight-chart .axis{stroke:#dfe3e7;stroke-width:1}.weight-chart .line{fill:none;stroke:#00a23d;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}.weight-chart .point{fill:#fff;stroke:#00a23d;stroke-width:3}.weight-chart .point:hover{fill:#00a23d;cursor:help}.chart-label{font-size:11px;fill:#69717b}
 :root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#20242a;background:#f4f5f6}body{margin:0}.wrap{max-width:1050px;margin:auto;padding:24px}h1{margin:0 0 4px}.sub{color:#69717b;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}.card{background:white;border:1px solid #dfe3e7;border-radius:14px;padding:18px;box-shadow:0 2px 10px #0000000b}.wide{grid-column:1/-1}h2{font-size:17px;margin:0 0 14px}label{display:block;font-size:12px;color:#656d76;margin:9px 0 4px}input,select,button{box-sizing:border-box;border:1px solid #cbd1d7;border-radius:8px;padding:9px;font:inherit}input,select{width:100%}input[type=checkbox]{width:auto;margin-right:7px}button{background:#00ae42;color:white;border:0;font-weight:600;cursor:pointer;margin-top:12px}button.secondary{background:#59636e}.status{display:inline-flex;gap:7px;align-items:center;font-weight:600}.dot{width:10px;height:10px;border-radius:50%;background:#d33}.on .dot{background:#00ae42}.spools{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.spool{padding:12px;border:1px solid #e1e4e7;border-radius:10px}.spool b{color:#00a23d}.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.bridge-map,.catalog-form{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.catalog{display:grid;grid-template-columns:1fr 160px;gap:12px;align-items:end;border-top:1px solid #eee;padding:12px 0}.catalog:first-child{border-top:0;padding-top:0}.check{font-size:14px;color:#20242a}.notice{padding:10px;border-radius:8px;background:#eef8f1;margin:10px 0}.guardian-alert{background:#fff4e9;color:#8a3d00}.guardian-actions{display:flex;gap:8px;flex-wrap:wrap}.guardian-actions button{margin-top:8px}.error{background:#ffecec;color:#a11}.muted{color:#69717b;font-size:13px;overflow-wrap:anywhere}.line{display:grid;grid-template-columns:1fr 100px 90px;gap:8px;align-items:end}.history{font-size:13px;border-top:1px solid #eee;padding:8px 0}body.embedded .wrap{padding:10px;max-width:none}body.embedded h1,body.embedded .sub,body.embedded .manual-card,body.embedded .shutdown-card,body.embedded .inventory-card{display:none}body.embedded .grid{grid-template-columns:1fr;gap:10px}body.embedded .wide{grid-column:auto}body.embedded .card{padding:14px;border-radius:10px;box-shadow:none}body.embedded .spools-card{order:1}body.embedded .printer-card{order:2}body.embedded .bridge-card{order:3}body.embedded .guardian-card{order:4}body.embedded .history-card{order:5}@media(max-width:700px){.spools,.bridge-map,.catalog-form{grid-template-columns:1fr 1fr}.catalog{grid-template-columns:1fr}.line{grid-template-columns:1fr}.wrap{padding:12px}}</style></head><body><div class="wrap">
-<h1>AMS Lite Companion V2</h1><div class="sub">Compteur local v2.0.1 — environnement indépendant lié à Bambu Studio officiel.</div><div id="msg"></div>
+<h1>AMS Lite Companion V2</h1><div class="sub">Compteur local v2.1.0 — environnement indépendant lié à Bambu Studio officiel.</div><div id="msg"></div>
 <div class="grid"><section class="card printer-card"><h2>Imprimante locale</h2><div id="conn" class="status"><span class="dot"></span><span>Déconnectée</span></div><div id="pstate"></div>
 <label>Adresse IP</label><input id="ip" placeholder="192.168.1.50"><label>Numéro de série</label><input id="serial" placeholder="01S00A..."><label>Code d’accès LAN <span class="muted">(laisse vide pour conserver le code enregistré)</span></label><input id="code" type="password" placeholder="8 chiffres"><button onclick="saveConfig()">Enregistrer et connecter</button></section>
 <section class="card bridge-card"><h2>Passerelle Bambu Studio</h2><div id="bridgeStatus" class="notice">En attente de Bambu Studio</div><label class="check"><input id="autoEnabled" type="checkbox">Récupérer automatiquement le .gcode.3mf</label><label class="check"><input id="fallbackEnabled" type="checkbox">Armer avec la correspondance A1–A4 enregistrée ci-dessous</label><div class="bridge-map" id="bridgeMap"></div><button onclick="saveBridge()">Enregistrer la passerelle</button><div id="bridgeDetails" class="muted"></div></section>
 <section class="card wide guardian-card"><h2>Gardien de plateau</h2><div id="guardianStatus" class="notice">Initialisation du gardien…</div><div id="guardianDetails" class="muted"></div></section>
+<section class="card wide autopilot-card"><h2>AutoPilot</h2><div id="autopilot" class="notice">Vérification des garde-fous…</div></section>
 <section class="card wide spools-card"><h2>Bobines actuellement dans l’AMS Lite</h2><div id="rfidStatus" class="muted">En attente de lecture RFID</div><div class="spools" id="spools"></div><button onclick="saveSpools()">Enregistrer les poids</button><button class="secondary" onclick="openCatalog()">Gérer le catalogue de bobines…</button><button class="secondary" onclick="openVision()">Ouvrir le centre Vision…</button></section>
 <section class="card wide history-card"><h2>Historique</h2><div id="history">Aucun travail comptabilisé.</div></section>
+<section class="card wide audit-card"><h2>Journal de fiabilité</h2><div id="audit" class="muted">Aucun événement MQTT enregistré.</div><button class="secondary" onclick="exportSupervisionReport()">Télécharger le rapport de supervision</button></section>
 <section class="card wide shutdown-card"><h2>Companion</h2><p>Utilise ce bouton après l’impression pour enregistrer et arrêter complètement Companion.</p><button class="secondary" onclick="shutdownCompanion()">Arrêter Companion</button></section></div><section id="catalogWindow" class="catalog-window"><div class="catalog-toolbar"><div><h2>Gestionnaire de bobines</h2><p class="muted">Stock, emplacement, alertes et historique. Conçu pour rester fluide avec plusieurs centaines de bobines.</p></div><button class="secondary no-top" onclick="exportCatalog()">Exporter CSV</button></div><section id="inventoryKpis" class="inventory-kpis"></section><section class="catalog-controls"><input id="catalogSearch" type="search" oninput="setCatalogFilter('query',this.value)" placeholder="Rechercher nom, matière, marque, couleur, emplacement…"><select id="catalogMaterial" onchange="setCatalogFilter('material',this.value)"></select><select id="catalogBrand" onchange="setCatalogFilter('brand',this.value)"></select><select id="catalogLocation" onchange="setCatalogFilter('location',this.value)"></select><select id="catalogStatus" onchange="setCatalogFilter('status',this.value)"><option value="all">Tous les états</option><option value="low">À commander</option><option value="ams">Dans l’AMS</option><option value="unlocated">Emplacement à définir</option></select><select id="catalogSort" onchange="setCatalogFilter('sort',this.value)"><option value="name">Trier : nom</option><option value="remaining">Trier : stock restant</option><option value="recent">Trier : dernière utilisation</option><option value="created">Trier : ajout récent</option></select></section><section id="bulkBar" class="bulk-bar"><strong id="selectionCount">Aucune sélection</strong><input id="bulkLocation" placeholder="Emplacement, ex. Étagère B-03"><button class="secondary no-top" onclick="runBulk('location')">Déplacer</button><input id="bulkThreshold" type="number" min="0" step="1" placeholder="Seuil g"><button class="secondary no-top" onclick="runBulk('threshold')">Seuil</button><button class="danger no-top" onclick="runBulk('archive')">Archiver</button></section><div class="table-wrap scalable-table"><table class="catalog-table"><thead><tr><th><input id="selectAllCatalog" type="checkbox" onchange="togglePageSelection(this.checked)" title="Sélectionner la page"></th><th>Bobine</th><th>Matière / couleur</th><th>Emplacement</th><th>Stock</th><th>Dernière utilisation</th><th>Impr.</th><th></th></tr></thead><tbody id="catalog"></tbody></table></div><div id="catalogPager" class="catalog-pager"></div><section id="spoolDetail" class="spool-detail"><h3>Fiche de bobine</h3><p class="muted">Sélectionne une bobine dans la liste pour consulter ou modifier sa fiche.</p></section><section class="catalog-add"><div><label>Nom descriptif <span class="muted">(automatique)</span></label><input id="newSpoolName" oninput="this.dataset.custom='1'" placeholder="PLA bleu mat"></div><div><label>Matière</label><input id="newSpoolMaterial" oninput="autoNewSpoolName()" placeholder="PLA"></div><div><label>Marque</label><input id="newSpoolBrand" placeholder="Bambu Lab"></div><div><label>Couleur</label><input id="newSpoolColor" oninput="autoNewSpoolName()" placeholder="Bleu"></div><div><label>Initial (g)</label><input id="newSpoolInitial" type="number" min="0" step="0.1" value="1000"></div><div><label>Restant (g)</label><input id="newSpoolRemaining" type="number" min="0" step="0.1" value="1000"></div><div><label>Emplacement</label><input id="newSpoolLocation" placeholder="Étagère B-03"></div><div><label>Seuil (g)</label><input id="newSpoolThreshold" type="number" min="0" step="1" value="100"></div><div><label>Date d’ajout</label><input id="newSpoolDate" type="date"></div><button onclick="createSpool()">Ajouter</button></section></section></div>
 <script>
 const embedded=new URLSearchParams(location.search).get('embedded')==='1',catalogView=new URLSearchParams(location.search).get('catalog')==='1',apiToken='__API_TOKEN__';if(embedded)document.body.classList.add('embedded');if(catalogView)document.body.classList.add('catalog-view');let S=null, imported=null, formDirty=false, selectedSpoolId=null, pendingDeleteId=null, catalogLoaded=false,catalogState={query:'',material:'all',brand:'all',location:'all',status:'all',sort:'name',page:0,pageSize:50,selected:new Set()};const $=id=>document.getElementById(id);function msg(t,e=false){$('msg').textContent=t||'';$('msg').className=t?`notice ${e?'error':''}`:''}function openCatalog(){if(window.webkit?.messageHandlers?.companion)window.webkit.messageHandlers.companion.postMessage('openCatalog');else window.open('/?catalog=1','ams-lite-catalog')}
@@ -2812,8 +3032,8 @@ $('bridgeMap').innerHTML=[1,2,3,4].map(i=>`<div><label>Filament ${i}</label><sel
 $('spools').innerHTML=[1,2,3,4].map(i=>{let x=s.spools[i]||{};return x.spool_id?`<div class="spool"><b>A${i}</b><label>Nom</label><input id="n${i}" value="${esc(x.name)}"><div class="row"><div><label>Initial (g)</label><input id="i${i}" type="number" step="0.1" value="${x.initial_g}"></div><div><label>Restant (g)</label><input id="r${i}" type="number" step="0.1" value="${x.remaining_g}"></div></div></div>`:`<div class="spool"><b>A${i}</b><div class="muted">Libre — choisis une bobine dans le catalogue.</div></div>`}).join('');}
 if(!formDirty)renderCatalog(s.inventory);
 $('bridgeStatus').textContent=s.bridge.status||'En attente de Bambu Studio';let bd=[];if(s.bridge.last_file)bd.push(`Dernier fichier : ${s.bridge.last_file}`);if(s.bridge.mapping_source)bd.push(`Correspondance : ${s.bridge.mapping_source}`);if(s.bridge.request_capture)bd.push('Capture des commandes AMS disponible sur ce Mac');let conflicts=s.bridge.mapping_conflict||[];if(conflicts.length)bd.push('Changement détecté : '+conflicts.map(x=>`filament ${x.filament_id} : A${x.saved_slot} → A${x.bambu_slot}`).join(', '));let bj=s.active_job?.auto_bridge?s.active_job:s.armed_job?.auto_bridge?s.armed_job:null;if(bj)bd.push('Décompte : '+bj.lines.map(x=>`filament ${x.filament.id} → A${x.slot} (${x.used_g} g)`).join(', '));let confirmButton=s.bridge.mapping_confirmation_required?'<button class="secondary" onclick="confirmDetectedImport()">Confirmer le changement AMS</button>':'';$('bridgeDetails').innerHTML=bd.map(esc).join('<br>')+confirmButton;
-$('guardianStatus').className='notice';let guardian=s.guardian||{},pending=guardian.pending_proposals||[],capability=guardian.capability||{};if(pending.length){let proposal=pending[0];$('guardianStatus').className='notice guardian-alert';$('guardianStatus').textContent=`Alerte à vérifier : ${proposal.object_label} (${proposal.evidence_count} images, confiance ${Math.round(100*proposal.confidence)} %)`;$('guardianDetails').innerHTML=`V2 ne commande pas l’imprimante. Décide seulement du suivi de cette alerte.<div class="guardian-actions"><button class="secondary" onclick="decideGuardian('${proposal.id}','continue')">Continuer à surveiller</button><button class="secondary" onclick="decideGuardian('${proposal.id}','dismiss')">Écarter l’alerte</button></div>`}else{$('guardianStatus').textContent='Mode observation : aucune action imprimante n’est disponible.';$('guardianDetails').textContent=`${guardian.observations_count||0} observation(s) journalisée(s). ${capability.reason||''}`}
-$('history').innerHTML=s.history.length?s.history.map(h=>`<div class="history"><b>${esc(h.file||'Travail')}</b> — ${esc(h.result)} — ${h.deducted?'déduction effectuée':'aucune déduction'}${h.tracking_note?`<br><span class="muted">${esc(h.tracking_note)}</span>`:''}<br>${esc(h.ended_at||'')}</div>`).join(''):'Aucun travail enregistré.'}
+$('guardianStatus').className='notice';let guardian=s.guardian||{},pending=guardian.pending_proposals||[],capability=guardian.capability||{};if(pending.length){let proposal=pending[0];$('guardianStatus').className='notice guardian-alert';$('guardianStatus').textContent=`Alerte ${proposal.defect_type||'anomaly'} à vérifier : ${proposal.object_label} (${proposal.evidence_count} images, confiance ${Math.round(100*proposal.confidence)} %)`;$('guardianDetails').innerHTML=`V2 ne commande pas l’imprimante. Décide seulement du suivi de cette alerte.<div class="guardian-actions"><button class="secondary" onclick="decideGuardian('${proposal.id}','continue')">Continuer à surveiller</button><button class="secondary" onclick="decideGuardian('${proposal.id}','dismiss')">Écarter l’alerte</button></div>`}else{$('guardianStatus').textContent='Mode observation : aucune action imprimante n’est disponible.';$('guardianDetails').textContent=`${guardian.observations_count||0} observation(s) journalisée(s). ${capability.reason||''}`}let autopilot=s.autopilot||{},pilotCapability=autopilot.capability||{},plans=autopilot.plans||[];$('autopilot').textContent=plans.length?`${plans.length} plan(s) simulé(s) bloqué(s) par le garde-fou : ${plans.map(p=>p.object_known?`${p.defect_type||'anomaly'} · objet ${p.object_id} cartographié`:`${p.defect_type||'anomaly'} · objet ${p.object_id} non cartographié`).join(' · ')}`:(pilotCapability.reason||'Aucun plan AutoPilot actif.');
+$('history').innerHTML=s.history.length?s.history.map(h=>`<div class="history"><b>${esc(h.file||'Travail')}</b> — ${esc(h.result)} — ${h.deducted?'déduction effectuée':'aucune déduction'}${h.tracking_note?`<br><span class="muted">${esc(h.tracking_note)}</span>`:''}<br>${esc(h.ended_at||'')}</div>`).join(''):'Aucun travail enregistré.';let audit=s.events||[];$('audit').innerHTML=audit.length?audit.slice(0,8).map(e=>`<div class="history"><b>${esc(e.state||'MQTT')}</b>${e.task_id?` · ${esc(e.task_id)}`:''}${e.layer!=null?` · couche ${esc(e.layer)}`:''}${e.progress!=null?` · ${esc(e.progress)} %`:''}<br><span class="muted">${esc(e.received_at)} · ${e.outcome==='processed'?'traité':e.outcome==='failed'?'à vérifier':'reçu'}${e.detail?` · ${esc(e.detail)}`:''}</span></div>`).join(''):'Aucun événement MQTT enregistré.'}
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function dateValue(value){return String(value||'').slice(0,10)}function suggestedName(material,color){return [material.trim(),color.trim()].filter(Boolean).join(' ')}function autoNewSpoolName(){let name=$('newSpoolName');if(!name.dataset.custom)name.value=suggestedName($('newSpoolMaterial').value,$('newSpoolColor').value)}function autoCatalogSpoolName(id){let name=$('cn'+id);if(!name.dataset.custom&&(/^Bobine A[1-4]$/.test(name.value)||/^A\d{2}-[A-Z0-9-]+$/i.test(name.value)||!name.value))name.value=suggestedName($('cm'+id).value,$('cc'+id).value)}
 function renderCatalog(inventory){let spools=inventory?.spools||[],occupants=Object.fromEntries(spools.filter(x=>x.slot).map(x=>[String(x.slot),x]));let label=(slot,x)=>{let other=occupants[String(slot)];return other&&other.id!==x.id?`A${slot} · échange avec ${other.name}`:`A${slot}${other?' · position actuelle':''}`};if($('newSpoolDate')&&!$('newSpoolDate').value)$('newSpoolDate').value=new Date().toISOString().slice(0,10);$('catalog').innerHTML=spools.length?spools.map(x=>`<tr data-spool="${x.id}" class="${selectedSpoolId===x.id?'selected':''}" onclick="selectSpool(${x.id})"><td class="id-cell"><button class="secondary" onclick="event.stopPropagation();selectSpool(${x.id})">#${x.id}</button></td><td><input onclick="event.stopPropagation()" oninput="this.dataset.custom='1'" id="cn${x.id}" value="${esc(x.name)}"></td><td><input onclick="event.stopPropagation()" oninput="autoCatalogSpoolName(${x.id})" id="cm${x.id}" value="${esc(x.material)}"></td><td><input onclick="event.stopPropagation()" id="cb${x.id}" value="${esc(x.brand)}"></td><td><input onclick="event.stopPropagation()" oninput="autoCatalogSpoolName(${x.id})" id="cc${x.id}" value="${esc(x.color)}"></td><td><input onclick="event.stopPropagation()" id="ci${x.id}" type="number" min="0" step="0.1" value="${x.initial_g}"></td><td><input onclick="event.stopPropagation()" id="cr${x.id}" type="number" min="0" step="0.1" value="${x.remaining_g}"></td><td><input onclick="event.stopPropagation()" id="cd${x.id}" type="date" value="${esc(dateValue(x.created_at))}"></td><td><select onclick="event.stopPropagation()" onchange="formDirty=true" id="catalogSlot${x.id}"><option value="" ${!x.slot?'selected':''}>Hors AMS</option>${[1,2,3,4].map(slot=>`<option value="${slot}" ${String(x.slot)===String(slot)?'selected':''}>${esc(label(slot,x))}</option>`).join('')}</select></td><td class="actions"><button onclick="saveCatalogSpool(${x.id},event)">Enregistrer</button><button class="secondary" onclick="event.stopPropagation();selectSpool(${x.id})">Historique</button><button class="secondary" onclick="deleteSpool(${x.id},event)">${pendingDeleteId===x.id?'Confirmer':'Supprimer'}</button></td></tr>`).join(''):'<tr><td colspan="10" class="muted">Aucune bobine dans le catalogue.</td></tr>'}
@@ -2859,6 +3079,7 @@ async function archiveSelectedSpool(){if(!selectedSpoolId||!confirm('Archiver ce
 async function deleteSelectedSpool(){if(!selectedSpoolId||!confirm('Supprimer définitivement cette bobine et tout son historique ?'))return;try{let result=await api('/api/inventory/spools/'+selectedSpoolId+'/delete',{method:'POST',body:'{}'});catalogState.selected.delete(selectedSpoolId);selectedSpoolId=null;catalogLoaded=false;msg(result.message);refresh()}catch(e){msg(e.message,true)}}
 async function runBulk(action){let ids=[...catalogState.selected];if(!ids.length)return msg('Sélectionne au moins une bobine.',true);if(action==='archive'&&!confirm(`Archiver ${ids.length} bobine(s) ? Leur historique sera conservé.`))return;let body={ids,action};if(action==='location')body.storage_location=$('bulkLocation').value;if(action==='threshold')body.low_stock_g=+$('bulkThreshold').value;try{let result=await api('/api/inventory/bulk',{method:'POST',body:JSON.stringify(body)});if(action==='archive'){catalogState.selected.clear();selectedSpoolId=null}catalogLoaded=false;msg(result.message);refresh()}catch(e){msg(e.message,true)}}
 async function exportCatalog(){try{let response=await fetch('/api/inventory/export.csv',{headers:{'X-AMS-Token':apiToken},credentials:'same-origin'});if(!response.ok)throw Error('Export impossible');let blob=await response.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download='ams-lite-catalogue.csv';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);msg('Export CSV téléchargé.')}catch(e){msg(e.message,true)}}
+async function exportSupervisionReport(){try{let response=await fetch('/api/report.json',{headers:{'X-AMS-Token':apiToken},credentials:'same-origin'});if(!response.ok)throw Error('Rapport impossible');let blob=await response.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download='ams-lite-rapport-supervision.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);msg('Rapport de supervision téléchargé.')}catch(e){msg(e.message,true)}}
 createSpool=async function(){try{await api('/api/inventory/spools',{method:'POST',body:JSON.stringify({name:$('newSpoolName').value,material:$('newSpoolMaterial').value,brand:$('newSpoolBrand').value,color:$('newSpoolColor').value,initial_g:+$('newSpoolInitial').value,remaining_g:+$('newSpoolRemaining').value,storage_location:$('newSpoolLocation').value,low_stock_g:+$('newSpoolThreshold').value,created_at:$('newSpoolDate').value})});['newSpoolName','newSpoolMaterial','newSpoolBrand','newSpoolColor','newSpoolLocation'].forEach(id=>$(id).value='');delete $('newSpoolName').dataset.custom;catalogLoaded=false;msg('Bobine ajoutée au catalogue.');refresh()}catch(e){msg(e.message,true)}};
 const visionView=new URLSearchParams(location.search).get('vision')==='1';
 function openVision(){if(window.webkit?.messageHandlers?.companion)window.webkit.messageHandlers.companion.postMessage('openVision');else window.open('/?vision=1','ams-lite-vision')}
@@ -2881,7 +3102,7 @@ def render_vision_html(api_token: str) -> str:
 <style>body{{font-family:-apple-system,sans-serif;background:#f4f5f6;color:#20242a;margin:0}}main{{max-width:1100px;margin:auto;padding:28px}}section{{background:#fff;border:1px solid #dfe3e7;border-radius:10px;padding:18px;margin-top:16px}}input{{width:100%;box-sizing:border-box;padding:9px;margin:6px 0 12px}}button{{padding:9px 13px;background:#00a23d;border:0;border-radius:7px;color:#fff;font-weight:600}}.secondary{{background:#59636e}}#gallery{{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px}}article{{border:1px solid #dfe3e7;border-radius:8px;padding:12px}}.muted{{color:#69717b}}</style>
 <style>#gallery img{{display:block;width:100%;margin-top:10px;border-radius:6px;background:#e9edf0}}#gallery article{{overflow:hidden}}.capture-group{{margin:18px 0 28px;padding-top:4px;border-top:1px solid #dfe3e7}}.capture-group:first-child{{border-top:0;margin-top:0}}.capture-group-head{{display:flex;gap:12px;align-items:center;justify-content:space-between;margin:8px 0 10px}}.capture-group-head h3{{margin:0;font-size:16px}}.capture-group-head button{{margin:0;background:#b5392e}}.capture-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}}.capture-card{{display:block;width:100%;padding:0;background:#fff;color:#20242a;text-align:left;border:0;margin:0;cursor:pointer}}.capture-card:hover img{{outline:3px solid #00a23d}}.capture-modal{{position:fixed;inset:0;z-index:10;background:#000b;display:grid;place-items:center;padding:24px;box-sizing:border-box}}.capture-modal[hidden]{{display:none}}.capture-dialog{{position:relative;box-sizing:border-box;width:min(1080px,calc(100vw - 32px));max-height:calc(100vh - 32px);overflow:auto;background:#fff;border-radius:12px;padding:20px;box-shadow:0 12px 50px #0008}}.capture-dialog img{{display:block;max-width:100%;max-height:68vh;margin:12px auto 0;border-radius:8px;background:#e9edf0}}.capture-close{{position:absolute;right:14px;top:8px;margin:0;background:#59636e}}.capture-info{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:14px}}.capture-info div{{background:#f5f7f8;border-radius:7px;padding:9px;overflow-wrap:anywhere}}.capture-info b{{display:block;font-size:12px;color:#66707a;margin-bottom:3px}}</style><main><h1>Centre Vision</h1><p class="muted">Surveillance locale en lecture seule.</p><section><h2>Connexion Bambu</h2><p>Adresse de l’imprimante : <b>192.168.1.24</b></p><button class="secondary" onclick="importBambuStudio()">Importer la configuration de Bambu Studio</button><p class="muted">Le code LAN reste uniquement sur ce Mac.</p></section><section><h2>Caméra</h2><p id="status">Chargement…</p><label><input id="enabled" type="checkbox"> Activer les captures toutes les 5 couches</label><label>Empreinte TLS</label><input id="fingerprint" placeholder="Détecte-la automatiquement"><button class="secondary" onclick="discover()">Détecter la caméra</button> <button onclick="save()">Approuver et enregistrer</button><p id="meta" class="muted"></p></section><section><h2>Captures par impression</h2><div id="gallery"></div></section></main><div id="captureModal" class="capture-modal" hidden onclick="if(event.target===this)closeCapture()"><section class="capture-dialog"><button class="capture-close" onclick="closeCapture()">Fermer</button><h2 id="captureTitle">Capture</h2><img id="captureLarge" alt="Capture agrandie"><div id="captureInfo" class="capture-info"></div></section></div>
 <script>const visionStatus=document.getElementById('status'),visionEnabled=document.getElementById('enabled'),visionFingerprint=document.getElementById('fingerprint'),visionMeta=document.getElementById('meta'),visionGallery=document.getElementById('gallery'),captureModal=document.getElementById('captureModal'),captureTitle=document.getElementById('captureTitle'),captureLarge=document.getElementById('captureLarge'),captureInfo=document.getElementById('captureInfo');</script>
-<script>const token={api_token!r};async function api(p,o={{}}){{let r=await fetch(p,{{...o,headers:{{'X-AMS-Token':token,'Content-Type':'application/json'}}}}),j=await r.json();if(!r.ok)throw Error(j.error||'Erreur');return j}}function captureURL(file){{return `/api/captures/${{encodeURIComponent(file)}}?token=${{encodeURIComponent(token)}}`}}function esc(v){{return String(v??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}function show(s){{let c=s.camera||{{}},x=Array.isArray(c.captures)?c.captures:[];visionStatus.textContent=c.status||'Caméra non configurée';visionEnabled.checked=!!c.enabled;visionFingerprint.value=c.certificate_sha256||'';visionMeta.textContent=`Cadence : 5 couches · dernière couche : ${{c.last_seen_layer||'—'}}`;window.visionCaptures=x;let groups=new Map();x.forEach((i,index)=>{{let key=i.folder||'en-cours';if(!groups.has(key))groups.set(key,{{name:i.print_name||(i.folder?'Impression terminée':'Impression en cours'),folder:i.folder||'',id:i.print_id||'',items:[]}});groups.get(key).items.push({{i,index}})}});visionGallery.innerHTML=x.length?[...groups.values()].map(g=>`<div class="capture-group"><div class="capture-group-head"><div><h3>${{esc(g.name)}}</h3><span>${{g.items.length}} image(s)</span></div>${{g.folder?`<button onclick="deletePrint('${{esc(g.folder)}}')">Supprimer</button>`:g.id?`<button onclick="deleteCurrentPrint('${{esc(g.id)}}')">Supprimer</button>`:''}}</div><div class="capture-grid">${{g.items.map(({{i,index}})=>`<article><button class="capture-card" onclick="openCapture(${{index}})"><b>Couche ${{i.layer}}</b><br>${{i.captured_at}}<img src="${{captureURL(i.file)}}" alt="Capture de la couche ${{i.layer}}"></button></article>`).join('')}}</div></div>`).join(''):'Aucune capture.'}}function openCapture(index){{let i=(window.visionCaptures||[])[index];if(!i)return;captureTitle.textContent=`Capture · couche ${{i.layer}}`;captureLarge.src=captureURL(i.file);captureLarge.alt=`Capture agrandie de la couche ${{i.layer}}`;captureInfo.innerHTML=`<div><b>Impression</b>${{esc(i.print_name||'En cours')}}</div><div><b>Couche</b>${{i.layer}}</div><div><b>Date</b>${{i.captured_at}}</div><div><b>Fichier</b>${{i.file}}</div><div><b>Empreinte SHA-256</b>${{i.sha256||'—'}}</div>`;captureModal.hidden=false}}function closeCapture(){{captureModal.hidden=true;captureLarge.removeAttribute('src')}}async function deletePrint(folder){{if(!confirm('Supprimer définitivement toutes les captures de cette impression ?'))return;try{{await api(`/api/captures/${{encodeURIComponent(folder)}}/delete`,{{method:'POST',body:'{{}}'}});closeCapture();await load()}}catch(e){{visionStatus.textContent=e.message}}}}async function deleteCurrentPrint(id){{if(!confirm('Supprimer les captures déjà prises pour cette impression ? Les prochaines captures continueront normalement.'))return;try{{await api(`/api/captures/session/${{encodeURIComponent(id)}}/delete`,{{method:'POST',body:'{{}}'}});closeCapture();await load()}}catch(e){{visionStatus.textContent=e.message}}}}async function load(){{try{{show(await api('/api/state'))}}catch(e){{visionStatus.textContent=e.message}}}}async function importBambuStudio(){{try{{let r=await api('/api/config/import-bambu-studio',{{method:'POST',body:JSON.stringify({{ip:'192.168.1.24'}})}});visionStatus.textContent=`Configuration importée pour ${{r.serial}}. Active ensuite le mode LAN de l’imprimante.`;load()}}catch(e){{visionStatus.textContent=e.message}}}}async function discover(){{try{{visionFingerprint.value=(await api('/api/camera/discover',{{method:'POST',body:'{{}}'}})).fingerprint;visionStatus.textContent='Empreinte détectée : approuve-la.'}}catch(e){{visionStatus.textContent=e.message}}}}async function save(){{try{{await api('/api/config',{{method:'POST',body:JSON.stringify({{camera_enabled:visionEnabled.checked,camera_certificate_sha256:visionFingerprint.value}})}});load()}}catch(e){{visionStatus.textContent=e.message}}}}document.addEventListener('keydown',e=>{{if(e.key==='Escape')closeCapture()}});load();setInterval(load,3000);</script>'''
+<script>const token={api_token!r};async function api(p,o={{}}){{let r=await fetch(p,{{...o,headers:{{'X-AMS-Token':token,'Content-Type':'application/json'}}}}),j=await r.json();if(!r.ok)throw Error(j.error||'Erreur');return j}}function captureURL(file){{return `/api/captures/${{encodeURIComponent(file)}}?token=${{encodeURIComponent(token)}}`}}function esc(v){{return String(v??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}function show(s){{let c=s.camera||{{}},x=Array.isArray(c.captures)?c.captures:[],storage=s.vision_storage||{{}},size=(Number(storage.bytes||0)/1048576).toFixed(1);visionStatus.textContent=c.status||'Caméra non configurée';visionEnabled.checked=!!c.enabled;visionFingerprint.value=c.certificate_sha256||'';visionMeta.textContent=`Cadence : 5 couches · dernière couche : ${{c.last_seen_layer||'—'}} · ${{storage.count||0}} image(s) · ${{size}} Mo`;window.visionCaptures=x;let groups=new Map();x.forEach((i,index)=>{{let key=i.folder||'en-cours';if(!groups.has(key))groups.set(key,{{name:i.print_name||(i.folder?'Impression terminée':'Impression en cours'),folder:i.folder||'',id:i.print_id||'',items:[]}});groups.get(key).items.push({{i,index}})}});visionGallery.innerHTML=x.length?[...groups.values()].map(g=>`<div class="capture-group"><div class="capture-group-head"><div><h3>${{esc(g.name)}}</h3><span>${{g.items.length}} image(s)</span></div>${{g.folder?`<button onclick="deletePrint('${{esc(g.folder)}}')">Supprimer</button>`:g.id?`<button onclick="deleteCurrentPrint('${{esc(g.id)}}')">Supprimer</button>`:''}}</div><div class="capture-grid">${{g.items.map(({{i,index}})=>`<article><button class="capture-card" onclick="openCapture(${{index}})"><b>Couche ${{i.layer}}</b><br>${{i.captured_at}}<img src="${{captureURL(i.file)}}" alt="Capture de la couche ${{i.layer}}"></button></article>`).join('')}}</div></div>`).join(''):'Aucune capture.'}}function openCapture(index){{let i=(window.visionCaptures||[])[index];if(!i)return;captureTitle.textContent=`Capture · couche ${{i.layer}}`;captureLarge.src=captureURL(i.file);captureLarge.alt=`Capture agrandie de la couche ${{i.layer}}`;captureInfo.innerHTML=`<div><b>Impression</b>${{esc(i.print_name||'En cours')}}</div><div><b>Couche</b>${{i.layer}}</div><div><b>Date</b>${{i.captured_at}}</div><div><b>Fichier</b>${{i.file}}</div><div><b>Empreinte SHA-256</b>${{i.sha256||'—'}}</div>`;captureModal.hidden=false}}function closeCapture(){{captureModal.hidden=true;captureLarge.removeAttribute('src')}}async function deletePrint(folder){{if(!confirm('Supprimer définitivement toutes les captures de cette impression ?'))return;try{{await api(`/api/captures/${{encodeURIComponent(folder)}}/delete`,{{method:'POST',body:'{{}}'}});closeCapture();await load()}}catch(e){{visionStatus.textContent=e.message}}}}async function deleteCurrentPrint(id){{if(!confirm('Supprimer les captures déjà prises pour cette impression ? Les prochaines captures continueront normalement.'))return;try{{await api(`/api/captures/session/${{encodeURIComponent(id)}}/delete`,{{method:'POST',body:'{{}}'}});closeCapture();await load()}}catch(e){{visionStatus.textContent=e.message}}}}async function load(){{try{{show(await api('/api/state'))}}catch(e){{visionStatus.textContent=e.message}}}}async function importBambuStudio(){{try{{let r=await api('/api/config/import-bambu-studio',{{method:'POST',body:JSON.stringify({{ip:'192.168.1.24'}})}});visionStatus.textContent=`Configuration importée pour ${{r.serial}}. Active ensuite le mode LAN de l’imprimante.`;load()}}catch(e){{visionStatus.textContent=e.message}}}}async function discover(){{try{{visionFingerprint.value=(await api('/api/camera/discover',{{method:'POST',body:'{{}}'}})).fingerprint;visionStatus.textContent='Empreinte détectée : approuve-la.'}}catch(e){{visionStatus.textContent=e.message}}}}async function save(){{try{{await api('/api/config',{{method:'POST',body:JSON.stringify({{camera_enabled:visionEnabled.checked,camera_certificate_sha256:visionFingerprint.value}})}});load()}}catch(e){{visionStatus.textContent=e.message}}}}document.addEventListener('keydown',e=>{{if(e.key==='Escape')closeCapture()}});load();setInterval(load,3000);</script>'''
 
 
 def run_server(open_browser: bool = True, state_path: Path = STATE_FILE, api_token: str | None = None) -> None:

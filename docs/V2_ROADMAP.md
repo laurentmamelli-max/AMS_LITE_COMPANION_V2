@@ -4,7 +4,8 @@ Branche de développement : `companion-v2`.
 
 V2 démarre sur la V1.5 stable, mais ses évolutions restent isolées de la
 branche `main` jusqu'à leur validation. La première livraison stable est
-`2.0.1`.
+`2.0.1`. La livraison locale en cours prépare le socle `2.1.0` et l’architecture
+V3 est documentée dans `V3_ARCHITECTURE.md`.
 
 ## Isolation avec V1
 
@@ -60,10 +61,10 @@ temps, afin d'éviter deux suivis du même travail.
 | Jalon | Résultat attendu | État |
 |---|---|---|
 | V2-0 | Branche, version de développement et feuille de route | Fait |
-| V2-1 | Étude du contrôle Bambu et test d'annulation d'un objet | À faire |
-| V2-2 | Détection visuelle et association objet/plateau | À cadrer |
-| V2-3 | Interface de proposition et journal de décisions | À cadrer |
-| V2-4 | Migration, tests de reprise et paquet macOS | À cadrer |
+| V2-1 | Vision : preuves, catégories de défaut et alertes | Fait, modèle local à brancher |
+| V2-2 | Cartographie G-code d’objets et zones XY | Fait pour balises explicites |
+| V2-3 | Plan d’exclusion simulé et garde-fous | Fait, action physique bloquée |
+| V2-4 | Journal durable, supervision, migrations et paquet macOS | En validation continue |
 
 ## Règle de livraison
 

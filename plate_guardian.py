@@ -37,6 +37,7 @@ class PlateGuardian:
             "n'est validée dans V2."
         ),
     }
+    defect_types = {"spaghetti", "detachment", "warping", "extrusion_anomaly", "anomaly"}
 
     def __init__(
         self,
@@ -79,6 +80,7 @@ class PlateGuardian:
                     idempotency_key TEXT NOT NULL UNIQUE,
                     object_id TEXT NOT NULL,
                     object_label TEXT NOT NULL,
+                    defect_type TEXT NOT NULL DEFAULT 'anomaly',
                     confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
                     source TEXT NOT NULL,
                     frame_sha256 TEXT NOT NULL,
@@ -91,6 +93,7 @@ class PlateGuardian:
                     id TEXT PRIMARY KEY,
                     object_id TEXT NOT NULL,
                     object_label TEXT NOT NULL,
+                    defect_type TEXT NOT NULL DEFAULT 'anomaly',
                     status TEXT NOT NULL CHECK(status IN ('pending_confirmation', 'continue', 'dismissed')),
                     confidence REAL NOT NULL,
                     evidence_count INTEGER NOT NULL,
@@ -111,6 +114,12 @@ class PlateGuardian:
                 );
                 """
             )
+            observation_columns = {row["name"] for row in connection.execute("PRAGMA table_info(guardian_observations)")}
+            proposal_columns = {row["name"] for row in connection.execute("PRAGMA table_info(guardian_proposals)")}
+            if "defect_type" not in observation_columns:
+                connection.execute("ALTER TABLE guardian_observations ADD COLUMN defect_type TEXT NOT NULL DEFAULT 'anomaly'")
+            if "defect_type" not in proposal_columns:
+                connection.execute("ALTER TABLE guardian_proposals ADD COLUMN defect_type TEXT NOT NULL DEFAULT 'anomaly'")
 
     @staticmethod
     def _text(value: Any, field: str, maximum: int) -> str:
@@ -133,6 +142,9 @@ class PlateGuardian:
         object_id = self._text(payload.get("object_id"), "object_id", 120)
         object_label = self._text(payload.get("object_label") or object_id, "object_label", 120)
         source = self._text(payload.get("source", "camera"), "source", 40)
+        defect_type = str(payload.get("defect_type") or "anomaly").strip().lower()
+        if defect_type not in self.defect_types:
+            raise GuardianError("defect_type inconnu")
         frame_sha256 = self._frame_hash(payload.get("frame_sha256"))
         try:
             confidence = float(payload.get("confidence"))
@@ -148,7 +160,7 @@ class PlateGuardian:
         if not idempotency_key:
             # A detector may retry a frame with a slightly different timestamp.
             # The same image must never count twice toward a safety proposal.
-            signature = f"{object_id}\n{frame_sha256}\n{source}"
+            signature = f"{object_id}\n{defect_type}\n{frame_sha256}\n{source}"
             idempotency_key = hashlib.sha256(signature.encode("utf-8")).hexdigest()
         if len(idempotency_key) > 160:
             raise GuardianError("idempotency_key est trop long")
@@ -157,15 +169,15 @@ class PlateGuardian:
             try:
                 connection.execute(
                     """INSERT INTO guardian_observations(
-                           idempotency_key, object_id, object_label, confidence,
+                           idempotency_key, object_id, object_label, defect_type, confidence,
                            source, frame_sha256, observed_at, created_at
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (idempotency_key, object_id, object_label, confidence, source,
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (idempotency_key, object_id, object_label, defect_type, confidence, source,
                      frame_sha256, observed_at, now),
                 )
             except sqlite3.IntegrityError:
                 return {"accepted": False, "duplicate": True, "proposal": None}
-            proposal = self._maybe_create_proposal(connection, object_id, object_label, now)
+            proposal = self._maybe_create_proposal(connection, object_id, object_label, defect_type, now)
             return {"accepted": True, "duplicate": False, "proposal": proposal}
 
     def _maybe_create_proposal(
@@ -173,21 +185,22 @@ class PlateGuardian:
         connection: sqlite3.Connection,
         object_id: str,
         object_label: str,
+        defect_type: str,
         now: float,
     ) -> dict[str, Any] | None:
         existing = connection.execute(
             """SELECT * FROM guardian_proposals
-               WHERE object_id = ? AND status = 'pending_confirmation'
+               WHERE object_id = ? AND defect_type = ? AND status = 'pending_confirmation'
                ORDER BY created_at DESC LIMIT 1""",
-            (object_id,),
+            (object_id, defect_type),
         ).fetchone()
         if existing:
             return self._proposal_dict(existing)
         rows = connection.execute(
             """SELECT confidence, frame_sha256, observed_at FROM guardian_observations
-               WHERE object_id = ? AND observed_at >= ? AND confidence >= ?
+               WHERE object_id = ? AND defect_type = ? AND observed_at >= ? AND confidence >= ?
                ORDER BY observed_at DESC""",
-            (object_id, now - self.evidence_window_seconds, self.min_confidence),
+            (object_id, defect_type, now - self.evidence_window_seconds, self.min_confidence),
         ).fetchall()
         unique_rows: list[sqlite3.Row] = []
         seen_frames: set[str] = set()
@@ -205,14 +218,15 @@ class PlateGuardian:
         confidence = sum(float(row["confidence"]) for row in ordered) / len(ordered)
         connection.execute(
             """INSERT INTO guardian_proposals(
-                   id, object_id, object_label, status, confidence, evidence_count,
+                   id, object_id, object_label, defect_type, status, confidence, evidence_count,
                    first_observed_at, last_observed_at, created_at
-               ) VALUES (?, ?, ?, 'pending_confirmation', ?, ?, ?, ?, ?)""",
-            (proposal_id, object_id, object_label, confidence, len(ordered),
+               ) VALUES (?, ?, ?, ?, 'pending_confirmation', ?, ?, ?, ?, ?)""",
+            (proposal_id, object_id, object_label, defect_type, confidence, len(ordered),
              float(ordered[0]["observed_at"]), float(ordered[-1]["observed_at"]), now),
         )
         detail = {
             "object_id": object_id,
+            "defect_type": defect_type,
             "evidence_count": len(ordered),
             "frame_sha256": [row["frame_sha256"] for row in ordered],
             "capability": self.capability["status"],
@@ -230,6 +244,7 @@ class PlateGuardian:
             "id": row["id"],
             "object_id": row["object_id"],
             "object_label": row["object_label"],
+            "defect_type": row["defect_type"],
             "status": row["status"],
             "confidence": round(float(row["confidence"]), 4),
             "evidence_count": int(row["evidence_count"]),
