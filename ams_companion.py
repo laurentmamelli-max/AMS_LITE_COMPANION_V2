@@ -55,8 +55,9 @@ LOG_FILE = Path(_log_override).expanduser() if _log_override else APP_DIR / "com
 INVENTORY_FILE = APP_DIR / "inventory.sqlite3"
 GUARDIAN_FILE = APP_DIR / "guardian.sqlite3"
 EVENTS_FILE = APP_DIR / "events.sqlite3"
+AUTOPILOT_FILE = APP_DIR / "autopilot.sqlite3"
 HOST, PORT = "127.0.0.1", 8766
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -233,6 +234,10 @@ def guardian_path_for_state(state_path: Path) -> Path:
 def events_path_for_state(state_path: Path) -> Path:
     """Keep the durable MQTT audit trail beside the state it describes."""
     return EVENTS_FILE if state_path == STATE_FILE else state_path.with_name("events.sqlite3")
+
+
+def autopilot_path_for_state(state_path: Path) -> Path:
+    return AUTOPILOT_FILE if state_path == STATE_FILE else state_path.with_name("autopilot.sqlite3")
 
 
 class EventJournal:
@@ -1295,6 +1300,7 @@ def validate_3mf_archive(archive: zipfile.ZipFile) -> None:
 
 def extract_3mf_object_map(archive: zipfile.ZipFile) -> dict[str, Any]:
     """Read explicit object markers from every bounded plate G-code."""
+    slice_objects = extract_3mf_slice_objects(archive)
     names = [name for name in archive.namelist() if re.search(r"(?:metadata/)?plate_\d+\.gcode$", name, re.I)]
     objects: list[dict[str, Any]] = []
     for name in sorted(names):
@@ -1305,9 +1311,57 @@ def extract_3mf_object_map(archive: zipfile.ZipFile) -> dict[str, Any]:
         truncated = len(raw_gcode) > MAX_GCODE_OBJECT_MAP_BYTES
         text = raw_gcode[:MAX_GCODE_OBJECT_MAP_BYTES].decode("utf-8", "replace")
         for item in map_gcode_objects(text):
-            objects.append({"plate": plate, "source_truncated": truncated, **item})
+            canonical = slice_objects.get(str(item["id"]))
+            label = str(item["label"])
+            if canonical:
+                name = str(canonical.get("name") or "Objet Bambu")
+                label = f"{name} · #{item['id']}"
+            objects.append({
+                "plate": plate, "source_truncated": truncated,
+                "protocol_object_id": canonical.get("protocol_object_id") if canonical else None,
+                "protocol_identity": "slice_info.config" if canonical else "gcode_only",
+                "protocol_skipped": bool(canonical.get("skipped")) if canonical else False,
+                **item, "label": label,
+            })
+    mapped_ids = {str(item["id"]) for item in objects}
+    for object_id, canonical in slice_objects.items():
+        if object_id not in mapped_ids:
+            objects.append({
+                "id": object_id, "label": f"{canonical.get('name') or 'Objet Bambu'} · #{object_id}",
+                "plate": "", "source_truncated": False,
+                "protocol_object_id": canonical["protocol_object_id"],
+                "protocol_identity": "slice_info.config", "protocol_skipped": bool(canonical.get("skipped")),
+                "start_line": None, "end_line": None, "bounds_xy": None,
+                "segment_count": 0, "line_ranges": [], "line_ranges_truncated": False,
+            })
     return {**object_map_summary(objects), "objects": objects,
-            "source_max_bytes": MAX_GCODE_OBJECT_MAP_BYTES}
+            "source_max_bytes": MAX_GCODE_OBJECT_MAP_BYTES,
+            "protocol": {
+                "command": "skip_objects",
+                "identity_source": "slice_info.config",
+                "verified_object_count": sum(1 for item in objects if item.get("protocol_object_id") is not None),
+            }}
+
+
+def extract_3mf_slice_objects(archive: zipfile.ZipFile) -> dict[str, dict[str, Any]]:
+    """Read the canonical Bambu skip-object IDs from ``slice_info.config``."""
+    names = [name for name in archive.namelist() if name.lower().endswith("metadata/slice_info.config")]
+    if not names:
+        return {}
+    root = ET.fromstring(archive.read(names[0]))
+    result: dict[str, dict[str, Any]] = {}
+    for element in root.iter():
+        if local_name(element.tag) != "object":
+            continue
+        object_id = str(element.attrib.get("identify_id") or "").strip()
+        if not object_id.isdigit() or int(object_id) <= 0:
+            continue
+        result[object_id] = {
+            "protocol_object_id": int(object_id),
+            "name": str(element.attrib.get("name") or "").strip()[:120],
+            "skipped": str(element.attrib.get("skipped") or "false").lower() == "true",
+        }
+    return result
 
 
 def extract_3mf_plates(archive: zipfile.ZipFile) -> list[dict[str, Any]]:
@@ -1652,7 +1706,7 @@ class Companion:
         self.guardian = PlateGuardian(guardian_path_for_state(state_path))
         self.events = EventJournal(events_path_for_state(state_path))
         self.events.initialize()
-        self.autopilot = AutoPilotPlanner()
+        self.autopilot = AutoPilotPlanner(autopilot_path_for_state(state_path))
         previous_spools = json.dumps(self.state.get("spools", {}), sort_keys=True)
         self._sync_spools_from_inventory()
         if json.dumps(self.state["spools"], sort_keys=True) != previous_spools:
@@ -1835,6 +1889,15 @@ class Companion:
             str(data.get("note") or ""),
         )
         log(f"Gardien de plateau: décision humaine {result['status']} pour {result['object_label']}")
+        return result
+
+    def prepare_autopilot_exclusion(self, proposal_id: str) -> dict[str, Any]:
+        """Persist the exact single-object skip command, without publishing it."""
+        with self.lock:
+            guardian = self.guardian.state()
+            result = self.autopilot.prepare(proposal_id, guardian, self.state.get("active_job"))
+            self.save()
+        log(f"AutoPilot: exclusion unitaire préparée pour l’objet {result['object_id']}")
         return result
 
     def mqtt_config(self) -> MQTTConfig:
@@ -2996,6 +3059,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(self.app.observe_plate_guardian(self.json_body()), 201)
             elif match := re.fullmatch(r"/api/guardian/proposals/([a-f0-9]{32})/decision", path):
                 self.send_json(self.app.decide_plate_guardian(match.group(1), self.json_body()))
+            elif match := re.fullmatch(r"/api/autopilot/proposals/([a-f0-9]{32})/prepare", path):
+                self.json_body()
+                self.send_json(self.app.prepare_autopilot_exclusion(match.group(1)))
             elif path == "/api/shutdown":
                 self.json_body()
                 self.send_json({"ok": True, "message": "Companion arrêté proprement"})
@@ -3037,8 +3103,7 @@ $('bridgeMap').innerHTML=[1,2,3,4].map(i=>`<div><label>Filament ${i}</label><sel
 $('spools').innerHTML=[1,2,3,4].map(i=>{let x=s.spools[i]||{};return x.spool_id?`<div class="spool"><b>A${i}</b><label>Nom</label><input id="n${i}" value="${esc(x.name)}"><div class="row"><div><label>Initial (g)</label><input id="i${i}" type="number" step="0.1" value="${x.initial_g}"></div><div><label>Restant (g)</label><input id="r${i}" type="number" step="0.1" value="${x.remaining_g}"></div></div></div>`:`<div class="spool"><b>A${i}</b><div class="muted">Libre — choisis une bobine dans le catalogue.</div></div>`}).join('');}
 if(!formDirty)renderCatalog(s.inventory);
 $('bridgeStatus').textContent=s.bridge.status||'En attente de Bambu Studio';let bd=[];if(s.bridge.last_file)bd.push(`Dernier fichier : ${s.bridge.last_file}`);if(s.bridge.mapping_source)bd.push(`Correspondance : ${s.bridge.mapping_source}`);if(s.bridge.request_capture)bd.push('Capture des commandes AMS disponible sur ce Mac');let conflicts=s.bridge.mapping_conflict||[];if(conflicts.length)bd.push('Changement détecté : '+conflicts.map(x=>`filament ${x.filament_id} : A${x.saved_slot} → A${x.bambu_slot}`).join(', '));let bj=s.active_job?.auto_bridge?s.active_job:s.armed_job?.auto_bridge?s.armed_job:null;if(bj)bd.push('Décompte : '+bj.lines.map(x=>`filament ${x.filament.id} → A${x.slot} (${x.used_g} g)`).join(', '));let confirmButton=s.bridge.mapping_confirmation_required?'<button class="secondary" onclick="confirmDetectedImport()">Confirmer le changement AMS</button>':'';$('bridgeDetails').innerHTML=bd.map(esc).join('<br>')+confirmButton;
-$('guardianStatus').className='notice';let guardian=s.guardian||{},pending=guardian.pending_proposals||[],capability=guardian.capability||{};if(pending.length){let proposal=pending[0];$('guardianStatus').className='notice guardian-alert';$('guardianStatus').textContent=`Alerte ${proposal.defect_type||'anomaly'} à vérifier : ${proposal.object_label} (${proposal.evidence_count} images, confiance ${Math.round(100*proposal.confidence)} %)`;$('guardianDetails').innerHTML=`V2 ne commande pas l’imprimante. Décide seulement du suivi de cette alerte.<div class="guardian-actions"><button class="secondary" onclick="decideGuardian('${proposal.id}','continue')">Continuer à surveiller</button><button class="secondary" onclick="decideGuardian('${proposal.id}','dismiss')">Écarter l’alerte</button></div>`}else{$('guardianStatus').textContent='Mode observation : aucune action imprimante n’est disponible.';$('guardianDetails').textContent=`${guardian.observations_count||0} observation(s) journalisée(s). ${capability.reason||''}`}let autopilot=s.autopilot||{},pilotCapability=autopilot.capability||{},plans=autopilot.plans||[];$('autopilot').textContent=plans.length?`${plans.length} plan(s) simulé(s) bloqué(s) par le garde-fou : ${plans.map(p=>p.object_known?`${p.defect_type||'anomaly'} · objet ${p.object_id} cartographié`:`${p.defect_type||'anomaly'} · objet ${p.object_id} non cartographié`).join(' · ')}`:(pilotCapability.reason||'Aucun plan AutoPilot actif.');
-$('guardianStatus').className='notice';let guardian=s.guardian||{},pending=guardian.pending_proposals||[],capability=guardian.capability||{};if(pending.length){let proposal=pending[0];$('guardianStatus').className='notice guardian-alert';$('guardianStatus').textContent=`Alerte ${proposal.defect_type||'anomaly'} à vérifier : ${proposal.object_label} (${proposal.evidence_count} images, confiance ${Math.round(100*proposal.confidence)} %)`;$('guardianDetails').innerHTML=`V2 ne commande pas l’imprimante. Décide seulement du suivi de cette alerte.<div class="guardian-actions"><button class="secondary" onclick="decideGuardian('${proposal.id}','continue')">Continuer à surveiller</button><button class="secondary" onclick="decideGuardian('${proposal.id}','dismiss')">Écarter l’alerte</button></div>`}else{$('guardianStatus').textContent='Mode observation : aucune action imprimante n’est disponible.';$('guardianDetails').textContent=`${guardian.observations_count||0} observation(s) journalisée(s). ${capability.reason||''}`}let autopilot=s.autopilot||{},pilotCapability=autopilot.capability||{},plans=autopilot.plans||[];$('autopilot').textContent=plans.length?`${plans.length} plan(s) simulé(s) bloqué(s) par le garde-fou : ${plans.map(p=>p.object_known?`${p.defect_type||'anomaly'} · objet ${p.object_id} cartographié`:`${p.defect_type||'anomaly'} · objet ${p.object_id} non cartographié`).join(' · ')}`:(pilotCapability.reason||'Aucun plan AutoPilot actif.');let objectMap=(s.active_job||s.armed_job||{}).object_map||{},objects=Array.isArray(objectMap.objects)?objectMap.objects:[];$('gcodeMap').innerHTML=objects.length?`<p class="muted">${objects.length} objet(s) cartographié(s) par le G-code.</p><div class="object-map">${objects.map(o=>{let b=o.bounds_xy;return `<div class="object-chip"><b>${esc(o.label||('Objet '+o.id))}</b><br><span>${b?`X ${b.min_x}–${b.max_x} · Y ${b.min_y}–${b.max_y}`:'Zone XY indisponible'} · ${o.segment_count||0} segment(s)</span></div>`}).join('')}</div>`:`<p>${esc(objectMap.reason||'Aucune cartographie exploitable pour ce travail.')}</p>`;
+$('guardianStatus').className='notice';let guardian=s.guardian||{},pending=guardian.pending_proposals||[],capability=guardian.capability||{};if(pending.length){let proposal=pending[0];$('guardianStatus').className='notice guardian-alert';$('guardianStatus').textContent=`Alerte ${proposal.defect_type||'anomaly'} à vérifier : ${proposal.object_label} (${proposal.evidence_count} images, confiance ${Math.round(100*proposal.confidence)} %)`;$('guardianDetails').innerHTML=`L’exclusion reste préparée localement : aucune commande n’est envoyée à l’imprimante.<div class="guardian-actions"><button class="secondary" onclick="prepareExclusion('${proposal.id}')">Préparer l’exclusion unitaire</button><button class="secondary" onclick="decideGuardian('${proposal.id}','continue')">Continuer à surveiller</button><button class="secondary" onclick="decideGuardian('${proposal.id}','dismiss')">Écarter l’alerte</button></div>`}else{$('guardianStatus').textContent='Mode observation : aucune action imprimante n’est disponible.';$('guardianDetails').textContent=`${guardian.observations_count||0} observation(s) journalisée(s). ${capability.reason||''}`}let autopilot=s.autopilot||{},pilotCapability=autopilot.capability||{},plans=autopilot.plans||[],prepared=autopilot.prepared||[];$('autopilot').textContent=prepared.length?`${prepared.length} exclusion(s) unitaire(s) préparée(s) et journalisée(s), sans envoi à l’imprimante.`:plans.length?`${plans.length} proposition(s) prête(s) à préparer : ${plans.map(p=>p.status==='ready_to_prepare'?`${p.defect_type||'anomaly'} · objet ${p.object_id} canonique`:`${p.defect_type||'anomaly'} · objet ${p.object_id} bloqué par les préconditions`).join(' · ')}`:(pilotCapability.reason||'Aucun plan AutoPilot actif.');let objectMap=(s.active_job||s.armed_job||{}).object_map||{},objects=Array.isArray(objectMap.objects)?objectMap.objects:[];$('gcodeMap').innerHTML=objects.length?`<p class="muted">${objects.length} objet(s) cartographié(s) par le G-code.</p><div class="object-map">${objects.map(o=>{let b=o.bounds_xy;return `<div class="object-chip"><b>${esc(o.label||('Objet '+o.id))}</b><br><span>${b?`X ${b.min_x}–${b.max_x} · Y ${b.min_y}–${b.max_y}`:'Zone XY indisponible'} · ${o.segment_count||0} segment(s)</span></div>`}).join('')}</div>`:`<p>${esc(objectMap.reason||'Aucune cartographie exploitable pour ce travail.')}</p>`;
 $('history').innerHTML=s.history.length?s.history.map(h=>`<div class="history"><b>${esc(h.file||'Travail')}</b> — ${esc(h.result)} — ${h.deducted?'déduction effectuée':'aucune déduction'}${h.tracking_note?`<br><span class="muted">${esc(h.tracking_note)}</span>`:''}<br>${esc(h.ended_at||'')}</div>`).join(''):'Aucun travail enregistré.';let audit=s.events||[];$('audit').innerHTML=audit.length?audit.slice(0,8).map(e=>`<div class="history"><b>${esc(e.state||'MQTT')}</b>${e.task_id?` · ${esc(e.task_id)}`:''}${e.layer!=null?` · couche ${esc(e.layer)}`:''}${e.progress!=null?` · ${esc(e.progress)} %`:''}<br><span class="muted">${esc(e.received_at)} · ${e.outcome==='processed'?'traité':e.outcome==='failed'?'à vérifier':'reçu'}${e.detail?` · ${esc(e.detail)}`:''}</span></div>`).join(''):'Aucun événement MQTT enregistré.'}
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function dateValue(value){return String(value||'').slice(0,10)}function suggestedName(material,color){return [material.trim(),color.trim()].filter(Boolean).join(' ')}function autoNewSpoolName(){let name=$('newSpoolName');if(!name.dataset.custom)name.value=suggestedName($('newSpoolMaterial').value,$('newSpoolColor').value)}function autoCatalogSpoolName(id){let name=$('cn'+id);if(!name.dataset.custom&&(/^Bobine A[1-4]$/.test(name.value)||/^A\d{2}-[A-Z0-9-]+$/i.test(name.value)||!name.value))name.value=suggestedName($('cm'+id).value,$('cc'+id).value)}
@@ -3056,6 +3121,7 @@ async function saveConfig(){try{await api('/api/config',{method:'POST',body:JSON
 async function saveBridge(){let m={};for(let i=1;i<=4;i++)m[i]=$('bm'+i).value;try{await api('/api/bridge',{method:'POST',body:JSON.stringify({enabled:$('autoEnabled').checked,fallback_enabled:$('fallbackEnabled').checked,default_mapping:m})});formDirty=false;msg('Passerelle enregistrée.');refresh()}catch(e){msg(e.message,true)}}
 async function saveSpools(){let x={};for(let i=1;i<=4;i++)if(S.spools[i]?.spool_id)x[i]={name:$('n'+i).value,initial_g:+$('i'+i).value,remaining_g:+$('r'+i).value};try{await api('/api/spools',{method:'POST',body:JSON.stringify(x)});formDirty=false;msg('Poids enregistrés.');refresh()}catch(e){msg(e.message,true)}}
 async function decideGuardian(id,decision){try{await api('/api/guardian/proposals/'+id+'/decision',{method:'POST',body:JSON.stringify({decision})});msg('Décision enregistrée. Aucune commande n’a été envoyée à l’imprimante.');refresh()}catch(e){msg(e.message,true)}}
+async function prepareExclusion(id){try{let prepared=await api('/api/autopilot/proposals/'+id+'/prepare',{method:'POST',body:'{}'});msg(prepared.message||'Exclusion préparée localement.');refresh()}catch(e){msg(e.message,true)}}
 async function createSpool(){try{await api('/api/inventory/spools',{method:'POST',body:JSON.stringify({name:$('newSpoolName').value,material:$('newSpoolMaterial').value,brand:$('newSpoolBrand').value,color:$('newSpoolColor').value,initial_g:+$('newSpoolInitial').value,remaining_g:+$('newSpoolRemaining').value,created_at:$('newSpoolDate').value})});['newSpoolName','newSpoolMaterial','newSpoolBrand','newSpoolColor'].forEach(id=>$(id).value='');delete $('newSpoolName').dataset.custom;formDirty=false;catalogLoaded=false;msg('Bobine ajoutée au catalogue. Choisis maintenant sa voie AMS.');refresh()}catch(e){msg(e.message,true)}}
 async function saveCatalogSpool(id,event){event?.stopPropagation();let slot=$('catalogSlot'+id).value;try{await api('/api/inventory/spools/'+id,{method:'POST',body:JSON.stringify({name:$('cn'+id).value,material:$('cm'+id).value,brand:$('cb'+id).value,color:$('cc'+id).value,initial_g:+$('ci'+id).value,remaining_g:+$('cr'+id).value,created_at:$('cd'+id).value})});let placement=await api('/api/inventory/assign',{method:'POST',body:JSON.stringify({spool_id:id,slot})});formDirty=false;catalogLoaded=false;msg(placement.message||'Bobine enregistrée.');refresh()}catch(e){msg(e.message,true)}}
 async function deleteSpool(id,event){event?.stopPropagation();if(pendingDeleteId!==id){pendingDeleteId=id;event.currentTarget.textContent='Confirmer';msg('Clique encore sur Confirmer pour supprimer définitivement cette bobine et son historique.');return}try{let result=await api('/api/inventory/spools/'+id+'/delete',{method:'POST',body:'{}'});pendingDeleteId=null;if(selectedSpoolId===id){selectedSpoolId=null;$('timelineTitle').textContent='Historique de la bobine';$('timelineSummary').textContent='Clique une ligne du catalogue pour afficher sa frise chronologique.';$('timeline').className='timeline-empty';$('timeline').textContent='Aucune bobine sélectionnée.'}formDirty=false;catalogLoaded=false;msg(result.message||'Bobine supprimée.');refresh()}catch(e){msg(e.message,true)}}

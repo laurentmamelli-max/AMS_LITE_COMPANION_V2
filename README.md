@@ -29,6 +29,8 @@ estimations et peuvent être corrigés manuellement après une pesée.
 
 - application native macOS avec un Centre Vision indépendant ;
 - captures caméra locales toutes les cinq couches, regroupées par impression ;
+- cartographie des objets Bambu Studio et préparation locale, unitaire et
+  journalisée d’une exclusion ; aucune commande n’est envoyée à l’imprimante ;
 - journal durable des événements MQTT importants, conservé après redémarrage ;
 - lancement de Bambu Studio officiel sans erreur de signature ;
 - suivi indépendant des emplacements A1 à A4 ;

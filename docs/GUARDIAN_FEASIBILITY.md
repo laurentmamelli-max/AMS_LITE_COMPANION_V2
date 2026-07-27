@@ -7,9 +7,11 @@ V2 sépare volontairement deux capacités :
 1. détecter, conserver les preuves et alerter ;
 2. annuler un objet précis.
 
-La première est développable localement. La seconde n'est pas activée : le
-projet ne dispose pas d'une commande Bambu LAN/SD officielle et vérifiée pour
-ignorer un objet d'une impression en cours.
+La première est développable localement. Pour la seconde, V2.3 sait préparer
+et journaliser une requête unitaire `skip_objects` avec l’identifiant canonique
+du fichier `slice_info.config`. Elle n'est pas activée : le projet ne dispose
+pas d'une commande Bambu LAN/SD officielle et vérifiée pour ignorer un objet
+d'une impression en cours.
 
 Le dépôt officiel de Bambu Studio référence encore une demande ouverte pour
 « Skip Object » sur les impressions SD/LAN :
@@ -21,8 +23,9 @@ copiera ni ne simulera donc une commande de contrôle non documentée :
 ## Conséquence produit
 
 Le noyau `plate_guardian.py` ne peut que créer une proposition avec preuves.
-Il n'expose volontairement aucune méthode d'annulation. Une future commande ne
-pourra être ajoutée qu'après :
+`autopilot.py` peut préparer une commande locale immuable et idempotente, mais
+ne contient aucun transport réseau. Une future publication ne pourra être
+ajoutée qu'après :
 
 1. validation du protocole par Bambu pour le modèle et le firmware ciblés ;
 2. test sur un plateau de démonstration ;

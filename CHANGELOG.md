@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.3.0 — 2026-07-28
+
+- L’identité d’exclusion est désormais l’identifiant canonique `identify_id`
+  de `Metadata/slice_info.config`, recoupé avec les segments du G-code. Un
+  objet absent, déjà ignoré ou sans travail actif est bloqué par préconditions.
+- Le Gardien permet de préparer une exclusion unitaire : la requête
+  `skip_objects` est construite, validée puis journalisée dans une base SQLite
+  dédiée, de façon idempotente. Cette étape ne possède aucun transport MQTT et
+  n’envoie donc aucune commande à l’imprimante.
+- Le tableau de bord affiche la préparation et son statut, en distinguant les
+  propositions encore bloquées des commandes locales journalisées.
+
 ## 2.2.0 — 2026-07-28
 
 - Cartographie G-code étendue au format réel de Bambu Studio : les marqueurs

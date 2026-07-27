@@ -10,7 +10,7 @@ flowchart LR
   C --> G["G-Code\nobjets, lignes, zones XY"]
   V --> D["Dashboard\nalertes et supervision"]
   G --> D
-  V --> A["AutoPilot\nplan simulé + garde-fous"]
+  V --> A["AutoPilot\ncommande préparée + garde-fous"]
   G --> A
   A --> D
 ```
@@ -43,9 +43,11 @@ sa plage de lignes et son enveloppe XY. Sans balise fiable, l’état reste
 
 ## AutoPilot — V2.3 et V3.0
 
-AutoPilot élabore un plan d’exclusion unitaire *simulé* et vérifie que l’objet
-est connu de la cartographie. Son état est délibérément
-`simulation_only`. Le passage à une action physique exige simultanément :
+AutoPilot élabore une exclusion unitaire préparée et vérifie que l’objet est
+connu de la cartographie et de `slice_info.config`. La commande est journalisée
+dans SQLite, de façon idempotente, mais son état reste
+`prepared_command_only` : aucun transport n’est invoqué. Le passage à une
+action physique exige simultanément :
 
 1. une commande Bambu documentée pour le modèle et firmware visés ;
 2. une exécution idempotente vérifiée sur plateau de test ;

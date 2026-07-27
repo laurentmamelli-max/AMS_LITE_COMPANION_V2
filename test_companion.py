@@ -30,6 +30,24 @@ def sample_3mf(*weights):
     return out.getvalue()
 
 
+def sample_mapped_3mf():
+    xml = b'''<config><plate id="1"><filament id="1" type="PLA" color="#ffffff" used_g="8" /></plate>
+    <object identify_id="944" name="Piece test.stl" skipped="false" />
+    <object identify_id="955" name="Deja ignore.stl" skipped="true" /></config>'''
+    gcode = b'''; start printing object, unique label id: 944
+G1 X10 Y20
+; stop printing object, unique label id: 944
+; start printing object, unique label id: 944
+G1 X12 Y25
+; stop printing object, unique label id: 944
+'''
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as archive:
+        archive.writestr("Metadata/slice_info.config", xml)
+        archive.writestr("Metadata/plate_1.gcode", gcode)
+    return out.getvalue()
+
+
 class CompanionTests(unittest.TestCase):
     def test_imports_lan_identity_from_bambu_studio_config(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -61,6 +79,30 @@ class CompanionTests(unittest.TestCase):
             streamed = ac.parse_3mf_path(path)
             self.assertEqual(parsed["plates"], streamed["plates"])
             self.assertEqual(parsed["sha256"], streamed["sha256"])
+
+    def test_uses_slice_info_identity_for_a_mapped_bambu_object(self):
+        parsed = ac.parse_3mf(sample_mapped_3mf(), "mapped.gcode.3mf")
+        objects = {item["id"]: item for item in parsed["object_map"]["objects"]}
+        self.assertEqual(944, objects["944"]["protocol_object_id"])
+        self.assertEqual("slice_info.config", objects["944"]["protocol_identity"])
+        self.assertIn("Piece test.stl", objects["944"]["label"])
+        self.assertTrue(objects["955"]["protocol_skipped"])
+
+    def test_prepares_a_guardian_exclusion_without_controlling_the_printer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.state["active_job"] = {
+                "token": "test-job", "object_map": ac.parse_3mf(sample_mapped_3mf())["object_map"],
+            }
+            for index in range(3):
+                result = app.observe_plate_guardian({
+                    "object_id": "944", "object_label": "Piece test", "confidence": 0.95,
+                    "source": "test", "frame_sha256": f"{index:064x}",
+                })
+            prepared = app.prepare_autopilot_exclusion(result["proposal"]["id"])
+            self.assertEqual([944], prepared["command"]["print"]["obj_list"])
+            self.assertEqual("prepared", prepared["status"])
+            self.assertEqual(1, len(app.public_state()["autopilot"]["prepared"]))
 
     def test_finish_deducts_once(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -170,7 +212,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("2.2.0", report["application"]["version"])
+            self.assertEqual("2.3.0", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -949,6 +991,17 @@ class CompanionTests(unittest.TestCase):
     def test_http_interface_and_state_api(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = ac.Companion(Path(tmp) / "state.json")
+            app.state["active_job"] = {
+                "token": "http-job", "object_map": ac.parse_3mf(sample_mapped_3mf())["object_map"],
+            }
+            proposal = None
+            for index in range(3):
+                observed = app.observe_plate_guardian({
+                    "object_id": "944", "object_label": "Piece test", "confidence": 0.95,
+                    "source": "http-test", "frame_sha256": f"{index + 10:064x}",
+                })
+                proposal = observed["proposal"] or proposal
+            self.assertIsNotNone(proposal)
             server = ac.ThreadingHTTPServer(("127.0.0.1", 0), ac.Handler)
             server.app = app
             server.api_token = "test-session-token"
@@ -971,6 +1024,7 @@ class CompanionTests(unittest.TestCase):
                 self.assertIn("Arrêter Companion", html)
                 self.assertIn("Passerelle Bambu Studio", html)
                 self.assertIn("Cartographie G-code", html)
+                self.assertIn("prepareExclusion", html)
                 self.assertIn("Gestionnaire de bobines", html)
                 self.assertIn("catalogView=", html)
                 self.assertIn("catalog-table", html)
@@ -981,10 +1035,17 @@ class CompanionTests(unittest.TestCase):
                 self.assertIn("embedded=new URLSearchParams", html)
                 self.assertIn(server.api_token, html)
                 self.assertEqual(1000, state["spools"]["1"]["remaining_g"])
+                prepare_request = urllib.request.Request(
+                    base + f"/api/autopilot/proposals/{proposal['id']}/prepare",
+                    data=b"{}", method="POST", headers=headers,
+                )
+                prepared = json.loads(urllib.request.urlopen(prepare_request, timeout=2).read())
+                self.assertEqual([944], prepared["command"]["print"]["obj_list"])
+                self.assertEqual("prepared", prepared["status"])
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("2.2.0", report["application"]["version"])
+                self.assertEqual("2.3.0", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
                 bridge_request = urllib.request.Request(
                     base + "/api/bridge",
