@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.0.2 — 2026-07-28
+
+- Chaque nouvelle impression remet à zéro le curseur de couches Vision. Une
+  capture à la couche 5 n’est donc plus bloquée par la dernière couche de
+  l’impression précédente.
+
 ## 3.0.1 — 2026-07-28
 
 - V3 adopte un fonctionnement **alertes uniquement** : une détection Vision

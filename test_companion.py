@@ -203,6 +203,22 @@ class CompanionTests(unittest.TestCase):
             self.assertEqual(10, app.state["camera"]["last_seen_layer"])
             self.assertEqual(10, app.state["camera"]["pending_capture_layer"])
 
+    def test_camera_resets_its_layer_cursor_when_a_new_print_session_starts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            with app.lock:
+                app._ensure_camera_print_session_locked({"subtask_name": "ancien.3mf"}, "old-task")
+                app.state["camera"].update({
+                    "last_seen_layer": 195, "last_requested_layer": 195,
+                    "pending_capture_layer": 195, "pending_capture_session_id": "old-session",
+                })
+                app._ensure_camera_print_session_locked({"subtask_name": "nouveau.3mf"}, "new-task")
+                self.assertEqual(0, app.state["camera"]["last_seen_layer"])
+                self.assertEqual(0, app.state["camera"]["last_requested_layer"])
+                app._schedule_camera_capture_locked({"layer_num": 5}, "RUNNING")
+            self.assertEqual(5, app.state["camera"]["pending_capture_layer"])
+            self.assertEqual(5, app.state["camera"]["last_requested_layer"])
+
     def test_camera_configuration_reports_active_surveillance(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = ac.Companion(Path(tmp) / "state.json")
@@ -267,7 +283,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("3.0.1", report["application"]["version"])
+            self.assertEqual("3.0.2", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -1154,7 +1170,7 @@ class CompanionTests(unittest.TestCase):
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("3.0.1", report["application"]["version"])
+                self.assertEqual("3.0.2", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
                 self.assertIn("Poste de supervision", html)
                 self.assertIn("Historique Vision et rapports", html)
