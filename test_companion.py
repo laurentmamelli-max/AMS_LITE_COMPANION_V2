@@ -321,7 +321,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("3.0.8", report["application"]["version"])
+            self.assertEqual("3.0.9", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -558,6 +558,29 @@ class CompanionTests(unittest.TestCase):
             self.assertEqual("CANCEL", entry["result"])
             self.assertFalse(entry["deducted"])
             self.assertTrue(entry["untracked"])
+
+    def test_stale_failed_report_before_running_does_not_pollute_armed_job_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.last_import = ac.parse_3mf(sample_3mf(12), "next-print.gcode.3mf")
+            app.arm({"plate": "1", "mappings": [{"filament_id": "1", "slot": "1"}]})
+
+            # Bambu sometimes replays a FAILED packet from the prior task in
+            # this narrow window, immediately before the actual RUNNING frame.
+            app.on_message({"print": {
+                "gcode_state": "FAILED", "subtask_id": "previous-task",
+                "subtask_name": "old-print.gcode.3mf",
+            }})
+            self.assertEqual([], app.state["history"])
+            self.assertIsNotNone(app.state["armed_job"])
+            self.assertEqual([], app.reports.recent())
+
+            app.on_message({"print": {
+                "gcode_state": "RUNNING", "subtask_id": "new-task",
+                "subtask_name": "next-print.gcode.3mf",
+            }})
+            self.assertEqual("new-task", app.state["active_job"]["task_id"])
+            self.assertEqual([], app.state["history"])
 
     def test_finished_untracked_print_is_kept_in_history_without_deduction(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1220,10 +1243,11 @@ class CompanionTests(unittest.TestCase):
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("3.0.8", report["application"]["version"])
+                self.assertEqual("3.0.9", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
                 self.assertIn("Poste de supervision", html)
                 self.assertIn("Historique Vision et rapports", html)
+                self.assertIn("Compteur local v3.0.9", html)
                 self.assertIn("shutdownCard.after(auditCard)", html)
                 self.assertIn("auditCard.after(reportsCard)", html)
                 snapshot_request = urllib.request.Request(

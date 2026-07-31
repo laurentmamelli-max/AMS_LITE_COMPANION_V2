@@ -59,6 +59,14 @@ cp "$ROOT/macos/Info.plist" "$CONTENTS/Info.plist"
 chmod 755 "$MACOS/AMS-Lite-Companion-V2"
 chmod 644 "$RESOURCES/ams_companion.py" "$RESOURCES/plate_guardian.py" "$RESOURCES/bambu_camera.py" "$RESOURCES/gcode_mapper.py" "$RESOURCES/autopilot.py" "$CONTENTS/Info.plist"
 
+# A signed bundle can launch only if each local Python dependency is present
+# beside the engine.  Import from the actual Resources directory before
+# signing so a forgotten module is caught during the release build.
+(
+  cd "$RESOURCES"
+  PYTHONDONTWRITEBYTECODE=1 python3 -c 'import ams_companion, autopilot, bambu_camera, gcode_mapper, plate_guardian'
+)
+
 codesign --force --deep --options runtime --sign "$SIGNING_IDENTITY" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
