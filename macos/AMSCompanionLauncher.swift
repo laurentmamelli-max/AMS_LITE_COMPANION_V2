@@ -303,6 +303,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             let process = Process()
             process.executableURL = URL(fileURLWithPath: python)
             process.arguments = [script, "--no-browser", "--api-token", apiToken]
+            var environment = ProcessInfo.processInfo.environment
+            // The Python engine runs directly from this signed application
+            // bundle. Avoid bytecode caches in Resources, which would alter
+            // the sealed bundle after a normal launch.
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            process.environment = environment
             self.engineLog = self.openEngineLog()
             process.standardOutput = self.engineLog
             process.standardError = self.engineLog
