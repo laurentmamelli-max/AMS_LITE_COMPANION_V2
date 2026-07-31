@@ -48,6 +48,21 @@ G1 X12 Y25
     return out.getvalue()
 
 
+def sample_bambu_indexed_3mf():
+    xml = b'''<config><plate><metadata key="index" value="3" />
+    <filament id="1" type="PLA" color="#ffffff" used_g="8" />
+    <object identify_id="944" name="Piece test.stl" skipped="false" /></plate></config>'''
+    gcode = b'''; start printing object, unique label id: 944
+G1 X10 Y20
+; stop printing object, unique label id: 944
+'''
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as archive:
+        archive.writestr("Metadata/slice_info.config", xml)
+        archive.writestr("Metadata/plate_3.gcode", gcode)
+    return out.getvalue()
+
+
 class ManualMQTTStub:
     """Test double: records the explicit request without opening a socket."""
 
@@ -98,6 +113,24 @@ class CompanionTests(unittest.TestCase):
         self.assertEqual("slice_info.config", objects["944"]["protocol_identity"])
         self.assertIn("Piece test.stl", objects["944"]["label"])
         self.assertTrue(objects["955"]["protocol_skipped"])
+
+    def test_manual_arm_keeps_the_selected_plate_object_map(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            parsed = ac.parse_3mf(sample_mapped_3mf(), "mapped.gcode.3mf")
+            expected_map = parsed["plates"][0]["object_map"]
+            # Bambu's temporary project archive can have a per-plate map but
+            # no global G-code map.  Manual arming must not lose the former.
+            parsed["object_map"] = {"status": "unavailable", "objects": []}
+            app.last_import = parsed
+            armed = app.arm({"plate": "1", "mappings": [{"filament_id": "1", "slot": "1"}]})
+            self.assertEqual(expected_map, armed["object_map"])
+
+    def test_bambu_plate_metadata_index_selects_its_matching_gcode_map(self):
+        parsed = ac.parse_3mf(sample_bambu_indexed_3mf(), "bambu.3mf")
+        self.assertEqual("3", parsed["plates"][0]["id"])
+        self.assertEqual("mapped", parsed["plates"][0]["object_map"]["status"])
+        self.assertEqual(["944"], [item["id"] for item in parsed["plates"][0]["object_map"]["objects"]])
 
     def test_sends_a_manual_guardian_exclusion_only_after_explicit_execution(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -929,6 +962,18 @@ class CompanionTests(unittest.TestCase):
             self.assertFalse(app.state["bridge"]["mapping_confirmation_required"])
             self.assertEqual("Travail armé automatiquement (Commande Bambu Studio)", app.state["bridge"]["status"])
             self.assertEqual("1", app.state["armed_job"]["lines"][0]["slot"])
+
+    def test_bridge_auto_arm_keeps_the_selected_plate_object_map(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json", [Path(tmp) / "watch"])
+            parsed = ac.parse_3mf(sample_mapped_3mf(), "bridge-mapped.gcode.3mf")
+            expected_map = parsed["plates"][0]["object_map"]
+            parsed["object_map"] = {"status": "unavailable", "objects": []}
+            app.on_studio_archive(Path(tmp) / "bridge-mapped.3mf", parsed)
+            app.on_mqtt_message("device/SERIAL/request", {"print": {
+                "ams_mapping": [0], "param": "Metadata/plate_1.gcode",
+            }})
+            self.assertEqual(expected_map, app.state["armed_job"]["object_map"])
 
     def test_bridge_request_can_arrive_before_archive(self):
         with tempfile.TemporaryDirectory() as tmp:

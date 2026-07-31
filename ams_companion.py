@@ -59,7 +59,7 @@ EVENTS_FILE = APP_DIR / "events.sqlite3"
 AUTOPILOT_FILE = APP_DIR / "autopilot.sqlite3"
 REPORTS_FILE = APP_DIR / "reports.sqlite3"
 HOST, PORT = "127.0.0.1", 8766
-__version__ = "3.0.2"
+__version__ = "3.0.3"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -1516,7 +1516,17 @@ def parse_slice_info(data: bytes) -> list[dict[str, Any]]:
                 "color": attrs.get("color") or attrs.get("filament_color") or "",
                 "used_g": round(used, 3),
             })
-        plate_id = str(plate.attrib.get("id") or plate.attrib.get("index") or pidx)
+        # Bambu Studio commonly stores the real plate number as a child
+        # ``<metadata key="index" value="…"/>`` rather than as an attribute
+        # of ``<plate>``.  That number must match ``plate_N.gcode``.
+        metadata_index = next((
+            str(node.attrib.get("value") or "").strip()
+            for node in plate
+            if (local_name(node.tag) == "metadata"
+                and str(node.attrib.get("key") or "").strip().lower() == "index"
+                and str(node.attrib.get("value") or "").strip())
+        ), "")
+        plate_id = str(plate.attrib.get("id") or plate.attrib.get("index") or metadata_index or pidx)
         if filaments:
             plates.append({"id": plate_id, "filaments": filaments})
     return plates
@@ -1641,13 +1651,33 @@ def extract_3mf_plates(archive: zipfile.ZipFile) -> list[dict[str, Any]]:
     return plates
 
 
+def object_map_for_plate(object_map: dict[str, Any], plate_id: str) -> dict[str, Any]:
+    """Return only the objects proved to belong to one sliced plate."""
+    objects = [item for item in object_map.get("objects", [])
+               if isinstance(item, dict) and str(item.get("plate") or "") == str(plate_id)]
+    result = {
+        **object_map_summary(objects),
+        "objects": objects,
+        "source_max_bytes": object_map.get("source_max_bytes", MAX_GCODE_OBJECT_MAP_BYTES),
+        "protocol": object_map.get("protocol", {}),
+    }
+    if not objects:
+        result["reason"] = (
+            f"Le G-code vérifié du plateau {plate_id} ne contient pas de balises d’objets exploitables."
+        )
+    return result
+
+
 def parsed_3mf_result(plates: list[dict[str, Any]], digest: str, filename: str,
                       object_map: dict[str, Any] | None = None) -> dict[str, Any]:
     if not plates:
         raise ValueError("Aucune consommation used_g trouvée. Exportez d’abord le plateau tranché en .gcode.3mf.")
-    return {"filename": Path(filename).name, "sha256": digest, "plates": plates,
-            "object_map": object_map or {"status": "unavailable", "object_count": 0,
-                                          "reason": "Cartographie non analysée", "objects": []}}
+    result_map = object_map or {"status": "unavailable", "object_count": 0,
+                                "reason": "Cartographie non analysée", "objects": []}
+    mapped_plates = [{**plate, "object_map": object_map_for_plate(result_map, str(plate["id"]))}
+                     for plate in plates]
+    return {"filename": Path(filename).name, "sha256": digest, "plates": mapped_plates,
+            "object_map": result_map}
 
 
 def parse_3mf(raw: bytes, filename: str = "travail.3mf") -> dict[str, Any]:
@@ -2554,7 +2584,10 @@ class Companion:
             "armed_epoch": time.time(),
             "auto_bridge": True,
             "mapping_source": mapping_source,
-            "object_map": self.auto_import.get("object_map", {}),
+            # The mapping is attached to each plate.  Keep that precise map
+            # when arming from the Bambu Studio bridge; a top-level mapping is
+            # only a compatibility fallback for older imports.
+            "object_map": plate.get("object_map") or self.auto_import.get("object_map", {}),
         }
         bridge["mapping_source"] = mapping_source
         bridge["mapping_confirmation_required"] = False
@@ -2757,7 +2790,10 @@ class Companion:
             self.state["armed_job"] = {
                 "token": token, "file": self.last_import["filename"], "plate": plate_id,
                 "lines": lines, "armed_at": now_iso(),
-                "object_map": self.last_import.get("object_map", {}),
+                # A multi-plate 3MF has one verified map per plate.  Using the
+                # selected plate prevents objects from another plate appearing
+                # in the active cartography.
+                "object_map": plate.get("object_map") or self.last_import.get("object_map", {}),
             }
             self.save()
             return self.state["armed_job"]
