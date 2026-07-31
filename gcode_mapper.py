@@ -22,6 +22,7 @@ _BAMBU_END = re.compile(
     r"^\s*;\s*stop\s+printing\s+object\s*,\s*unique\s+label\s+id\s*:\s*(.+?)\s*$", re.I
 )
 _XY = re.compile(r"\b([XY])\s*(-?(?:\d+(?:\.\d*)?|\.\d+))\b", re.I)
+_E = re.compile(r"\bE\s*(-?(?:\d+(?:\.\d*)?|\.\d+))\b", re.I)
 
 
 def _safe_identifier(value: str, fallback: str = "objet") -> str:
@@ -148,7 +149,18 @@ def map_gcode_objects(text: str, *, max_objects: int = 200, max_ranges_per_objec
 
         values = {axis.upper(): float(value) for axis, value in _XY.findall(line)}
         x, y = values.get("X", x), values.get("Y", y)
-        if current and line.lstrip().upper().startswith(("G0", "G1", "G2", "G3")):
+        # A Bambu object section also contains fast travel moves that cross
+        # the whole plate before the nozzle starts depositing material.  Those
+        # moves describe the head, not the printed object: including them made
+        # many object envelopes overlap almost the entire build plate.
+        #
+        # Keep the global X/Y position up to date for partial coordinates, but
+        # contribute a point only when the motion has a positive extrusion and
+        # an explicit X or Y coordinate.  This covers both relative and
+        # absolute extrusion G-code while excluding travel and retraction.
+        motion = line.lstrip().upper().startswith(("G0", "G1", "G2", "G3"))
+        extrusion = [float(value) for value in _E.findall(line)]
+        if current and motion and ("X" in values or "Y" in values) and any(value > 0 for value in extrusion):
             current.point(x, y)
 
         bambu_end = _BAMBU_END.match(line)

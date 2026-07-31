@@ -35,10 +35,10 @@ def sample_mapped_3mf():
     <object identify_id="944" name="Piece test.stl" skipped="false" />
     <object identify_id="955" name="Deja ignore.stl" skipped="true" /></config>'''
     gcode = b'''; start printing object, unique label id: 944
-G1 X10 Y20
+G1 X10 Y20 E0.4
 ; stop printing object, unique label id: 944
 ; start printing object, unique label id: 944
-G1 X12 Y25
+G1 X12 Y25 E0.4
 ; stop printing object, unique label id: 944
 '''
     out = io.BytesIO()
@@ -53,7 +53,7 @@ def sample_bambu_indexed_3mf():
     <filament id="1" type="PLA" color="#ffffff" used_g="8" />
     <object identify_id="944" name="Piece test.stl" skipped="false" /></plate></config>'''
     gcode = b'''; start printing object, unique label id: 944
-G1 X10 Y20
+G1 X10 Y20 E0.4
 ; stop printing object, unique label id: 944
 '''
     out = io.BytesIO()
@@ -270,9 +270,12 @@ class CompanionTests(unittest.TestCase):
         self.assertIn('id="captureModal"', page)
         self.assertIn('ce n’est pas une vidéo en direct', page)
         self.assertIn('Calibrer le plateau sur une capture', page)
-        self.assertIn('contour(s) rouges projetés depuis le G-code', page)
+        self.assertIn('Les noms sont dans la légende sous l’image', page)
         self.assertIn('id="layerCounter"', page)
         self.assertIn('id="calibrateCaptureButton"', page)
+        self.assertIn('id="objectLegend"', page)
+        self.assertIn('function selectMappedObject(index)', page)
+        self.assertNotIn('paint-order="stroke">${esc(object.label||object.id)}</text>', page)
 
     def test_camera_capture_lock_is_cleared_after_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -321,7 +324,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("3.0.9", report["application"]["version"])
+            self.assertEqual("3.1.0", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -581,6 +584,26 @@ class CompanionTests(unittest.TestCase):
             }})
             self.assertEqual("new-task", app.state["active_job"]["task_id"])
             self.assertEqual([], app.state["history"])
+
+    def test_startup_refreshes_active_object_map_from_its_matching_recent_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = root / "active.gcode.3mf"
+            archive.write_bytes(sample_mapped_3mf())
+            state = ac.default_state()
+            state["active_job"] = {
+                "file": "active.gcode.3mf", "plate": "1", "task_id": "active-1",
+                "object_map": {"status": "mapped", "objects": [{"id": "944", "bounds_xy": None}]},
+            }
+            state["bridge"]["recent_import"] = {
+                "filename": "active.gcode.3mf", "source_path": str(archive),
+            }
+            path = root / "state.json"
+            ac.atomic_save(state, path)
+
+            app = ac.Companion(path)
+            mapped = app.state["active_job"]["object_map"]["objects"]
+            self.assertEqual({"min_x": 10.0, "max_x": 12.0, "min_y": 20.0, "max_y": 25.0}, mapped[0]["bounds_xy"])
 
     def test_finished_untracked_print_is_kept_in_history_without_deduction(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1243,11 +1266,11 @@ class CompanionTests(unittest.TestCase):
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("3.0.9", report["application"]["version"])
+                self.assertEqual("3.1.0", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
                 self.assertIn("Poste de supervision", html)
                 self.assertIn("Historique Vision et rapports", html)
-                self.assertIn("Compteur local v3.0.9", html)
+                self.assertIn("Compteur local v3.1.0", html)
                 self.assertIn("shutdownCard.after(auditCard)", html)
                 self.assertIn("auditCard.after(reportsCard)", html)
                 snapshot_request = urllib.request.Request(

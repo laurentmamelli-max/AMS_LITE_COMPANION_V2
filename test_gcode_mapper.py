@@ -10,7 +10,7 @@ G1 X10.0 Y20.0 E1
 G1 X30 Y22 E2
 ; STOP_PRINTING_OBJECT: Cube gauche
 ; PRINTING_OBJECT: Tour
-G0 X50 Y60
+G1 X50 Y60 E0.4
 G1 X55 Y70 E1
 ; END_OBJECT
 """
@@ -50,6 +50,21 @@ G1 X16 Y25 E2
             by_id["944"]["bounds_xy"],
         )
         self.assertEqual(2, len(by_id["944"]["line_ranges"]))
+
+    def test_ignores_travel_moves_when_building_an_object_envelope(self):
+        gcode = """; start printing object, unique label id: 944
+G1 X10 Y20 F42000
+G1 X170 Y170 F42000
+G1 X12 Y22 E.4
+G1 X20 Y30 E.2
+G1 X5 Y5 F42000
+; stop printing object, unique label id: 944
+"""
+        item = map_gcode_objects(gcode)[0]
+        self.assertEqual(
+            {"min_x": 12.0, "max_x": 20.0, "min_y": 22.0, "max_y": 30.0},
+            item["bounds_xy"],
+        )
 
     def test_keeps_a_true_segment_count_when_ranges_are_capped(self):
         gcode = """; start printing object, unique label id: 1
