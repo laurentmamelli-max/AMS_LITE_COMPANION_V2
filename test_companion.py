@@ -321,7 +321,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("3.0.7", report["application"]["version"])
+            self.assertEqual("3.0.8", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -1220,11 +1220,12 @@ class CompanionTests(unittest.TestCase):
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("3.0.7", report["application"]["version"])
+                self.assertEqual("3.0.8", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
                 self.assertIn("Poste de supervision", html)
                 self.assertIn("Historique Vision et rapports", html)
-                self.assertIn("shutdownCard.after(reportsCard)", html)
+                self.assertIn("shutdownCard.after(auditCard)", html)
+                self.assertIn("auditCard.after(reportsCard)", html)
                 snapshot_request = urllib.request.Request(
                     base + "/api/reports/snapshot", data=b"{}", method="POST", headers=headers,
                 )
