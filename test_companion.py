@@ -272,6 +272,7 @@ class CompanionTests(unittest.TestCase):
         self.assertIn('Calibrer le plateau sur une capture', page)
         self.assertIn('contour(s) rouges projetés depuis le G-code', page)
         self.assertIn('id="layerCounter"', page)
+        self.assertIn('id="calibrateCaptureButton"', page)
 
     def test_camera_capture_lock_is_cleared_after_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -320,7 +321,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("3.0.5", report["application"]["version"])
+            self.assertEqual("3.0.6", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -1219,7 +1220,7 @@ class CompanionTests(unittest.TestCase):
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("3.0.5", report["application"]["version"])
+                self.assertEqual("3.0.6", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
                 self.assertIn("Poste de supervision", html)
                 self.assertIn("Historique Vision et rapports", html)
