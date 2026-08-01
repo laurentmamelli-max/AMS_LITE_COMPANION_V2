@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -271,8 +272,9 @@ class CompanionTests(unittest.TestCase):
         self.assertIn('function openCapture(index)', page)
         self.assertIn('id="captureModal"', page)
         self.assertIn('ce n’est pas une vidéo en direct', page)
-        self.assertIn('Projection dynamique des objets', page)
-        self.assertIn('Reprendre le suivi sur cette capture', page)
+        self.assertIn('Reconnaissance des formes 3MF', page)
+        self.assertIn('Installer le moteur de formes', page)
+        self.assertIn('Rechercher les formes dans cette capture', page)
         self.assertIn('Légende des objets cartographiés', page)
         self.assertIn('id="layerCounter"', page)
         self.assertIn('id="calibrateCaptureButton"', page)
@@ -282,26 +284,38 @@ class CompanionTests(unittest.TestCase):
         self.assertIn('function lineIntersection(a,b,c,d)', page)
         self.assertIn('deux clics sur les bords', page)
         self.assertIn('function startAutoCalibration()', page)
-        self.assertIn('function trackPerspective()', page)
-        self.assertIn('/api/vision/captures/register', page)
-        self.assertIn('Régler cette capture comme référence', page)
+        self.assertIn('function detectObjectShapes()', page)
+        self.assertIn('/api/vision/shapes/detect', page)
+        self.assertIn('Rechercher les formes 3MF', page)
         self.assertIn('id="objectLegend"', page)
         self.assertIn('function selectMappedObject(index)', page)
         self.assertNotIn('paint-order="stroke">${esc(object.label||object.id)}</text>', page)
 
-    def test_dynamic_vision_registration_accepts_only_finite_matrix(self):
+    def test_shape_detector_accepts_only_canonical_3mf_objects(self):
         with tempfile.TemporaryDirectory() as tmp:
-            app = ac.Companion(Path(tmp) / "state.json")
-            app._vision_capture_path = lambda filename: Path(tmp) / filename  # type: ignore[method-assign]
-            app._vision_calibration_helper = lambda: Path(tmp) / "vision-helper"  # type: ignore[method-assign]
-            response = SimpleNamespace(stdout=json.dumps({
-                "registered": True,
-                "matrix": [[1, 0, 0.02], [0, 1, -0.03], [0, 0, 1]],
-            }))
-            with mock.patch.object(ac.subprocess, "run", return_value=response):
-                result = app.register_vision_capture("reference.jpg", "current.jpg")
-            self.assertTrue(result["registered"])
-            self.assertEqual(0.02, result["matrix"][0][2])
+            root = Path(tmp)
+            source = root / "job.3mf"
+            source.write_bytes(b"3mf")
+            app = ac.Companion(root / "state.json")
+            app._vision_capture_path = lambda filename: root / filename  # type: ignore[method-assign]
+            app.state["active_job"] = {"file": "job.3mf", "plate": "1", "object_map": {
+                "objects": [{"id": "944", "label": "Pièce test", "plate": "1", "bounds_xy": {"min_x": 1}}],
+            }}
+            app.state["bridge"]["recent_import"] = {"source_path": str(source), "filename": "job.3mf"}
+            engine = SimpleNamespace(
+                available=lambda: True,
+                extract_plate_layout=lambda *args: object(),
+                detect_plate_layout=lambda *args: {"detected": True, "similarity": 91.0, "width": 100,
+                                                    "height": 50, "objects": [
+                                                        {"object_id": "944", "points": [[10, 5], [30, 5], [30, 20], [10, 20]]},
+                                                        {"object_id": "wrong", "points": [[1, 1], [2, 1], [2, 2], [1, 2]]},
+                                                    ]},
+            )
+            with mock.patch.dict(sys.modules, {"vision_linemod": engine}):
+                result = app.detect_vision_object_shapes("frame.jpg")
+            self.assertTrue(result["detected"])
+            self.assertEqual("944", result["objects"][0]["object_id"])
+            self.assertEqual([0.1, 0.1], result["objects"][0]["points"][0])
 
     def test_camera_capture_lock_is_cleared_after_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -350,7 +364,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("3.3.0", report["application"]["version"])
+            self.assertEqual("3.4.0", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -1292,11 +1306,11 @@ class CompanionTests(unittest.TestCase):
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("3.3.0", report["application"]["version"])
+                self.assertEqual("3.4.0", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
                 self.assertIn("Poste de supervision", html)
                 self.assertIn("Historique Vision et rapports", html)
-                self.assertIn("Compteur local v3.3.0", html)
+                self.assertIn("Compteur local v3.4.0", html)
                 self.assertIn("shutdownCard.after(auditCard)", html)
                 self.assertIn("auditCard.after(reportsCard)", html)
                 snapshot_request = urllib.request.Request(

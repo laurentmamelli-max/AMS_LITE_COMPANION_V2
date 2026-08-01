@@ -53,8 +53,8 @@ estimations et peuvent être corrigés manuellement après une pesée.
 - conservation du travail actif après redémarrage ;
 - arrêt automatique lorsque Bambu Studio est fermé ;
 - aucun service permanent en arrière-plan ;
-- aucune dépendance Python externe ; le suivi de perspective Vision utilise
-  uniquement un composant macOS inclus dans l’application.
+- reconnaissance des formes 3MF par le moteur libre OpenCV LINEMOD, installé
+  localement et séparément du suivi d’impression.
 
 ## Compatibilité
 
@@ -172,19 +172,20 @@ du tableau de bord : il présente les captures dans une fenêtre séparée, les
 range par impression terminée et permet de supprimer un groupe pour libérer
 l’espace local.
 
-### Projection dynamique des objets
+### Reconnaissance des formes 3MF
 
-La caméra montée sur le bras et le plateau ne conservent pas toujours la même
-perspective. Ouvrez une capture où le plateau est nettement lisible, utilisez
-**Régler cette capture comme référence**, puis cliquez ses quatre coins (un
-coin hors champ peut toujours être reconstruit avec ses deux bords). Le Centre
-Vision recale ensuite cette référence sur chaque capture, localement sur le
-Mac, avant de projeter les objets du G-code.
+Le Centre Vision ne recale plus le fond de l’image. Pour une impression active,
+il lit les silhouettes et les identifiants d’objet inclus dans le `.gcode.3mf`
+par Bambu Studio, génère plusieurs vues de la disposition complète, puis les
+cherche directement dans chaque capture avec OpenCV LINEMOD.
 
-Une capture où la tête masque le plateau, ou pour laquelle le recalage n’est
-pas exploitable, reste sans contour. Ce refus est volontaire : une projection
-incertaine ne doit jamais servir à décider d’une exclusion. Le réglage manuel
-reste disponible à tout moment pour choisir une meilleure référence.
+Installez une seule fois le moteur CPU local depuis le bouton **Installer le
+moteur de formes** du Centre Vision (ou, depuis le dépôt, en double-cliquant
+`Installer_Moteur_Vision.command`). Il télécharge OpenCV dans les données
+locales de Companion, sans envoyer d’image ni de 3MF sur Internet. Ensuite,
+ouvrez une capture et utilisez **Rechercher les formes 3MF**. Une pièce masquée
+ou non reconnue ne reçoit aucun contour. Le réglage manuel reste disponible
+pour cette image précise comme solution de secours.
 
 ## Catalogue de bobines
 

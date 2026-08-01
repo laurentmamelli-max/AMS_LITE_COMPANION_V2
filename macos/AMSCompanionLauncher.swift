@@ -735,6 +735,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         if command == "openCatalog" { showCatalog() }
         if command == "openVision" { showVision() }
         if command == "downloadCalibrationSheet" { downloadCalibrationSheet() }
+        if command == "installVisionEngine" { installVisionEngine() }
+    }
+
+    private func installVisionEngine() {
+        guard let script = Bundle.main.url(forResource: "Installer_Moteur_Vision", withExtension: "command") else {
+            showAlert(title: "Installeur introuvable",
+                      message: "Le composant Vision n’est pas inclus dans cette application. Réinstalle la version complète de Companion.")
+            return
+        }
+        do {
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/bin/bash")
+            task.arguments = [script.path]
+            task.standardOutput = FileHandle.nullDevice
+            task.standardError = FileHandle.nullDevice
+            try task.run()
+            showAlert(title: "Installation lancée",
+                      message: "Le moteur OpenCV s’installe localement. Attends la fin de l’installation, puis ouvre à nouveau la capture et lance la reconnaissance des formes 3MF.")
+        } catch {
+            showAlert(title: "Installation impossible",
+                      message: "Companion n’a pas pu lancer l’installation du moteur Vision : \(error.localizedDescription)")
+        }
     }
 
     private func downloadCalibrationSheet() {

@@ -81,17 +81,19 @@ cp "$ROOT/ams_companion.py" "$RESOURCES/ams_companion.py"
 cp "$ROOT/plate_guardian.py" "$RESOURCES/plate_guardian.py"
 cp "$ROOT/bambu_camera.py" "$RESOURCES/bambu_camera.py"
 cp "$ROOT/gcode_mapper.py" "$RESOURCES/gcode_mapper.py"
+cp "$ROOT/vision_linemod.py" "$RESOURCES/vision_linemod.py"
+cp "$ROOT/Installer_Moteur_Vision.command" "$RESOURCES/Installer_Moteur_Vision.command"
 cp "$ROOT/autopilot.py" "$RESOURCES/autopilot.py"
 cp "$ROOT/macos/Info.plist" "$CONTENTS/Info.plist"
-chmod 755 "$MACOS/AMS-Lite-Companion-V2" "$RESOURCES/ams_vision_calibration"
-chmod 644 "$RESOURCES/ams_companion.py" "$RESOURCES/plate_guardian.py" "$RESOURCES/bambu_camera.py" "$RESOURCES/gcode_mapper.py" "$RESOURCES/autopilot.py" "$CONTENTS/Info.plist"
+chmod 755 "$MACOS/AMS-Lite-Companion-V2" "$RESOURCES/ams_vision_calibration" "$RESOURCES/Installer_Moteur_Vision.command"
+chmod 644 "$RESOURCES/ams_companion.py" "$RESOURCES/plate_guardian.py" "$RESOURCES/bambu_camera.py" "$RESOURCES/gcode_mapper.py" "$RESOURCES/vision_linemod.py" "$RESOURCES/autopilot.py" "$CONTENTS/Info.plist"
 
 # A signed bundle can launch only if each local Python dependency is present
 # beside the engine.  Import from the actual Resources directory before
 # signing so a forgotten module is caught during the release build.
 (
   cd "$RESOURCES"
-  PYTHONDONTWRITEBYTECODE=1 python3 -c 'import ams_companion, autopilot, bambu_camera, gcode_mapper, plate_guardian'
+  PYTHONDONTWRITEBYTECODE=1 python3 -c 'import ams_companion, autopilot, bambu_camera, gcode_mapper, plate_guardian, vision_linemod'
   ./ams_vision_calibration --sheet >/dev/null
 )
 

@@ -1,5 +1,15 @@
 # Changelog
 
+## 3.4.0 — 2026-08-02
+
+- Nouveau moteur de reconnaissance des formes du 3MF, basé sur OpenCV LINEMOD
+  (Apache-2.0) : les silhouettes de chaque objet sont extraites des aperçus
+  Bambu inclus dans le 3MF tranché et recherchées directement dans la capture.
+- L’identifiant Bambu de chaque silhouette est lu dans le masque `pick` du
+  3MF : il est donc recoupé avec la cartographie G-code avant affichage.
+- Les images où aucune forme n’est reconnue restent sans contour. Le réglage
+  manuel demeure disponible, mais ne s’applique plus aux autres perspectives.
+
 ## 3.3.0 — 2026-08-02
 
 - La projection Vision suit maintenant une capture de référence réglée
