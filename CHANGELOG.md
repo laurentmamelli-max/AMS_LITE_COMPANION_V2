@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.2.1 — 2026-08-01
+
+- Dans la fenêtre macOS intégrée, la planche de calibration est désormais
+  enregistrée directement dans le dossier Téléchargements au lieu de dépendre
+  du téléchargement WebKit.
+
 ## 3.2.0 — 2026-08-01
 
 - Calibration Vision automatique et locale par planche QR 180 mm : la
