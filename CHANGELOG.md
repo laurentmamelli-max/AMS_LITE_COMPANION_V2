@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.1.2 — 2026-08-01
+
+- La reconstruction d’un coin hors champ utilise maintenant l’intersection de
+  deux bords réels du plateau, au lieu d’une approximation affine inadaptée à
+  une caméra inclinée. Les calibrations à trois coins de la version 3.1.1 sont
+  explicitement refusées afin d’éviter toute projection trompeuse.
+
 ## 3.1.1 — 2026-08-01
 
 - La calibration Vision affiche désormais les repères jaunes de chaque coin
