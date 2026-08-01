@@ -3454,6 +3454,52 @@ class Companion:
                 camera["capture_in_progress"] = False
                 self.save()
 
+    def capture_calibration_frame(self) -> dict[str, Any]:
+        """Read one idle-camera frame for calibration; never sends printer control."""
+        with self.lock:
+            camera = self.state.setdefault("camera", {})
+            if str((self.state.get("printer") or {}).get("state") or "").upper() in RUNNING:
+                raise ValueError("La capture de calibration est réservée au plateau au repos")
+            if camera.get("capture_in_progress"):
+                raise RuntimeError("Une capture caméra est déjà en cours")
+            host = str(self.state["config"].get("ip") or "")
+            code = str(self.state["config"].get("access_code") or "")
+            fingerprint = str(camera.get("certificate_sha256") or "")
+            if not host or not code or not fingerprint:
+                raise ValueError("Configure d’abord la caméra et son empreinte TLS approuvée")
+            camera["capture_in_progress"] = True
+            camera["status"] = "Capture de calibration en cours…"
+            self.save()
+        try:
+            frame = capture_jpeg(host, code, fingerprint)
+            root = self.state_path.parent / "captures"
+            secure_directory(root)
+            filename = f"layer-00000-{time.strftime('%Y%m%d-%H%M%S')}.jpg"
+            path = root / filename
+            path.write_bytes(frame.jpeg)
+            os.chmod(path, 0o600)
+            result = {
+                "layer": 0, "captured_at": now_iso(), "file": filename,
+                "sha256": frame.sha256, "size_bytes": len(frame.jpeg),
+                "print_name": "Calibration Vision", "calibration": True,
+            }
+            with self.lock:
+                camera = self.state["camera"]
+                camera.setdefault("captures", []).insert(0, result)
+                camera["captures"] = camera["captures"][:200]
+                camera["status"] = "Capture de calibration enregistrée"
+                self.save()
+            return result
+        except CameraError as exc:
+            with self.lock:
+                self.state["camera"]["status"] = f"Capture de calibration impossible : {exc}"
+                self.save()
+            raise RuntimeError(str(exc)) from exc
+        finally:
+            with self.lock:
+                self.state["camera"]["capture_in_progress"] = False
+                self.save()
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version = f"AMSLiteCompanion/{__version__}"
@@ -3640,6 +3686,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/vision/calibration/detect":
                 body = self.json_body()
                 self.send_json(self.app.detect_vision_calibration_markers(str(body.get("file") or "")))
+            elif path == "/api/vision/calibration/capture":
+                self.json_body()
+                self.send_json(self.app.capture_calibration_frame())
             elif match := re.fullmatch(r"/api/captures/(print-[a-zA-Z0-9._-]+)/delete", path):
                 self.json_body()
                 self.send_json(self.app.delete_capture_print(match.group(1)))
@@ -3834,7 +3883,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 <p class="notice">Captures automatiques périodiques : <strong>ce n’est pas une vidéo en direct</strong>. Une image est prise à la couche 5, puis toutes les 5 couches.</p>
 <section><h2>Impression en cours</h2><p id="layerCounter" style="font-size:42px;font-weight:800;margin:4px 0;color:#087535">Couche —</p><p class="muted">Compteur reçu directement de l’imprimante.</p></section>
 <section><h2>Caméra</h2><p id="status">Chargement…</p><label><input id="enabled" type="checkbox"> Activer les captures automatiques (pas de flux vidéo)</label><p class="muted">Le Centre Vision se met à jour toutes les trois secondes après chaque nouvelle capture.</p><label>Empreinte TLS</label><input id="fingerprint" placeholder="Détecte-la automatiquement"><button class="secondary" onclick="discover()">Détecter la caméra</button><button onclick="saveCamera()">Enregistrer</button><p id="meta" class="muted"></p></section>
-<section><h2>Projection des objets cartographiés</h2><p>Les contours rouges utilisent les positions vérifiées dans le G-code. La calibration automatique reconnaît les quatre QR de la planche Companion, sans aucun clic sur la photo.</p><div class="fields"><label>Largeur G-code du plateau (mm)<input id="bedX" type="number" min="1" max="500" step="1" value="180"></label><label>Profondeur G-code du plateau (mm)<input id="bedY" type="number" min="1" max="500" step="1" value="180"></label></div><button class="secondary" onclick="downloadCalibrationSheet()">1. Télécharger la planche 180 mm</button><button class="secondary" onclick="startAutoCalibration()">2. Détecter la planche sur cette capture</button><button class="secondary" onclick="startCalibration()">Réglage manuel…</button><button class="danger" onclick="clearCalibration()">Effacer la calibration</button><p id="calibrationStatus" class="muted">Imprime la planche à 100 %, pose-la à plat sur le plateau vide, ouvre sa capture puis lance la détection automatique.</p></section>
+<section><h2>Projection des objets cartographiés</h2><p>Les contours rouges utilisent les positions vérifiées dans le G-code. La calibration automatique reconnaît les quatre QR de la planche Companion, sans aucun clic sur la photo.</p><div class="fields"><label>Largeur G-code du plateau (mm)<input id="bedX" type="number" min="1" max="500" step="1" value="180"></label><label>Profondeur G-code du plateau (mm)<input id="bedY" type="number" min="1" max="500" step="1" value="180"></label></div><button class="secondary" onclick="downloadCalibrationSheet()">1. Télécharger la planche 180 mm</button><button class="secondary" onclick="takeCalibrationCapture()">2. Prendre la capture de calibration</button><button class="secondary" onclick="startAutoCalibration()">3. Détecter la planche sur cette capture</button><button class="secondary" onclick="startCalibration()">Réglage manuel…</button><button class="danger" onclick="clearCalibration()">Effacer la calibration</button><p id="calibrationStatus" class="muted">Imprime la planche à 100 %, pose-la à plat sur le plateau vide, puis utilise la capture locale de calibration.</p></section>
 <section><h2>Captures par impression</h2><div id="gallery"></div></section></main>
 <div id="captureModal" class="capture-modal" hidden onclick="if(event.target===this)closeCapture()"><section class="capture-dialog"><button class="secondary capture-close" onclick="closeCapture()">Fermer</button><h2 id="captureTitle">Capture</h2><button id="autoCalibrateCaptureButton" onclick="startAutoCalibration()">Détecter la planche automatiquement</button><button id="calibrateCaptureButton" onclick="startCalibration()">Réglage manuel</button><div id="calibrationActions" class="calibration-actions" hidden><button class="secondary" onclick="undoCalibrationPoint()">Annuler le dernier coin</button><button class="secondary" onclick="skipCalibrationCorner()">Ce coin est hors champ</button><button class="danger" onclick="startCalibration()">Recommencer</button></div><p id="overlayNotice" class="muted"></p><div id="captureStage" class="capture-stage"><img id="captureLarge" alt="Capture agrandie"><svg id="captureOverlay" viewBox="0 0 1 1" preserveAspectRatio="none"></svg></div><div id="objectLegend" class="object-legend" aria-label="Légende des objets cartographiés"></div><p id="calibrationPoints" class="calibration-points"></p><div id="captureInfo" class="capture-info"></div></section></div>
 <script>
@@ -3860,6 +3909,7 @@ function startCalibration(){if(!currentCapture||modalEl.hidden){setCalibrationSt
 function lineIntersection(a,b,c,d){const [x1,y1]=a,[x2,y2]=b,[x3,y3]=c,[x4,y4]=d,den=(x1-x2)*(y3-y4)-(y1-y2)*(x3-x4);if(Math.abs(den)<1e-8)return null;const first=x1*y2-y1*x2,second=x3*y4-y3*x4;return [(first*(x3-x4)-(x1-x2)*second)/den,(first*(y3-y4)-(y1-y2)*second)/den]}
 function saveCalibration(points,extendedCorner=null,method='manual'){const width=Math.max(1,Number(bedXEl.value)||180),height=Math.max(1,Number(bedYEl.value)||180);localStorage.setItem(calibrationKey,JSON.stringify({points,width,height,extended_corner:extendedCorner,method}));calibrationMode=false;const message=method==='qr_sheet'?'Calibration automatique enregistrée à partir des quatre QR de la planche. Les contours rouges apparaissent maintenant sur les captures cartographiées.':extendedCorner===null?'Calibration enregistrée localement. Les contours rouges apparaissent maintenant sur les captures cartographiées.':`Calibration enregistrée : le coin ${calibrationLabels[extendedCorner]} a été reconstruit par l’intersection des deux bords. Vérifie que les contours suivent les pièces.`;setCalibrationStatus(message);renderCalibrationProgress();drawOverlay()}
 function downloadCalibrationSheet(){const link=document.createElement('a');link.href=`/api/vision/calibration-sheet.pdf?token=${encodeURIComponent(token)}`;link.download='ams-companion-calibration-180mm.pdf';document.body.append(link);link.click();link.remove();setCalibrationStatus('Planche téléchargée. Imprime-la à 100 % sans ajustement, puis pose-la à plat sur le plateau vide.')}
+async function takeCalibrationCapture(){try{setCalibrationStatus('Capture locale de calibration en cours…');const capture=await api('/api/vision/calibration/capture',{method:'POST',body:'{}'});await load();const index=(window.visionCaptures||[]).findIndex(item=>item.file===capture.file);if(index>=0)openCapture(index);setCalibrationStatus('Capture de calibration prête. Lance maintenant la détection automatique.')}catch(error){setCalibrationStatus(error.message||'Capture de calibration impossible.',true)}}
 async function startAutoCalibration(){if(!currentCapture||modalEl.hidden){setCalibrationStatus('Ouvre une capture de la planche posée sur le plateau, puis lance la détection automatique.',true);return}try{setCalibrationStatus('Recherche des quatre QR de calibration dans cette capture…');const result=await api('/api/vision/calibration/detect',{method:'POST',body:JSON.stringify({file:currentCapture.file})}),order=['TL','TR','BR','BL'],markers=new Map((result.markers||[]).map(item=>[item.id,item]));if(order.some(id=>!markers.has(id)))throw Error(`${Number(result.detected)||0}/4 QR détecté(s). Vérifie que la planche entière est visible, nette et imprimée à 100 %.`);const source=[[20,20],[160,20],[160,160],[20,160]],detected=order.map(id=>{const item=markers.get(id);return [Number(item.x),Number(item.y)]}),h=homographyPairs(source,detected),width=Math.max(1,Number(bedXEl.value)||180),height=Math.max(1,Number(bedYEl.value)||180),corners=[[0,0],[width,0],[width,height],[0,height]].map(point=>project(h,point[0],point[1]));if(!h||corners.some(point=>!point||!Number.isFinite(point[0])||!Number.isFinite(point[1])||point[0]<-0.75||point[0]>1.75||point[1]<-0.75||point[1]>1.75))throw Error('Perspective incohérente : refais une capture nette de la planche entière.');saveCalibration(corners,null,'qr_sheet')}catch(error){setCalibrationStatus(error.message||'Détection automatique impossible.',true)}}
 function finishCalibration(){if(calibrationPoints.length!==4)return;if(hiddenCornerIndex>=0)return saveHiddenCorner();if(calibrationPoints.some(point=>!point)){setCalibrationStatus('Marque le coin hors champ puis fournis les deux bords visibles.',true);return}saveCalibration(calibrationPoints)}
 function saveHiddenCorner(){if(hiddenCornerIndex<0||calibrationPoints.length!==4||calibrationEdgePoints.length!==2)return;const edges=hiddenCornerEdges(),first=calibrationPoints[edges[0].corner],second=calibrationPoints[edges[1].corner],corner=lineIntersection(first,calibrationEdgePoints[0],second,calibrationEdgePoints[1]);if(!corner||!Number.isFinite(corner[0])||!Number.isFinite(corner[1])){setCalibrationStatus('Les deux bords semblent parallèles ou imprécis. Recommence et clique plus loin sur chacun des bords.',true);return}const completed=calibrationPoints.slice();completed[hiddenCornerIndex]=corner;saveCalibration(completed,hiddenCornerIndex)}

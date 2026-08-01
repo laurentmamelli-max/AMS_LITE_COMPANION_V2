@@ -180,7 +180,8 @@ sélectionner les coins du plateau. Dans **Projection des objets cartographiés*
 1. téléchargez la planche Companion de 180 mm et imprimez-la à **100 %**, sans
    adaptation à la page ;
 2. posez-la à plat sur le plateau vide, sans lancer d’impression ;
-3. prenez ou ouvrez une capture où les quatre QR sont nets ;
+3. utilisez **Prendre la capture de calibration** : elle lit une image locale
+   de la caméra, uniquement lorsque l’imprimante est au repos ;
 4. cliquez **Détecter la planche automatiquement**.
 
 La détection et le calcul de perspective restent sur le Mac. La planche ne

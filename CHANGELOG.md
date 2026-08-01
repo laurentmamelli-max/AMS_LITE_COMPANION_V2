@@ -7,6 +7,8 @@
 - La planche est générée par l’application, détectée par le composant macOS
   inclus et ne requiert aucune dépendance Python, aucun réseau ni accès à
   l’imprimante.
+- Une capture de calibration peut être demandée lorsque l’imprimante est au
+  repos : elle lit uniquement la caméra TLS déjà approuvée.
 
 ## 3.1.2 — 2026-08-01
 

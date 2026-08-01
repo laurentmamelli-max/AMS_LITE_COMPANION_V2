@@ -279,6 +279,8 @@ class CompanionTests(unittest.TestCase):
         self.assertIn('function lineIntersection(a,b,c,d)', page)
         self.assertIn('deux clics sur les bords', page)
         self.assertIn('function downloadCalibrationSheet()', page)
+        self.assertIn('function takeCalibrationCapture()', page)
+        self.assertIn('/api/vision/calibration/capture', page)
         self.assertIn('function startAutoCalibration()', page)
         self.assertIn('/api/vision/calibration/detect', page)
         self.assertIn('Détecter la planche automatiquement', page)
