@@ -317,6 +317,34 @@ class CompanionTests(unittest.TestCase):
             self.assertEqual("944", result["objects"][0]["object_id"])
             self.assertEqual([0.1, 0.1], result["objects"][0]["points"][0])
 
+    def test_shape_detector_uses_the_3mf_archived_with_a_completed_capture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = "print-20260802-wheel"
+            capture_root = root / "captures" / folder
+            capture_root.mkdir(parents=True)
+            (capture_root / "source.gcode.3mf").write_bytes(b"3mf")
+            frame = capture_root / "layer-00005-20260802-010101.jpg"
+            frame.write_bytes(b"frame")
+            app = ac.Companion(root / "state.json")
+            app.state["camera"]["captures"] = [{
+                "file": frame.name, "folder": folder, "object_map": {"objects": [
+                    {"id": "495", "label": "Roue", "plate": "1", "bounds_xy": {"min_x": 1}},
+                ]},
+            }]
+            engine = SimpleNamespace(
+                available=lambda: True,
+                extract_plate_layout=lambda archive, plate, object_map: (archive, plate, object_map),
+                detect_plate_layout=lambda *args: {"detected": True, "similarity": 88.0, "width": 100,
+                                                    "height": 50, "objects": [
+                                                        {"object_id": "495", "points": [[0, 0], [50, 0], [50, 25], [0, 25]]},
+                                                    ]},
+            )
+            with mock.patch.dict(sys.modules, {"vision_linemod": engine}):
+                result = app.detect_vision_object_shapes(frame.name)
+            self.assertTrue(result["detected"])
+            self.assertEqual("495", result["objects"][0]["object_id"])
+
     def test_camera_capture_lock_is_cleared_after_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.json"
@@ -364,7 +392,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("3.4.3", report["application"]["version"])
+            self.assertEqual("3.4.4", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -1306,11 +1334,11 @@ class CompanionTests(unittest.TestCase):
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("3.4.3", report["application"]["version"])
+                self.assertEqual("3.4.4", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
                 self.assertIn("Poste de supervision", html)
                 self.assertIn("Historique Vision et rapports", html)
-                self.assertIn("Compteur local v3.4.3", html)
+                self.assertIn("Compteur local v3.4.4", html)
                 self.assertIn("shutdownCard.after(auditCard)", html)
                 self.assertIn("auditCard.after(reportsCard)", html)
                 snapshot_request = urllib.request.Request(

@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.4.4 — 2026-08-02
+
+- Chaque impression suivie archive désormais son 3MF tranché dans son dossier
+  Vision. La reconnaissance des formes reste donc disponible après la fin de
+  l’impression, sans dépendre du fichier temporaire de Bambu Studio.
+
 ## 3.4.3 — 2026-08-02
 
 - Les modules Python distribués déclarent explicitement UTF-8, exigé par le

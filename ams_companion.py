@@ -61,7 +61,7 @@ EVENTS_FILE = APP_DIR / "events.sqlite3"
 AUTOPILOT_FILE = APP_DIR / "autopilot.sqlite3"
 REPORTS_FILE = APP_DIR / "reports.sqlite3"
 HOST, PORT = "127.0.0.1", 8766
-__version__ = "3.4.3"
+__version__ = "3.4.4"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -2401,13 +2401,38 @@ class Companion:
         with self.lock:
             active = self.state.get("active_job")
             recent = self.state.get("bridge", {}).get("recent_import")
-            if not isinstance(active, dict) or not isinstance(recent, dict):
-                raise RuntimeError("Aucun 3MF actif pour reconstruire les formes")
-            source_path = Path(str(recent.get("source_path") or ""))
-            if not source_path.is_file() or str(recent.get("filename") or "") != str(active.get("file") or ""):
-                raise RuntimeError("Le 3MF source de cette impression n’est plus disponible")
-            plate_id = str(active.get("plate") or "")
-            object_map = active.get("object_map") if isinstance(active.get("object_map"), dict) else {}
+            capture = next(
+                (item for item in self.state.get("camera", {}).get("captures", [])
+                 if isinstance(item, dict) and item.get("file") == filename),
+                None,
+            )
+            source_path: Path | None = None
+            object_map: dict[str, Any] = {}
+            plate_id = ""
+            if isinstance(active, dict) and isinstance(recent, dict):
+                candidate = Path(str(recent.get("source_path") or ""))
+                if candidate.is_file() and str(recent.get("filename") or "") == str(active.get("file") or ""):
+                    source_path = candidate
+                    plate_id = str(active.get("plate") or "")
+                    object_map = active.get("object_map") if isinstance(active.get("object_map"), dict) else {}
+            if source_path is None and isinstance(capture, dict):
+                folder = str(capture.get("folder") or "")
+                archived = self.state_path.parent / "captures" / folder / "source.gcode.3mf"
+                embedded = capture.get("object_map")
+                if folder and re.fullmatch(r"print-[a-zA-Z0-9._-]+", folder) and archived.is_file() and isinstance(embedded, dict):
+                    source_path = archived
+                    object_map = embedded
+                    plates = {str(item.get("plate") or "") for item in embedded.get("objects", [])
+                              if isinstance(item, dict) and item.get("plate")}
+                    if len(plates) == 1:
+                        plate_id = plates.pop()
+            if source_path is None:
+                raise RuntimeError(
+                    "Le 3MF de cette impression n’a pas été archivé. Cette ancienne capture ne peut pas être recherchée ; "
+                    "les nouvelles impressions conservent automatiquement leur 3MF."
+                )
+            if not plate_id or not object_map:
+                raise RuntimeError("La cartographie 3MF de cette capture est indisponible")
             labels = {str(item.get("id") or ""): str(item.get("label") or "Objet")
                       for item in object_map.get("objects", []) if isinstance(item, dict)}
         try:
@@ -3277,6 +3302,7 @@ class Companion:
                     current["task_id"] = task_id
                 if name:
                     current["name"] = name
+                self._archive_vision_source_locked(current)
                 return current
             # A new task arrived without the terminal MQTT frame of the old
             # one.  Preserve the first session before creating the next.
@@ -3292,6 +3318,7 @@ class Companion:
             "folder": capture_print_folder(name, task_id, started_at),
         }
         camera["active_print"] = session
+        self._archive_vision_source_locked(session)
         # Layer numbers restart at the beginning of every print.  Keeping the
         # previous session's cursor would suppress all captures until the new
         # print exceeded that old layer number (for example 195 → 200).
@@ -3305,6 +3332,29 @@ class Companion:
                     image["print_id"] = session_id
         log(f"Vision: session de captures ouverte pour {name}")
         return session
+
+    def _archive_vision_source_locked(self, session: dict[str, Any]) -> None:
+        """Keep the sliced 3MF beside a print's captures for later Vision review."""
+        folder = str(session.get("folder") or "")
+        active = self.state.get("active_job")
+        recent = self.state.get("bridge", {}).get("recent_import")
+        if not re.fullmatch(r"print-[a-zA-Z0-9._-]+", folder) or not isinstance(active, dict) or not isinstance(recent, dict):
+            return
+        source = Path(str(recent.get("source_path") or ""))
+        if not source.is_file() or str(recent.get("filename") or "") != str(active.get("file") or ""):
+            return
+        destination = self.state_path.parent / "captures" / folder
+        archive = destination / "source.gcode.3mf"
+        try:
+            secure_directory(destination)
+            if not archive.is_file():
+                shutil.copy2(source, archive)
+                os.chmod(archive, 0o600)
+                log(f"Vision: 3MF source archivé pour la recherche d’objets ({folder})")
+            session["source_archive"] = archive.name
+            session["source_plate"] = str(active.get("plate") or "")
+        except OSError as exc:
+            log(f"Vision: archivage du 3MF impossible: {exc}")
 
     def _finalize_camera_print_session_locked(self, result: str, task_id: str, fallback_name: str) -> None:
         """Move the session's images into its own print directory exactly once."""

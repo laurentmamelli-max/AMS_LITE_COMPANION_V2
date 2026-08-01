@@ -184,8 +184,10 @@ moteur de formes** du Centre Vision (ou, depuis le dépôt, en double-cliquant
 `Installer_Moteur_Vision.command`). Il télécharge OpenCV dans les données
 locales de Companion, sans envoyer d’image ni de 3MF sur Internet. Ensuite,
 ouvrez une capture et utilisez **Rechercher les formes 3MF**. Une pièce masquée
-ou non reconnue ne reçoit aucun contour. Le réglage manuel reste disponible
-pour cette image précise comme solution de secours.
+ou non reconnue ne reçoit aucun contour. Le 3MF est archivé avec les captures
+de chaque nouvelle impression, afin de pouvoir relancer la recherche plus tard.
+Le réglage manuel reste disponible pour cette image précise comme solution de
+secours.
 
 ## Catalogue de bobines
 
