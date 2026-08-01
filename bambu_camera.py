@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Read-only local camera client for Bambu A1/P1 MJPEG streams.
 
 The protocol is community-documented rather than an official public API.  This

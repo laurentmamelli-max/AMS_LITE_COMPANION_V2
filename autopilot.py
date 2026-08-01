@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """V3 safety policy: alerts first, manual exclusion only on explicit request.
 
 This module never owns a network connection.  It produces the one canonical

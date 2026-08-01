@@ -1,5 +1,22 @@
 # Changelog
 
+## 3.4.3 — 2026-08-02
+
+- Les modules Python distribués déclarent explicitement UTF-8, exigé par le
+  Python système présent sur ce Mac au lancement d’une application graphique.
+
+## 3.4.2 — 2026-08-02
+
+- Le lancement avec le Python système force désormais UTF-8, évitant l’arrêt
+  immédiat de l’application sur les installations macOS dont la locale est
+  ASCII.
+
+## 3.4.1 — 2026-08-02
+
+- Correctif de livraison : le lanceur et l’installeur du moteur OpenCV utilisent
+  désormais le même Python système afin d’éviter une incompatibilité NumPy
+  lorsqu’un Python Homebrew est également installé.
+
 ## 3.4.0 — 2026-08-02
 
 - Nouveau moteur de reconnaissance des formes du 3MF, basé sur OpenCV LINEMOD

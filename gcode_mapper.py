@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Safe object cartography for sliced G-code.
 
 The mapper supports both generic slicer markers and the repeated Bambu Studio

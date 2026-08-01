@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Safety-first plate monitoring primitives for AMS Lite Companion V2.
 
 This module deliberately does not contain any printer command.  Bambu Studio

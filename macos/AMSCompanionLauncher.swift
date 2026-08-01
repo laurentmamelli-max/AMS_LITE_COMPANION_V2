@@ -233,10 +233,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
     private func pythonExecutable() -> String? {
         let candidates = [
+            // Vision's optional OpenCV runtime is installed for this stable
+            // Apple/Xcode interpreter. Prefer it over a Homebrew Python whose
+            // ABI can differ from the locally installed NumPy wheel.
+            "/usr/bin/python3",
             "/opt/homebrew/bin/python3",
             "/usr/local/bin/python3",
             "/Library/Frameworks/Python.framework/Versions/Current/bin/python3",
-            "/usr/bin/python3"
         ]
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
@@ -308,6 +311,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             // bundle. Avoid bytecode caches in Resources, which would alter
             // the sealed bundle after a normal launch.
             environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            // /usr/bin/python3 can inherit the ASCII locale of a launched
+            // macOS application. The Companion sources and UI are UTF-8.
+            environment["PYTHONUTF8"] = "1"
             process.environment = environment
             self.engineLog = self.openEngineLog()
             process.standardOutput = self.engineLog
@@ -747,7 +753,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         do {
             let task = Process()
             task.executableURL = URL(fileURLWithPath: "/bin/bash")
-            task.arguments = [script.path]
+            task.arguments = [script.path, pythonExecutable() ?? "/usr/bin/python3"]
             task.standardOutput = FileHandle.nullDevice
             task.standardError = FileHandle.nullDevice
             try task.run()
