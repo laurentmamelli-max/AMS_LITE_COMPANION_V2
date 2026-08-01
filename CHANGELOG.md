@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.1.1 — 2026-08-01
+
+- La calibration Vision affiche désormais les repères jaunes de chaque coin
+  sélectionné, avec annulation et redémarrage immédiats.
+- Lorsqu’un coin du plateau est réellement hors champ de la caméra, il peut
+  être signalé : les trois coins visibles permettent une estimation locale du
+  quatrième. La projection est alors explicitement indiquée comme indicative.
+
 ## 3.0.2 — 2026-07-28
 
 - Chaque nouvelle impression remet à zéro le curseur de couches Vision. Une

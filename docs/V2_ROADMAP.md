@@ -4,7 +4,7 @@ Branche de développement : `companion-v2`.
 
 V2 démarre sur la V1.5 stable, mais ses évolutions restent isolées de la
 branche `main` jusqu'à leur validation. La première livraison stable est
-`2.0.1`. La livraison locale a atteint `3.0.2` ; l’architecture V3 est
+`2.0.1`. La livraison locale a atteint `3.1.1` ; l’architecture V3 est
 documentée dans `V3_ARCHITECTURE.md`.
 
 ## Isolation avec V1
