@@ -53,7 +53,7 @@ estimations et peuvent être corrigés manuellement après une pesée.
 - conservation du travail actif après redémarrage ;
 - arrêt automatique lorsque Bambu Studio est fermé ;
 - aucun service permanent en arrière-plan ;
-- aucune dépendance Python externe ; la calibration Vision automatique utilise
+- aucune dépendance Python externe ; le suivi de perspective Vision utilise
   uniquement un composant macOS inclus dans l’application.
 
 ## Compatibilité
@@ -172,22 +172,19 @@ du tableau de bord : il présente les captures dans une fenêtre séparée, les
 range par impression terminée et permet de supprimer un groupe pour libérer
 l’espace local.
 
-### Calibration automatique de la projection
+### Projection dynamique des objets
 
-Le Centre Vision peut superposer les objets du G-code sur une capture sans
-sélectionner les coins du plateau. Dans **Projection des objets cartographiés** :
+La caméra montée sur le bras et le plateau ne conservent pas toujours la même
+perspective. Ouvrez une capture où le plateau est nettement lisible, utilisez
+**Régler cette capture comme référence**, puis cliquez ses quatre coins (un
+coin hors champ peut toujours être reconstruit avec ses deux bords). Le Centre
+Vision recale ensuite cette référence sur chaque capture, localement sur le
+Mac, avant de projeter les objets du G-code.
 
-1. téléchargez la planche Companion de 180 mm et imprimez-la à **100 %**, sans
-   adaptation à la page ;
-2. posez-la à plat sur le plateau vide, sans lancer d’impression ;
-3. utilisez **Prendre la capture de calibration** : elle lit une image locale
-   de la caméra, uniquement lorsque l’imprimante est au repos ;
-4. cliquez **Détecter la planche automatiquement**.
-
-La détection et le calcul de perspective restent sur le Mac. La planche ne
-commande pas l’imprimante et peut être retirée après l’enregistrement de la
-calibration. Le réglage manuel reste disponible si une capture ne permet pas
-de lire les quatre QR.
+Une capture où la tête masque le plateau, ou pour laquelle le recalage n’est
+pas exploitable, reste sans contour. Ce refus est volontaire : une projection
+incertaine ne doit jamais servir à décider d’une exclusion. Le réglage manuel
+reste disponible à tout moment pour choisir une meilleure référence.
 
 ## Catalogue de bobines
 

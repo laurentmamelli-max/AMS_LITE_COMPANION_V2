@@ -1,5 +1,15 @@
 # Changelog
 
+## 3.3.0 — 2026-08-02
+
+- La projection Vision suit maintenant une capture de référence réglée
+  manuellement, puis recale la perspective sur chaque image avec la
+  registration homographique native de macOS.
+- Une image trop occultée, une transformation invalide ou une ancienne
+  calibration sans capture source reste sans contour : Companion préfère
+  signaler l’absence de projection à une superposition trompeuse.
+- Le réglage manuel et la reconstruction d’un coin hors champ sont conservés.
+
 ## 3.2.1 — 2026-08-01
 
 - Dans la fenêtre macOS intégrée, la planche de calibration est désormais

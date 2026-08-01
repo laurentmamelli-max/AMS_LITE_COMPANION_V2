@@ -9,6 +9,8 @@ import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 # Keep test fixtures and their expected failures out of the user's persistent
 # Companion journal.  ``ams_companion`` reads this before it is imported.
@@ -269,8 +271,9 @@ class CompanionTests(unittest.TestCase):
         self.assertIn('function openCapture(index)', page)
         self.assertIn('id="captureModal"', page)
         self.assertIn('ce n’est pas une vidéo en direct', page)
-        self.assertIn('Télécharger la planche 180 mm', page)
-        self.assertIn('Les noms sont dans la légende sous l’image', page)
+        self.assertIn('Projection dynamique des objets', page)
+        self.assertIn('Reprendre le suivi sur cette capture', page)
+        self.assertIn('Légende des objets cartographiés', page)
         self.assertIn('id="layerCounter"', page)
         self.assertIn('id="calibrateCaptureButton"', page)
         self.assertIn('Ce coin est hors champ', page)
@@ -278,15 +281,27 @@ class CompanionTests(unittest.TestCase):
         self.assertIn('function undoCalibrationPoint()', page)
         self.assertIn('function lineIntersection(a,b,c,d)', page)
         self.assertIn('deux clics sur les bords', page)
-        self.assertIn('function downloadCalibrationSheet()', page)
-        self.assertIn('function takeCalibrationCapture()', page)
-        self.assertIn('/api/vision/calibration/capture', page)
         self.assertIn('function startAutoCalibration()', page)
-        self.assertIn('/api/vision/calibration/detect', page)
-        self.assertIn('Détecter la planche automatiquement', page)
+        self.assertIn('function trackPerspective()', page)
+        self.assertIn('/api/vision/captures/register', page)
+        self.assertIn('Régler cette capture comme référence', page)
         self.assertIn('id="objectLegend"', page)
         self.assertIn('function selectMappedObject(index)', page)
         self.assertNotIn('paint-order="stroke">${esc(object.label||object.id)}</text>', page)
+
+    def test_dynamic_vision_registration_accepts_only_finite_matrix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app._vision_capture_path = lambda filename: Path(tmp) / filename  # type: ignore[method-assign]
+            app._vision_calibration_helper = lambda: Path(tmp) / "vision-helper"  # type: ignore[method-assign]
+            response = SimpleNamespace(stdout=json.dumps({
+                "registered": True,
+                "matrix": [[1, 0, 0.02], [0, 1, -0.03], [0, 0, 1]],
+            }))
+            with mock.patch.object(ac.subprocess, "run", return_value=response):
+                result = app.register_vision_capture("reference.jpg", "current.jpg")
+            self.assertTrue(result["registered"])
+            self.assertEqual(0.02, result["matrix"][0][2])
 
     def test_camera_capture_lock_is_cleared_after_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -335,7 +350,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("3.2.1", report["application"]["version"])
+            self.assertEqual("3.3.0", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -1277,11 +1292,11 @@ class CompanionTests(unittest.TestCase):
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("3.2.1", report["application"]["version"])
+                self.assertEqual("3.3.0", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
                 self.assertIn("Poste de supervision", html)
                 self.assertIn("Historique Vision et rapports", html)
-                self.assertIn("Compteur local v3.2.1", html)
+                self.assertIn("Compteur local v3.3.0", html)
                 self.assertIn("shutdownCard.after(auditCard)", html)
                 self.assertIn("auditCard.after(reportsCard)", html)
                 snapshot_request = urllib.request.Request(
