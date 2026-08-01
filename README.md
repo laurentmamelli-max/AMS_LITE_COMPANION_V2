@@ -53,7 +53,8 @@ estimations et peuvent être corrigés manuellement après une pesée.
 - conservation du travail actif après redémarrage ;
 - arrêt automatique lorsque Bambu Studio est fermé ;
 - aucun service permanent en arrière-plan ;
-- aucune dépendance Python externe.
+- aucune dépendance Python externe ; la calibration Vision automatique utilise
+  uniquement un composant macOS inclus dans l’application.
 
 ## Compatibilité
 
@@ -170,6 +171,22 @@ depuis l’icône de la barre des menus. Le Centre Vision s’ouvre depuis le bo
 du tableau de bord : il présente les captures dans une fenêtre séparée, les
 range par impression terminée et permet de supprimer un groupe pour libérer
 l’espace local.
+
+### Calibration automatique de la projection
+
+Le Centre Vision peut superposer les objets du G-code sur une capture sans
+sélectionner les coins du plateau. Dans **Projection des objets cartographiés** :
+
+1. téléchargez la planche Companion de 180 mm et imprimez-la à **100 %**, sans
+   adaptation à la page ;
+2. posez-la à plat sur le plateau vide, sans lancer d’impression ;
+3. prenez ou ouvrez une capture où les quatre QR sont nets ;
+4. cliquez **Détecter la planche automatiquement**.
+
+La détection et le calcul de perspective restent sur le Mac. La planche ne
+commande pas l’imprimante et peut être retirée après l’enregistrement de la
+calibration. Le réglage manuel reste disponible si une capture ne permet pas
+de lire les quatre QR.
 
 ## Catalogue de bobines
 

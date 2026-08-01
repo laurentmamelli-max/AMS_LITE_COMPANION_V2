@@ -26,6 +26,7 @@ import socket
 import sqlite3
 import ssl
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -59,7 +60,7 @@ EVENTS_FILE = APP_DIR / "events.sqlite3"
 AUTOPILOT_FILE = APP_DIR / "autopilot.sqlite3"
 REPORTS_FILE = APP_DIR / "reports.sqlite3"
 HOST, PORT = "127.0.0.1", 8766
-__version__ = "3.1.2"
+__version__ = "3.2.0"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -2303,6 +2304,83 @@ class Companion:
                 active += 1
         return {"count": count, "bytes": total_bytes, "completed": completed, "active": active}
 
+    def _vision_capture_path(self, filename: str) -> Path:
+        """Resolve only a capture indexed by this local Companion instance."""
+        if not re.fullmatch(r"layer-\d{5}-\d{8}-\d{6}\.jpg", filename):
+            raise ValueError("Nom de capture invalide")
+        with self.lock:
+            listed = next(
+                (item for item in self.state.get("camera", {}).get("captures", [])
+                 if isinstance(item, dict) and item.get("file") == filename),
+                None,
+            )
+        if not listed:
+            raise FileNotFoundError("Capture Vision introuvable")
+        folder = str(listed.get("folder") or "")
+        if folder and not re.fullmatch(r"print-[a-zA-Z0-9._-]+", folder):
+            raise FileNotFoundError("Dossier de capture invalide")
+        path = self.state_path.parent / "captures" / folder / filename if folder else (
+            self.state_path.parent / "captures" / filename
+        )
+        if not path.is_file():
+            raise FileNotFoundError("Fichier de capture introuvable")
+        return path
+
+    @staticmethod
+    def _vision_calibration_helper() -> Path:
+        helper = Path(__file__).resolve().with_name("ams_vision_calibration")
+        if not helper.is_file() or not os.access(helper, os.X_OK):
+            raise RuntimeError("Module de calibration Vision indisponible : réinstalle Companion V3.2 ou utilise le réglage manuel")
+        return helper
+
+    def vision_calibration_sheet(self) -> bytes:
+        """Generate the local 180 mm ArUco-like QR calibration sheet on demand."""
+        try:
+            result = subprocess.run(
+                [str(self._vision_calibration_helper()), "--sheet"],
+                check=True, capture_output=True, timeout=15,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Génération de la planche de calibration expirée") from exc
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError("Impossible de générer la planche de calibration") from exc
+        if not result.stdout.startswith(b"%PDF") or len(result.stdout) < 1024:
+            raise RuntimeError("Planche de calibration invalide")
+        return result.stdout
+
+    def detect_vision_calibration_markers(self, filename: str) -> dict[str, Any]:
+        """Ask the bundled macOS Vision helper for QR marker centres only."""
+        image_path = self._vision_capture_path(filename)
+        try:
+            result = subprocess.run(
+                [str(self._vision_calibration_helper()), "--detect", str(image_path)],
+                check=True, capture_output=True, timeout=15, text=True,
+            )
+            payload = json.loads(result.stdout)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Détection automatique expirée") from exc
+        except (subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Détection automatique impossible sur cette capture") from exc
+        markers = payload.get("markers") if isinstance(payload, dict) else None
+        if not isinstance(markers, list):
+            raise RuntimeError("Réponse de calibration invalide")
+        clean: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for marker in markers:
+            if not isinstance(marker, dict):
+                continue
+            identifier = str(marker.get("id") or "")
+            x, y = marker.get("x"), marker.get("y")
+            if identifier not in {"TL", "TR", "BR", "BL"} or identifier in seen:
+                continue
+            if not isinstance(x, (float, int)) or not isinstance(y, (float, int)):
+                continue
+            if not 0.0 <= float(x) <= 1.0 or not 0.0 <= float(y) <= 1.0:
+                continue
+            seen.add(identifier)
+            clean.append({"id": identifier, "x": float(x), "y": float(y)})
+        return {"markers": clean, "required": 4, "detected": len(clean)}
+
     def observe_plate_guardian(self, data: dict[str, Any]) -> dict[str, Any]:
         """Accept detector evidence; the guardian has no printer-control path."""
         with self.lock:
@@ -3428,6 +3506,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def send_pdf(self, raw: bytes, filename: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "application/pdf")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "private, no-store")
+        self.end_headers()
+        self.wfile.write(raw)
+
     def send_json(self, value: Any, status: int = 200) -> None:
         raw = json.dumps(value, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -3508,6 +3595,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_jpeg(image_path.read_bytes())
             except OSError:
                 self.send_error(404)
+        elif path == "/api/vision/calibration-sheet.pdf":
+            query = urllib.parse.parse_qs(request_url.query)
+            if not self._local_capture_request_is_valid(query):
+                self.send_json({"error": "Accès local non autorisé"}, 403)
+                return
+            try:
+                self.send_pdf(self.app.vision_calibration_sheet(), "ams-companion-calibration-180mm.pdf")
+            except (RuntimeError, OSError) as exc:
+                self.send_json({"error": str(exc)}, 503)
         elif not self._require_api_access():
             return
         elif path == "/api/state":
@@ -3541,6 +3637,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/camera/discover":
                 self.json_body()
                 self.send_json(self.app.discover_camera_certificate())
+            elif path == "/api/vision/calibration/detect":
+                body = self.json_body()
+                self.send_json(self.app.detect_vision_calibration_markers(str(body.get("file") or "")))
             elif match := re.fullmatch(r"/api/captures/(print-[a-zA-Z0-9._-]+)/delete", path):
                 self.json_body()
                 self.send_json(self.app.delete_capture_print(match.group(1)))
@@ -3735,9 +3834,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 <p class="notice">Captures automatiques périodiques : <strong>ce n’est pas une vidéo en direct</strong>. Une image est prise à la couche 5, puis toutes les 5 couches.</p>
 <section><h2>Impression en cours</h2><p id="layerCounter" style="font-size:42px;font-weight:800;margin:4px 0;color:#087535">Couche —</p><p class="muted">Compteur reçu directement de l’imprimante.</p></section>
 <section><h2>Caméra</h2><p id="status">Chargement…</p><label><input id="enabled" type="checkbox"> Activer les captures automatiques (pas de flux vidéo)</label><p class="muted">Le Centre Vision se met à jour toutes les trois secondes après chaque nouvelle capture.</p><label>Empreinte TLS</label><input id="fingerprint" placeholder="Détecte-la automatiquement"><button class="secondary" onclick="discover()">Détecter la caméra</button><button onclick="saveCamera()">Enregistrer</button><p id="meta" class="muted"></p></section>
-<section><h2>Projection des objets cartographiés</h2><p>Les contours rouges utilisent les positions vérifiées dans le G-code. Ce n’est pas une reconnaissance visuelle automatique : la projection devient précise après une calibration unique du plateau.</p><div class="fields"><label>Largeur G-code du plateau (mm)<input id="bedX" type="number" min="1" max="500" step="1" value="180"></label><label>Profondeur G-code du plateau (mm)<input id="bedY" type="number" min="1" max="500" step="1" value="180"></label></div><button class="secondary" onclick="startCalibration()">Calibrer le plateau sur une capture…</button><button class="danger" onclick="clearCalibration()">Effacer la calibration</button><p id="calibrationStatus" class="muted">Ouvre une capture, puis sélectionne les coins visibles. Un coin hors champ peut être estimé.</p></section>
+<section><h2>Projection des objets cartographiés</h2><p>Les contours rouges utilisent les positions vérifiées dans le G-code. La calibration automatique reconnaît les quatre QR de la planche Companion, sans aucun clic sur la photo.</p><div class="fields"><label>Largeur G-code du plateau (mm)<input id="bedX" type="number" min="1" max="500" step="1" value="180"></label><label>Profondeur G-code du plateau (mm)<input id="bedY" type="number" min="1" max="500" step="1" value="180"></label></div><button class="secondary" onclick="downloadCalibrationSheet()">1. Télécharger la planche 180 mm</button><button class="secondary" onclick="startAutoCalibration()">2. Détecter la planche sur cette capture</button><button class="secondary" onclick="startCalibration()">Réglage manuel…</button><button class="danger" onclick="clearCalibration()">Effacer la calibration</button><p id="calibrationStatus" class="muted">Imprime la planche à 100 %, pose-la à plat sur le plateau vide, ouvre sa capture puis lance la détection automatique.</p></section>
 <section><h2>Captures par impression</h2><div id="gallery"></div></section></main>
-<div id="captureModal" class="capture-modal" hidden onclick="if(event.target===this)closeCapture()"><section class="capture-dialog"><button class="secondary capture-close" onclick="closeCapture()">Fermer</button><h2 id="captureTitle">Capture</h2><button id="calibrateCaptureButton" onclick="startCalibration()">Calibrer ce plateau</button><div id="calibrationActions" class="calibration-actions" hidden><button class="secondary" onclick="undoCalibrationPoint()">Annuler le dernier coin</button><button class="secondary" onclick="skipCalibrationCorner()">Ce coin est hors champ</button><button class="danger" onclick="startCalibration()">Recommencer</button></div><p id="overlayNotice" class="muted"></p><div id="captureStage" class="capture-stage"><img id="captureLarge" alt="Capture agrandie"><svg id="captureOverlay" viewBox="0 0 1 1" preserveAspectRatio="none"></svg></div><div id="objectLegend" class="object-legend" aria-label="Légende des objets cartographiés"></div><p id="calibrationPoints" class="calibration-points"></p><div id="captureInfo" class="capture-info"></div></section></div>
+<div id="captureModal" class="capture-modal" hidden onclick="if(event.target===this)closeCapture()"><section class="capture-dialog"><button class="secondary capture-close" onclick="closeCapture()">Fermer</button><h2 id="captureTitle">Capture</h2><button id="autoCalibrateCaptureButton" onclick="startAutoCalibration()">Détecter la planche automatiquement</button><button id="calibrateCaptureButton" onclick="startCalibration()">Réglage manuel</button><div id="calibrationActions" class="calibration-actions" hidden><button class="secondary" onclick="undoCalibrationPoint()">Annuler le dernier coin</button><button class="secondary" onclick="skipCalibrationCorner()">Ce coin est hors champ</button><button class="danger" onclick="startCalibration()">Recommencer</button></div><p id="overlayNotice" class="muted"></p><div id="captureStage" class="capture-stage"><img id="captureLarge" alt="Capture agrandie"><svg id="captureOverlay" viewBox="0 0 1 1" preserveAspectRatio="none"></svg></div><div id="objectLegend" class="object-legend" aria-label="Légende des objets cartographiés"></div><p id="calibrationPoints" class="calibration-points"></p><div id="captureInfo" class="capture-info"></div></section></div>
 <script>
 const token=__API_TOKEN__,statusEl=document.getElementById('status'),enabledEl=document.getElementById('enabled'),fingerprintEl=document.getElementById('fingerprint'),metaEl=document.getElementById('meta'),galleryEl=document.getElementById('gallery'),modalEl=document.getElementById('captureModal'),titleEl=document.getElementById('captureTitle'),largeEl=document.getElementById('captureLarge'),stageEl=document.getElementById('captureStage'),overlayEl=document.getElementById('captureOverlay'),overlayNoticeEl=document.getElementById('overlayNotice'),legendEl=document.getElementById('objectLegend'),infoEl=document.getElementById('captureInfo'),calibrationStatusEl=document.getElementById('calibrationStatus'),calibrationPointsEl=document.getElementById('calibrationPoints'),calibrationActionsEl=document.getElementById('calibrationActions'),bedXEl=document.getElementById('bedX'),bedYEl=document.getElementById('bedY'),layerCounterEl=document.getElementById('layerCounter');
 let visionState=null,currentCapture=null,calibrationMode=false,calibrationPoints=[],calibrationEdgePoints=[],hiddenCornerIndex=-1,selectedObjectIndex=-1;const calibrationKey='ams-lite-vision-plate-calibration-v1';
@@ -3746,7 +3845,7 @@ function esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;'
 function loadCalibration(){try{const value=JSON.parse(localStorage.getItem(calibrationKey)||'null');if(value&&Array.isArray(value.points)&&value.points.length===4)return value}catch(_){ }return null}function calibration(){const value=loadCalibration();if(value){bedXEl.value=value.width||180;bedYEl.value=value.height||180}return value}
 function setCalibrationStatus(message,isWarning=false){calibrationStatusEl.textContent=message;calibrationStatusEl.className=isWarning?'warning':'muted'}
 function solve(matrix,vector){const n=vector.length,a=matrix.map((row,i)=>row.slice().concat(vector[i]));for(let col=0;col<n;col++){let pivot=col;for(let row=col+1;row<n;row++)if(Math.abs(a[row][col])>Math.abs(a[pivot][col]))pivot=row;if(Math.abs(a[pivot][col])<1e-9)return null;[a[col],a[pivot]]=[a[pivot],a[col]];const scale=a[col][col];for(let j=col;j<=n;j++)a[col][j]/=scale;for(let row=0;row<n;row++)if(row!==col){const factor=a[row][col];for(let j=col;j<=n;j++)a[row][j]-=factor*a[col][j]}}return a.map(row=>row[n])}
-function homography(points,width,height){if(!Array.isArray(points)||points.length!==4)return null;const source=[[0,0],[width,0],[width,height],[0,height]],matrix=[],vector=[];for(let i=0;i<4;i++){const [x,y]=source[i],[u,v]=points[i];matrix.push([x,y,1,0,0,0,-u*x,-u*y]);vector.push(u);matrix.push([0,0,0,x,y,1,-v*x,-v*y]);vector.push(v)}return solve(matrix,vector)}function project(h,x,y){if(!h)return null;const d=h[6]*x+h[7]*y+1;if(Math.abs(d)<1e-9)return null;return [(h[0]*x+h[1]*y+h[2])/d,(h[3]*x+h[4]*y+h[5])/d]}
+function homographyPairs(source,points){if(!Array.isArray(source)||!Array.isArray(points)||source.length!==4||points.length!==4)return null;const matrix=[],vector=[];for(let i=0;i<4;i++){const [x,y]=source[i],[u,v]=points[i];matrix.push([x,y,1,0,0,0,-u*x,-u*y]);vector.push(u);matrix.push([0,0,0,x,y,1,-v*x,-v*y]);vector.push(v)}return solve(matrix,vector)}function homography(points,width,height){return homographyPairs([[0,0],[width,0],[width,height],[0,height]],points)}function project(h,x,y){if(!h)return null;const d=h[6]*x+h[7]*y+1;if(Math.abs(d)<1e-9)return null;return [(h[0]*x+h[1]*y+h[2])/d,(h[3]*x+h[4]*y+h[5])/d]}
 function objectsFor(capture){const embedded=capture?.object_map?.objects;if(Array.isArray(embedded)&&embedded.length)return embedded;const current=visionState?.camera?.active_print;if(current&&capture?.print_id===current.id){const mapped=visionState?.active_job?.object_map?.objects;return Array.isArray(mapped)?mapped:[]}return []}
 const outlineColors=['#d92d20','#b42318','#c11574','#7a5af8','#444ce7','#175cd3','#027a48','#039855','#b54708','#93370d','#a15c07','#6941c6'];
 function selectMappedObject(index){selectedObjectIndex=selectedObjectIndex===index?-1:index;drawOverlay()}
@@ -3759,7 +3858,9 @@ function openCapture(index){currentCapture=(window.visionCaptures||[])[index];if
 function closeCapture(){modalEl.hidden=true;calibrationMode=false;calibrationPoints=[];calibrationEdgePoints=[];hiddenCornerIndex=-1;selectedObjectIndex=-1;largeEl.removeAttribute('src');overlayEl.innerHTML='';legendEl.innerHTML='';renderCalibrationProgress()}
 function startCalibration(){if(!currentCapture||modalEl.hidden){setCalibrationStatus('Ouvre une capture dans la galerie, puis lance la calibration.',true);return}calibrationMode=true;calibrationPoints=[];calibrationEdgePoints=[];hiddenCornerIndex=-1;setCalibrationStatus('Clique les coins visibles dans l’ordre indiqué. Si le coin suivant est coupé par l’image, utilise « Ce coin est hors champ » : deux clics sur les bords permettront de le reconstruire avec la bonne perspective.');renderCalibrationProgress()}
 function lineIntersection(a,b,c,d){const [x1,y1]=a,[x2,y2]=b,[x3,y3]=c,[x4,y4]=d,den=(x1-x2)*(y3-y4)-(y1-y2)*(x3-x4);if(Math.abs(den)<1e-8)return null;const first=x1*y2-y1*x2,second=x3*y4-y3*x4;return [(first*(x3-x4)-(x1-x2)*second)/den,(first*(y3-y4)-(y1-y2)*second)/den]}
-function saveCalibration(points,extendedCorner=null){const width=Math.max(1,Number(bedXEl.value)||180),height=Math.max(1,Number(bedYEl.value)||180);localStorage.setItem(calibrationKey,JSON.stringify({points,width,height,extended_corner:extendedCorner}));calibrationMode=false;setCalibrationStatus(extendedCorner===null?'Calibration enregistrée localement. Les contours rouges apparaissent maintenant sur les captures cartographiées.':`Calibration enregistrée : le coin ${calibrationLabels[extendedCorner]} a été reconstruit par l’intersection des deux bords. Vérifie que les contours suivent les pièces.`);renderCalibrationProgress();drawOverlay()}
+function saveCalibration(points,extendedCorner=null,method='manual'){const width=Math.max(1,Number(bedXEl.value)||180),height=Math.max(1,Number(bedYEl.value)||180);localStorage.setItem(calibrationKey,JSON.stringify({points,width,height,extended_corner:extendedCorner,method}));calibrationMode=false;const message=method==='qr_sheet'?'Calibration automatique enregistrée à partir des quatre QR de la planche. Les contours rouges apparaissent maintenant sur les captures cartographiées.':extendedCorner===null?'Calibration enregistrée localement. Les contours rouges apparaissent maintenant sur les captures cartographiées.':`Calibration enregistrée : le coin ${calibrationLabels[extendedCorner]} a été reconstruit par l’intersection des deux bords. Vérifie que les contours suivent les pièces.`;setCalibrationStatus(message);renderCalibrationProgress();drawOverlay()}
+function downloadCalibrationSheet(){const link=document.createElement('a');link.href=`/api/vision/calibration-sheet.pdf?token=${encodeURIComponent(token)}`;link.download='ams-companion-calibration-180mm.pdf';document.body.append(link);link.click();link.remove();setCalibrationStatus('Planche téléchargée. Imprime-la à 100 % sans ajustement, puis pose-la à plat sur le plateau vide.')}
+async function startAutoCalibration(){if(!currentCapture||modalEl.hidden){setCalibrationStatus('Ouvre une capture de la planche posée sur le plateau, puis lance la détection automatique.',true);return}try{setCalibrationStatus('Recherche des quatre QR de calibration dans cette capture…');const result=await api('/api/vision/calibration/detect',{method:'POST',body:JSON.stringify({file:currentCapture.file})}),order=['TL','TR','BR','BL'],markers=new Map((result.markers||[]).map(item=>[item.id,item]));if(order.some(id=>!markers.has(id)))throw Error(`${Number(result.detected)||0}/4 QR détecté(s). Vérifie que la planche entière est visible, nette et imprimée à 100 %.`);const source=[[20,20],[160,20],[160,160],[20,160]],detected=order.map(id=>{const item=markers.get(id);return [Number(item.x),Number(item.y)]}),h=homographyPairs(source,detected),width=Math.max(1,Number(bedXEl.value)||180),height=Math.max(1,Number(bedYEl.value)||180),corners=[[0,0],[width,0],[width,height],[0,height]].map(point=>project(h,point[0],point[1]));if(!h||corners.some(point=>!point||!Number.isFinite(point[0])||!Number.isFinite(point[1])||point[0]<-0.75||point[0]>1.75||point[1]<-0.75||point[1]>1.75))throw Error('Perspective incohérente : refais une capture nette de la planche entière.');saveCalibration(corners,null,'qr_sheet')}catch(error){setCalibrationStatus(error.message||'Détection automatique impossible.',true)}}
 function finishCalibration(){if(calibrationPoints.length!==4)return;if(hiddenCornerIndex>=0)return saveHiddenCorner();if(calibrationPoints.some(point=>!point)){setCalibrationStatus('Marque le coin hors champ puis fournis les deux bords visibles.',true);return}saveCalibration(calibrationPoints)}
 function saveHiddenCorner(){if(hiddenCornerIndex<0||calibrationPoints.length!==4||calibrationEdgePoints.length!==2)return;const edges=hiddenCornerEdges(),first=calibrationPoints[edges[0].corner],second=calibrationPoints[edges[1].corner],corner=lineIntersection(first,calibrationEdgePoints[0],second,calibrationEdgePoints[1]);if(!corner||!Number.isFinite(corner[0])||!Number.isFinite(corner[1])){setCalibrationStatus('Les deux bords semblent parallèles ou imprécis. Recommence et clique plus loin sur chacun des bords.',true);return}const completed=calibrationPoints.slice();completed[hiddenCornerIndex]=corner;saveCalibration(completed,hiddenCornerIndex)}
 function undoCalibrationPoint(){if(!calibrationMode)return;if(calibrationEdgePoints.length){calibrationEdgePoints.pop();renderCalibrationProgress();return}if(!calibrationPoints.length)return;const index=calibrationPoints.length-1,removed=calibrationPoints.pop();if(index===hiddenCornerIndex&&removed===null)hiddenCornerIndex=-1;renderCalibrationProgress()}

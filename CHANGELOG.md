@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.2.0 — 2026-08-01
+
+- Calibration Vision automatique et locale par planche QR 180 mm : la
+  perspective de la caméra est reconstruite sans cliquer les coins du plateau.
+- La planche est générée par l’application, détectée par le composant macOS
+  inclus et ne requiert aucune dépendance Python, aucun réseau ni accès à
+  l’imprimante.
+
 ## 3.1.2 — 2026-08-01
 
 - La reconstruction d’un coin hors champ utilise maintenant l’intersection de

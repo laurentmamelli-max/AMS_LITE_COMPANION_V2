@@ -45,10 +45,37 @@ xcrun swiftc \
   -o "$BUILD/AMS-Lite-Companion-V2-x86_64" \
   "$ROOT/macos/AMSCompanionLauncher.swift"
 
+xcrun swiftc \
+  -O \
+  -target arm64-apple-macosx11.0 \
+  -framework AppKit \
+  -framework Foundation \
+  -framework Vision \
+  -framework CoreImage \
+  -framework ImageIO \
+  -o "$BUILD/ams_vision_calibration-arm64" \
+  "$ROOT/macos/AMSVisionCalibration.swift"
+
+xcrun swiftc \
+  -O \
+  -target x86_64-apple-macosx10.15 \
+  -framework AppKit \
+  -framework Foundation \
+  -framework Vision \
+  -framework CoreImage \
+  -framework ImageIO \
+  -o "$BUILD/ams_vision_calibration-x86_64" \
+  "$ROOT/macos/AMSVisionCalibration.swift"
+
 xcrun lipo -create \
   "$BUILD/AMS-Lite-Companion-V2-arm64" \
   "$BUILD/AMS-Lite-Companion-V2-x86_64" \
   -output "$MACOS/AMS-Lite-Companion-V2"
+
+xcrun lipo -create \
+  "$BUILD/ams_vision_calibration-arm64" \
+  "$BUILD/ams_vision_calibration-x86_64" \
+  -output "$RESOURCES/ams_vision_calibration"
 
 cp "$ROOT/ams_companion.py" "$RESOURCES/ams_companion.py"
 cp "$ROOT/plate_guardian.py" "$RESOURCES/plate_guardian.py"
@@ -56,7 +83,7 @@ cp "$ROOT/bambu_camera.py" "$RESOURCES/bambu_camera.py"
 cp "$ROOT/gcode_mapper.py" "$RESOURCES/gcode_mapper.py"
 cp "$ROOT/autopilot.py" "$RESOURCES/autopilot.py"
 cp "$ROOT/macos/Info.plist" "$CONTENTS/Info.plist"
-chmod 755 "$MACOS/AMS-Lite-Companion-V2"
+chmod 755 "$MACOS/AMS-Lite-Companion-V2" "$RESOURCES/ams_vision_calibration"
 chmod 644 "$RESOURCES/ams_companion.py" "$RESOURCES/plate_guardian.py" "$RESOURCES/bambu_camera.py" "$RESOURCES/gcode_mapper.py" "$RESOURCES/autopilot.py" "$CONTENTS/Info.plist"
 
 # A signed bundle can launch only if each local Python dependency is present
@@ -65,6 +92,7 @@ chmod 644 "$RESOURCES/ams_companion.py" "$RESOURCES/plate_guardian.py" "$RESOURC
 (
   cd "$RESOURCES"
   PYTHONDONTWRITEBYTECODE=1 python3 -c 'import ams_companion, autopilot, bambu_camera, gcode_mapper, plate_guardian'
+  ./ams_vision_calibration --sheet >/dev/null
 )
 
 codesign --force --deep --options runtime --sign "$SIGNING_IDENTITY" "$APP"
