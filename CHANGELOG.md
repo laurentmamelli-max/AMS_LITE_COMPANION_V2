@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.4.5 — 2026-08-02
+
+- La recherche Vision affiche désormais son diagnostic réel (3MF historique
+  absent, image illisible ou aucune forme reconnue) au lieu du message générique
+  « Requête invalide ».
+
 ## 3.4.4 — 2026-08-02
 
 - Chaque impression suivie archive désormais son 3MF tranché dans son dossier

@@ -61,7 +61,7 @@ EVENTS_FILE = APP_DIR / "events.sqlite3"
 AUTOPILOT_FILE = APP_DIR / "autopilot.sqlite3"
 REPORTS_FILE = APP_DIR / "reports.sqlite3"
 HOST, PORT = "127.0.0.1", 8766
-__version__ = "3.4.4"
+__version__ = "3.4.5"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -3804,7 +3804,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(self.app.detect_vision_calibration_markers(str(body.get("file") or "")))
             elif path == "/api/vision/shapes/detect":
                 body = self.json_body()
-                self.send_json(self.app.detect_vision_object_shapes(str(body.get("file") or "")))
+                try:
+                    result = self.app.detect_vision_object_shapes(str(body.get("file") or ""))
+                except (FileNotFoundError, RuntimeError, ValueError) as exc:
+                    # A missing historical 3MF or an uncertain frame is an
+                    # expected Vision outcome, not an invalid browser request.
+                    result = {"detected": False, "message": str(exc)}
+                self.send_json(result)
             elif path == "/api/vision/calibration/capture":
                 self.json_body()
                 self.send_json(self.app.capture_calibration_frame())
