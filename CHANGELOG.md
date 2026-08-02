@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.8.2 — 2026-08-03
+
+- Ajout du **Garde-fou Vision** : à chaque séquence de trois vues, Companion
+  cherche seulement à confirmer les objets attendus du 3MF. Si les trois vues
+  ne permettent pas cette confirmation, une alerte/popup de contrôle humain
+  est créée ; il n'y a ni pause, ni annulation, ni commande envoyée à
+  l'imprimante.
+- Ce mécanisme empêche qu'une IA qui n'a pas de preuve visuelle suffisante soit
+  interprétée comme un feu vert. Son état et le détail par image sont visibles
+  dans le Centre Vision.
+- Le premier groupe de vues d'une impression déjà archivée est revérifié au
+  démarrage, afin de diagnostiquer aussi les anciens faux négatifs.
+
 ## 3.8.1 — 2026-08-02
 
 - Le Centre Vision ne limite plus son historique à 200 captures. Les futures

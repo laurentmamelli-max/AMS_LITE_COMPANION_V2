@@ -504,7 +504,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("3.8.1", report["application"]["version"])
+            self.assertEqual("3.8.2", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -578,6 +578,35 @@ class CompanionTests(unittest.TestCase):
                 {"count": 2, "bytes": 8, "completed": 1, "active": 1},
                 app.vision_storage(),
             )
+
+    def test_visual_guard_warns_when_three_views_cannot_confirm_3mf_objects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            folder = "print-20260803-visual-guard"
+            session = "a" * 16
+            app.state["camera"]["captures"] = [{
+                "file": f"layer-00005-20260803-01010{view}.jpg", "folder": folder,
+                "print_id": session, "layer": 5, "capture_view": view,
+                "capture_views_total": 3, "object_map": {"objects": [{"id": "2565"}]},
+            } for view in (1, 2, 3)]
+            with mock.patch.object(app, "detect_vision_object_shapes", return_value={
+                "detected": False, "message": "Correspondance de formes ambiguë",
+            }):
+                results = [app.assess_capture_visual_verification(item["file"])
+                           for item in app.state["camera"]["captures"]]
+            self.assertEqual(["unverified"] * 3, [item["status"] for item in results])
+            event = app.state["camera"]["verification_alerts"][0]
+            self.assertEqual("open", event["status"])
+            self.assertEqual(5, event["layer"])
+            self.assertEqual(3, event["views"])
+            self.assertIn("vision_guard", [item["source"] for item in ac.build_alert_queue(app.state)])
+            with mock.patch.object(app, "detect_vision_object_shapes", return_value={
+                "detected": True, "objects": [{"object_id": "2565"}], "message": "Objet confirmé",
+            }):
+                verified = app.assess_capture_visual_verification(app.state["camera"]["captures"][0]["file"])
+            self.assertEqual("verified", verified["status"])
+            self.assertEqual("resolved", event["status"])
+            self.assertNotIn("vision_guard", [item["source"] for item in ac.build_alert_queue(app.state)])
 
     def test_startup_restores_unlimited_vision_history_from_local_jpegs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1471,11 +1500,11 @@ class CompanionTests(unittest.TestCase):
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("3.8.1", report["application"]["version"])
+                self.assertEqual("3.8.2", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
                 self.assertIn("Poste de supervision", html)
                 self.assertIn("Historique Vision et rapports", html)
-                self.assertIn("Compteur local v3.8.1", html)
+                self.assertIn("Compteur local v3.8.2", html)
                 self.assertIn("shutdownCard.after(auditCard)", html)
                 self.assertIn("auditCard.after(reportsCard)", html)
                 snapshot_request = urllib.request.Request(
