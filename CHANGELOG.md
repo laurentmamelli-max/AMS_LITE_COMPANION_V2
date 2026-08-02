@@ -1,5 +1,15 @@
 # Changelog
 
+## 3.8.6 — 2026-08-03
+
+- Le Garde-fou Vision suit désormais chaque séquence de vues non vérifiées au
+  lieu de rester figé sur la première couche. Après trois séquences sans objet
+  3MF confirmé, une nouvelle alerte renforcée explique de vérifier la buse et
+  le plateau et ouvre le Centre Vision.
+- Une alerte active est désormais affichée clairement en tête du Centre Vision,
+  avec la dernière couche concernée. Comme toujours, aucun ordre n’est envoyé
+  à l’imprimante.
+
 ## 3.8.5 — 2026-08-03
 
 - Une alerte de vérification Vision ouvre désormais directement le Centre

@@ -63,7 +63,7 @@ EVENTS_FILE = APP_DIR / "events.sqlite3"
 AUTOPILOT_FILE = APP_DIR / "autopilot.sqlite3"
 REPORTS_FILE = APP_DIR / "reports.sqlite3"
 HOST, PORT = "127.0.0.1", 8766
-__version__ = "3.8.5"
+__version__ = "3.8.6"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -268,13 +268,28 @@ def build_alert_queue(state: dict[str, Any]) -> list[dict[str, str]]:
             continue
         layer = int(_float(event.get("layer") or 0))
         views = max(1, int(_float(event.get("views") or 0)))
-        alerts.append({
-            "id": f"vision-guard:{event_id}", "severity": "warning", "source": "vision_guard",
-            "title": "Vérification Vision requise",
-            "message": (
+        checkpoints = [int(_float(value)) for value in event.get("checkpoints", [])
+                       if int(_float(value)) > 0]
+        escalated = str(event.get("kind") or "") == "repeated_unverified"
+        first_layer = int(_float(event.get("first_layer") or (checkpoints[0] if checkpoints else layer)))
+        severity = "critical" if escalated else "warning"
+        if escalated:
+            checkpoint_text = f"{len(checkpoints)} séquences" if checkpoints else "plusieurs séquences"
+            message = (
+                f"{checkpoint_text} sans objet 3MF confirmé, des couches {first_layer or '?'} à {layer or '?'}. "
+                "La vue peut être masquée ou l’impression peut être en défaut : vérifie la buse et le plateau. "
+                "Aucune commande n’a été envoyée."
+            )
+            title = "Alerte Vision renforcée"
+        else:
+            message = (
                 f"Les {views} vues de la couche {layer or 'en cours'} ne confirment pas les objets attendus du 3MF. "
                 "Vérifie l’impression : aucune commande n’a été envoyée."
-            ),
+            )
+            title = "Vérification Vision requise"
+        alerts.append({
+            "id": f"vision-guard:{event_id}", "severity": severity, "source": "vision_guard",
+            "title": title, "message": message,
             "created_at": str(event.get("created_at") or ""), "action": "review_only",
         })
     return alerts
@@ -3050,7 +3065,15 @@ class Companion:
         )
 
     def _update_visual_verification_alert_locked(self, capture: dict[str, Any]) -> None:
-        """Open one review alert only after a whole view set is unverified."""
+        """Escalate repeated complete view sets that cannot confirm the 3MF.
+
+        One uncertain frame is normal when the moving toolhead crosses the
+        camera.  A complete three-view checkpoint without *any* object proof
+        is therefore a review warning.  Repeating that situation across three
+        different layers is materially stronger evidence: issue one new,
+        clearly worded critical alert so the native notification is not stuck
+        on the first failed layer.  This stays strictly review-only.
+        """
         camera = self.state.setdefault("camera", {})
         key = self._capture_verification_key(capture)
         if not key:
@@ -3071,22 +3094,59 @@ class Companion:
         event_id = hashlib.sha256(f"vision-verification:{key}".encode("utf-8")).hexdigest()[:32]
         existing = next((item for item in alerts if isinstance(item, dict) and item.get("id") == event_id), None)
         if any(item.get("status") == "verified" for item in checked):
-            if isinstance(existing, dict) and existing.get("status") == "open":
-                existing["status"] = "resolved"
-                existing["resolved_at"] = now_iso()
+            for event in alerts:
+                if (isinstance(event, dict) and event.get("session_key") == key
+                        and event.get("status") == "open"):
+                    event["status"] = "resolved"
+                    event["resolved_at"] = now_iso()
             camera["verification_status"] = f"Garde-fou Vision : objets 3MF confirmés à la couche {layer}"
             return
         if not all(item.get("status") in {"unverified", "unavailable"} for item in checked):
             return
+        checkpoint_files = [str(item.get("file") or "") for item in related if item.get("file")]
         if not isinstance(existing, dict):
-            alerts.insert(0, {
+            existing = {
                 "id": event_id, "status": "open", "session_key": key, "layer": layer,
-                "views": views, "created_at": now_iso(),
+                "first_layer": layer, "checkpoints": [layer], "latest_files": checkpoint_files,
+                "views": views, "created_at": now_iso(), "updated_at": now_iso(),
+            }
+            alerts.insert(0, existing)
+        else:
+            checkpoints = [int(_float(value)) for value in existing.get("checkpoints", [])
+                           if int(_float(value)) > 0]
+            if layer not in checkpoints:
+                checkpoints.append(layer)
+            existing["checkpoints"] = checkpoints[-50:]
+            existing["first_layer"] = int(_float(existing.get("first_layer") or layer))
+            existing["layer"] = layer
+            existing["latest_files"] = checkpoint_files
+            existing["views"] = views
+            existing["updated_at"] = now_iso()
+
+        checkpoints = [int(_float(value)) for value in existing.get("checkpoints", [])
+                       if int(_float(value)) > 0]
+        if len(checkpoints) >= 3:
+            escalation_id = hashlib.sha256(f"vision-verification-escalated:{key}".encode("utf-8")).hexdigest()[:32]
+            escalation = next((item for item in alerts if isinstance(item, dict) and item.get("id") == escalation_id), None)
+            if not isinstance(escalation, dict):
+                escalation = {
+                    "id": escalation_id, "kind": "repeated_unverified", "status": "open",
+                    "session_key": key, "first_layer": checkpoints[0], "created_at": now_iso(),
+                }
+                alerts.insert(0, escalation)
+            escalation.update({
+                "layer": layer, "views": views, "checkpoints": checkpoints,
+                "latest_files": checkpoint_files, "updated_at": now_iso(),
             })
-            camera["verification_alerts"] = alerts[:100]
-        camera["verification_status"] = (
-            f"Garde-fou Vision : {views} vues non vérifiées à la couche {layer} — contrôle humain requis"
-        )
+            camera["verification_status"] = (
+                f"Alerte Vision renforcée : {len(checkpoints)} séquences sans objet 3MF confirmé "
+                f"jusqu’à la couche {layer} — vérifier la buse et le plateau"
+            )
+        else:
+            camera["verification_status"] = (
+                f"Garde-fou Vision : {views} vues non vérifiées à la couche {layer} — contrôle humain requis"
+            )
+        camera["verification_alerts"] = alerts[:100]
 
     def assess_capture_visual_verification(self, filename: str) -> dict[str, Any]:
         """Confirm 3MF evidence for one frame, never infer a healthy verdict.
@@ -3137,7 +3197,12 @@ class Companion:
         return verdict
 
     def audit_visual_verification(self, folder_name: str) -> dict[str, Any]:
-        """Replay the first complete evidence set of one completed local print."""
+        """Replay every retained checkpoint of one local print.
+
+        This makes a detector upgrade useful for an already completed print:
+        it rebuilds the complete evidence trail instead of leaving the alert
+        attached forever to its first capture layer.
+        """
         if not re.fullmatch(r"print-[a-zA-Z0-9._-]+", folder_name):
             raise ValueError("Dossier de captures invalide")
         with self.lock:
@@ -3146,9 +3211,6 @@ class Companion:
                 if isinstance(item, dict) and item.get("folder") == folder_name
             ]
         captures.sort(key=lambda item: (int(_float(item.get("layer") or 0)), int(_float(item.get("capture_view") or 0))))
-        if captures:
-            first_layer = int(_float(captures[0].get("layer") or 0))
-            captures = [item for item in captures if int(_float(item.get("layer") or 0)) == first_layer]
         results = [self.assess_capture_visual_verification(str(item.get("file") or "")) for item in captures if item.get("file")]
         return {"folder": folder_name, "checked": len(results), "results": results}
 
@@ -3165,16 +3227,69 @@ class Companion:
             ).start()
 
     def _schedule_recent_visual_audit(self) -> None:
-        """Audit one completed session left unverified by an earlier version."""
+        """Audit a recent session left incomplete by an earlier Vision build."""
         with self.lock:
             camera = self.state.setdefault("camera", {})
             if not camera.get("verification_enabled", True):
                 return
+            # Early alerts were created while a print still had only its
+            # transient session id. Once the print finishes, captures move
+            # into a stable folder. Re-key the alert before replaying it so
+            # the audit updates one event instead of producing a duplicate.
+            captures = [item for item in camera.get("captures", []) if isinstance(item, dict)]
+            migrated = False
+            for event in camera.get("verification_alerts", []):
+                if not isinstance(event, dict) or event.get("status") != "open":
+                    continue
+                session_id = str(event.get("session_key") or "")
+                folder = next((str(item.get("folder") or "") for item in captures
+                               if str(item.get("print_id") or "") == session_id
+                               and re.fullmatch(r"print-[a-zA-Z0-9._-]+", str(item.get("folder") or ""))), "")
+                if not folder and re.fullmatch(r"print-[a-zA-Z0-9._-]+", session_id):
+                    folder = session_id
+                if not folder:
+                    continue
+                event["session_key"] = folder
+                prefix = "vision-verification-escalated" if event.get("kind") == "repeated_unverified" else "vision-verification"
+                expected_id = hashlib.sha256(f"{prefix}:{folder}".encode("utf-8")).hexdigest()[:32]
+                if event.get("id") == expected_id:
+                    continue
+                survivor = next((candidate for candidate in camera.get("verification_alerts", [])
+                                 if isinstance(candidate, dict) and candidate is not event
+                                 and candidate.get("id") == expected_id and candidate.get("status") == "open"), None)
+                if isinstance(survivor, dict):
+                    prior = [int(_float(value)) for value in survivor.get("checkpoints", []) if int(_float(value)) > 0]
+                    incoming = [int(_float(value)) for value in event.get("checkpoints", []) if int(_float(value)) > 0]
+                    merged = sorted(set(prior + incoming))
+                    if merged:
+                        survivor["checkpoints"] = merged
+                        survivor["first_layer"] = merged[0]
+                        survivor["layer"] = merged[-1]
+                    event["status"] = "superseded"
+                    event["superseded_by"] = expected_id
+                    event["resolved_at"] = now_iso()
+                else:
+                    event["id"] = expected_id
+                migrated = True
+            if migrated:
+                self.save()
+            legacy_open_keys = {
+                str(event.get("session_key") or "") for event in camera.get("verification_alerts", [])
+                if isinstance(event, dict) and event.get("status") == "open"
+                and not isinstance(event.get("checkpoints"), list)
+            }
             folder = next((
-                str(item.get("folder") or "") for item in camera.get("captures", [])
+                str(item.get("folder") or "") for item in captures
                 if isinstance(item, dict) and item.get("folder")
                 and self._capture_has_expected_objects(item)
-                and not isinstance(item.get("visual_verification"), dict)
+                and (
+                    not isinstance(item.get("visual_verification"), dict)
+                    or self._capture_verification_key(item) in legacy_open_keys
+                    # A capture can acquire its final print folder after the
+                    # first warning was created. Keep its original in-memory
+                    # session id as a migration key as well.
+                    or str(item.get("print_id") or "") in legacy_open_keys
+                )
             ), "")
         if re.fullmatch(r"print-[a-zA-Z0-9._-]+", folder):
             threading.Thread(target=self.audit_visual_verification, args=(folder,), daemon=True).start()
@@ -4363,6 +4478,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 </style><main>
 <h1>Centre Vision</h1>
 <p class="notice">Captures automatiques périodiques : <strong>ce n’est pas une vidéo en direct</strong>. Trois vues avec des pauses aléatoires sont prises à la couche 5, puis toutes les 5 couches, afin de voir les objets masqués par la tête.</p>
+<section id="visionAlert" hidden style="border:2px solid #c94332;background:#fff1ef"><h2 style="color:#a72f22">Alerte Vision active</h2><p id="visionAlertText" style="font-weight:650;margin-bottom:0"></p></section>
 <section><h2>Impression en cours</h2><p id="layerCounter" style="font-size:42px;font-weight:800;margin:4px 0;color:#087535">Couche —</p><p class="muted">Compteur reçu directement de l’imprimante.</p></section>
 <section><h2>Caméra</h2><p id="status">Chargement…</p><label><input id="enabled" type="checkbox"> Activer les captures automatiques (pas de flux vidéo)</label><p class="muted">Le Centre Vision se met à jour toutes les trois secondes après chaque nouvelle capture.</p><label>Empreinte TLS</label><input id="fingerprint" placeholder="Détecte-la automatiquement"><button class="secondary" onclick="discover()">Détecter la caméra</button><button onclick="saveCamera()">Enregistrer</button><p id="meta" class="muted"></p></section>
 <section><h2>IA de détection PrintGuard</h2><p>Détecteur local éprouvé, séparé de Companion. Les JPEG restent sur ce Mac et l’IA ne reçoit ni le code LAN Bambu ni aucun droit de pause ou d’annulation.</p><label><input id="printguardEnabled" type="checkbox"> Analyser automatiquement chaque nouvelle capture</label><div class="fields"><label>Adresse locale<input id="printguardURL" value="http://127.0.0.1:8000" inputmode="url"></label><label>Sensibilité (0,1 à 4)<input id="printguardSensitivity" type="number" min="0.1" max="4" step="0.1" value="1"></label></div><label>Jeton API optionnel<input id="printguardToken" type="password" placeholder="Seulement si PrintGuard exige un jeton"></label><button class="secondary" onclick="testPrintGuard()">Tester PrintGuard</button><button onclick="savePrintGuard()">Enregistrer l’IA</button><p id="printguardStatus" class="muted">Installe et lance PrintGuard, puis teste la connexion locale.</p></section>
@@ -4428,7 +4544,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 <section><h2>Captures par impression</h2><div id="gallery"></div></section></main>
 <div id="captureModal" class="capture-modal" hidden onclick="if(event.target===this)closeCapture()"><section class="capture-dialog"><button class="secondary capture-close" onclick="closeCapture()">Fermer</button><h2 id="captureTitle">Capture</h2><button onclick="classifyCurrentCapture()">Analyser avec PrintGuard</button><p id="overlayNotice" class="muted"></p><div id="captureStage" class="capture-stage"><img id="captureLarge" alt="Capture agrandie"><svg id="captureOverlay" viewBox="0 0 1 1" preserveAspectRatio="none"></svg></div><div id="objectLegend" class="object-legend" aria-label="Légende des objets reconnus"></div><div id="captureInfo" class="capture-info"></div></section></div>
 <script>
-const token=__API_TOKEN__,statusEl=document.getElementById('status'),enabledEl=document.getElementById('enabled'),fingerprintEl=document.getElementById('fingerprint'),metaEl=document.getElementById('meta'),galleryEl=document.getElementById('gallery'),modalEl=document.getElementById('captureModal'),titleEl=document.getElementById('captureTitle'),largeEl=document.getElementById('captureLarge'),overlayEl=document.getElementById('captureOverlay'),overlayNoticeEl=document.getElementById('overlayNotice'),legendEl=document.getElementById('objectLegend'),infoEl=document.getElementById('captureInfo'),layerCounterEl=document.getElementById('layerCounter'),printguardEnabledEl=document.getElementById('printguardEnabled'),printguardURLEl=document.getElementById('printguardURL'),printguardTokenEl=document.getElementById('printguardToken'),printguardSensitivityEl=document.getElementById('printguardSensitivity'),printguardStatusEl=document.getElementById('printguardStatus');
+const token=__API_TOKEN__,statusEl=document.getElementById('status'),enabledEl=document.getElementById('enabled'),fingerprintEl=document.getElementById('fingerprint'),metaEl=document.getElementById('meta'),galleryEl=document.getElementById('gallery'),modalEl=document.getElementById('captureModal'),titleEl=document.getElementById('captureTitle'),largeEl=document.getElementById('captureLarge'),overlayEl=document.getElementById('captureOverlay'),overlayNoticeEl=document.getElementById('overlayNotice'),legendEl=document.getElementById('objectLegend'),infoEl=document.getElementById('captureInfo'),layerCounterEl=document.getElementById('layerCounter'),printguardEnabledEl=document.getElementById('printguardEnabled'),printguardURLEl=document.getElementById('printguardURL'),printguardTokenEl=document.getElementById('printguardToken'),printguardSensitivityEl=document.getElementById('printguardSensitivity'),printguardStatusEl=document.getElementById('printguardStatus'),visionAlertEl=document.getElementById('visionAlert'),visionAlertTextEl=document.getElementById('visionAlertText');
 let visionState=null,currentCapture=null,currentShapeObjects=[],currentPlateMessage='',selectedObjectIndex=-1,visionGalleryLimit=180;
 async function api(path,opt={}){const response=await fetch(path,{...opt,headers:{'X-AMS-Token':token,'Content-Type':'application/json'}}),body=await response.json();if(!response.ok)throw Error(body.error||'Erreur');return body}
 function esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function captureURL(file){return `/api/captures/${encodeURIComponent(file)}?token=${encodeURIComponent(token)}`}
@@ -4444,7 +4560,7 @@ function closeCapture(){modalEl.hidden=true;currentShapeObjects=[];selectedObjec
 async function deleteCapturePrint(folder){if(!confirm('Supprimer définitivement toutes les images de cette impression ?'))return;try{await api(`/api/captures/${encodeURIComponent(folder)}/delete`,{method:'POST',body:'{}'});closeCapture();await load()}catch(error){statusEl.textContent=error.message||'Suppression impossible.'}}
 async function deleteActiveCaptureSession(sessionId){if(!confirm('Supprimer les images déjà prises de cette impression ? Les prochaines captures resteront actives.'))return;try{await api(`/api/captures/session/${encodeURIComponent(sessionId)}/delete`,{method:'POST',body:'{}'});closeCapture();await load()}catch(error){statusEl.textContent=error.message||'Suppression impossible.'}}
 function showMoreCaptures(){visionGalleryLimit+=180;if(visionState)render(visionState)}
-function render(state){visionState=state;const printer=state.printer||{},camera=state.camera||{},printguard=state.printguard||{},captures=Array.isArray(camera.captures)?camera.captures:[],storage=state.vision_storage||{};const views=camera.capture_views_per_layer||3,delayMin=camera.capture_view_delay_min_seconds||4,delayMax=camera.capture_view_delay_max_seconds||24;layerCounterEl.textContent=Number(printer.layer)>0?`Couche ${Number(printer.layer)}`:'Couche —';statusEl.textContent=camera.status||'Caméra non configurée';enabledEl.checked=!!camera.enabled;fingerprintEl.value=camera.certificate_sha256||'';printguardEnabledEl.checked=!!printguard.enabled;printguardURLEl.value=printguard.base_url||'http://127.0.0.1:8000';printguardSensitivityEl.value=printguard.sensitivity||1;printguardStatusEl.textContent=printguard.status||'PrintGuard non configuré';metaEl.textContent=`Captures, pas vidéo : ${views} vues avec pauses aléatoires de ${delayMin} à ${delayMax} s toutes les ${camera.capture_every_layers||5} couches · dernière couche reçue : ${camera.last_seen_layer||'—'} · ${storage.count||0} image(s) conservée(s) localement. ${camera.verification_status||''}`;window.visionCaptures=captures;const visible=captures.slice(0,visionGalleryLimit),groups=new Map();visible.forEach((item,index)=>{const key=item.folder||'en-cours';if(!groups.has(key))groups.set(key,{name:item.print_name||(item.folder?'Impression terminée':'Impression en cours'),folder:item.folder||'',sessionId:item.print_id||'',items:[]});groups.get(key).items.push({item,index})});galleryEl.innerHTML=visible.length?[...groups.values()].map(group=>{const deletion=group.folder?`<button class="danger" onclick="deleteCapturePrint('${esc(group.folder)}')">Supprimer</button>`:/^[a-f0-9]{16}$/.test(group.sessionId)?`<button class="danger" onclick="deleteActiveCaptureSession('${esc(group.sessionId)}')">Supprimer</button>`:'';return `<div class="capture-group"><div class="capture-group-head"><div><h3>${esc(group.name)}</h3><span>${group.items.length} image(s)</span></div>${deletion}</div><div class="capture-grid">${group.items.map(({item,index})=>{const pg=item.printguard||{},ai=pg.prediction?`<br><span class="map-badge">PrintGuard : ${pg.prediction==='failure'?'risque signalé':'aucun défaut'} (${Math.round(100*Number(pg.defect_score||0))} %)</span>`:'',guard=item.visual_verification||{},guardBadge=['unverified','unavailable'].includes(guard.status)?`<br><span class="map-badge">Garde-fou Vision : contrôle requis</span>`:'';return `<button class="capture-card" onclick="openCapture(${index})"><img src="${captureURL(item.file)}" alt="Capture couche ${item.layer}, vue ${item.capture_view||1}"><div><b>Couche ${item.layer} · vue ${item.capture_view||1}/${item.capture_views_total||1}</b><br><span class="muted">${esc(item.captured_at)}</span>${ai}${guardBadge}</div></button>`}).join('')}</div></div>`}).join(''):'<p>Aucune capture : la première séquence sera prise à la couche 5, pas immédiatement au lancement.</p>';const remaining=captures.length-visible.length;if(remaining)galleryEl.innerHTML+=`<p class="muted">${remaining} image(s) plus ancienne(s) restent dans l’historique local.<br><button class="secondary" onclick="showMoreCaptures()">Afficher 180 images supplémentaires</button></p>`}
+function render(state){visionState=state;const printer=state.printer||{},camera=state.camera||{},printguard=state.printguard||{},captures=Array.isArray(camera.captures)?camera.captures:[],storage=state.vision_storage||{};const views=camera.capture_views_per_layer||3,delayMin=camera.capture_view_delay_min_seconds||4,delayMax=camera.capture_view_delay_max_seconds||24;const openAlerts=(camera.verification_alerts||[]).filter(item=>item&&item.status==='open'),activeAlert=openAlerts.find(item=>item.kind==='repeated_unverified')||openAlerts[0];visionAlertEl.hidden=!activeAlert;if(activeAlert){const checkpoints=Array.isArray(activeAlert.checkpoints)?activeAlert.checkpoints.length:1;visionAlertTextEl.textContent=activeAlert.kind==='repeated_unverified'?`${checkpoints} séquences sans objet 3MF confirmé jusqu’à la couche ${activeAlert.layer||'—'}. Vérifie la buse et le plateau : le cadre peut être masqué ou l’impression en défaut.`:`Les ${activeAlert.views||views} vues de la couche ${activeAlert.layer||'—'} ne confirment pas les objets 3MF attendus. Ouvre les captures et contrôle l’impression.`}layerCounterEl.textContent=Number(printer.layer)>0?`Couche ${Number(printer.layer)}`:'Couche —';statusEl.textContent=camera.status||'Caméra non configurée';enabledEl.checked=!!camera.enabled;fingerprintEl.value=camera.certificate_sha256||'';printguardEnabledEl.checked=!!printguard.enabled;printguardURLEl.value=printguard.base_url||'http://127.0.0.1:8000';printguardSensitivityEl.value=printguard.sensitivity||1;printguardStatusEl.textContent=printguard.status||'PrintGuard non configuré';metaEl.textContent=`Captures, pas vidéo : ${views} vues avec pauses aléatoires de ${delayMin} à ${delayMax} s toutes les ${camera.capture_every_layers||5} couches · dernière couche reçue : ${camera.last_seen_layer||'—'} · ${storage.count||0} image(s) conservée(s) localement. ${camera.verification_status||''}`;window.visionCaptures=captures;const visible=captures.slice(0,visionGalleryLimit),groups=new Map();visible.forEach((item,index)=>{const key=item.folder||'en-cours';if(!groups.has(key))groups.set(key,{name:item.print_name||(item.folder?'Impression terminée':'Impression en cours'),folder:item.folder||'',sessionId:item.print_id||'',items:[]});groups.get(key).items.push({item,index})});galleryEl.innerHTML=visible.length?[...groups.values()].map(group=>{const deletion=group.folder?`<button class="danger" onclick="deleteCapturePrint('${esc(group.folder)}')">Supprimer</button>`:/^[a-f0-9]{16}$/.test(group.sessionId)?`<button class="danger" onclick="deleteActiveCaptureSession('${esc(group.sessionId)}')">Supprimer</button>`:'';return `<div class="capture-group"><div class="capture-group-head"><div><h3>${esc(group.name)}</h3><span>${group.items.length} image(s)</span></div>${deletion}</div><div class="capture-grid">${group.items.map(({item,index})=>{const pg=item.printguard||{},ai=pg.prediction?`<br><span class="map-badge">PrintGuard : ${pg.prediction==='failure'?'risque signalé':'aucun défaut'} (${Math.round(100*Number(pg.defect_score||0))} %)</span>`:'',guard=item.visual_verification||{},guardBadge=['unverified','unavailable'].includes(guard.status)?`<br><span class="map-badge">Garde-fou Vision : contrôle requis</span>`:'';return `<button class="capture-card" onclick="openCapture(${index})"><img src="${captureURL(item.file)}" alt="Capture couche ${item.layer}, vue ${item.capture_view||1}"><div><b>Couche ${item.layer} · vue ${item.capture_view||1}/${item.capture_views_total||1}</b><br><span class="muted">${esc(item.captured_at)}</span>${ai}${guardBadge}</div></button>`}).join('')}</div></div>`}).join(''):'<p>Aucune capture : la première séquence sera prise à la couche 5, pas immédiatement au lancement.</p>';const remaining=captures.length-visible.length;if(remaining)galleryEl.innerHTML+=`<p class="muted">${remaining} image(s) plus ancienne(s) restent dans l’historique local.<br><button class="secondary" onclick="showMoreCaptures()">Afficher 180 images supplémentaires</button></p>`}
 async function load(){try{render(await api('/api/state'))}catch(error){statusEl.textContent=error.message}}async function saveCamera(){try{await api('/api/config',{method:'POST',body:JSON.stringify({camera_enabled:enabledEl.checked,camera_certificate_sha256:fingerprintEl.value})});await load()}catch(error){statusEl.textContent=error.message}}async function discover(){try{fingerprintEl.value=(await api('/api/camera/discover',{method:'POST',body:'{}'})).fingerprint;statusEl.textContent='Empreinte détectée : enregistre-la pour l’approuver.'}catch(error){statusEl.textContent=error.message}}document.addEventListener('keydown',event=>{if(event.key==='Escape')closeCapture()});load();setInterval(load,3000);
 </script></html>'''.replace("__API_TOKEN__", json.dumps(api_token))
 

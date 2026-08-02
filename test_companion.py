@@ -481,7 +481,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("3.8.5", report["application"]["version"])
+            self.assertEqual("3.8.6", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -584,6 +584,84 @@ class CompanionTests(unittest.TestCase):
             self.assertEqual("verified", verified["status"])
             self.assertEqual("resolved", event["status"])
             self.assertNotIn("vision_guard", [item["source"] for item in ac.build_alert_queue(app.state)])
+
+    def test_visual_guard_escalates_after_three_unverified_checkpoints(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            folder = "print-20260803-vision-escalation"
+            captures = []
+            for layer in (5, 10, 15):
+                for view in (1, 2, 3):
+                    captures.append({
+                        "file": f"layer-{layer:05d}-20260803-{layer:02d}0{view:02d}.jpg",
+                        "folder": folder, "print_id": "b" * 16, "layer": layer,
+                        "capture_view": view, "capture_views_total": 3,
+                        "object_map": {"objects": [{"id": "2565"}]},
+                        "visual_verification": {"status": "unverified"},
+                    })
+            app.state["camera"]["captures"] = captures
+            for capture in captures:
+                with app.lock:
+                    app._update_visual_verification_alert_locked(capture)
+            alerts = app.state["camera"]["verification_alerts"]
+            base = next(item for item in alerts if item.get("kind") != "repeated_unverified")
+            escalation = next(item for item in alerts if item.get("kind") == "repeated_unverified")
+            self.assertEqual([5, 10, 15], base["checkpoints"])
+            self.assertEqual(15, base["layer"])
+            self.assertEqual([5, 10, 15], escalation["checkpoints"])
+            alert = next(item for item in ac.build_alert_queue(app.state) if item["id"].endswith(escalation["id"]))
+            self.assertEqual("critical", alert["severity"])
+            self.assertIn("buse et le plateau", alert["message"])
+            captures[0]["visual_verification"] = {"status": "verified"}
+            with app.lock:
+                app._update_visual_verification_alert_locked(captures[0])
+            self.assertTrue(all(item["status"] == "resolved" for item in alerts))
+
+    def test_visual_audit_rechecks_every_retained_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            folder = "print-20260803-full-audit"
+            app.state["camera"]["captures"] = [
+                {
+                    "file": f"layer-{layer:05d}-20260803-{layer:02d}0{view:02d}.jpg",
+                    "folder": folder, "print_id": "c" * 16, "layer": layer,
+                    "capture_view": view, "capture_views_total": 3,
+                    "object_map": {"objects": [{"id": "2565"}]},
+                }
+                for layer in (5, 10) for view in (1, 2, 3)
+            ]
+            with mock.patch.object(app, "detect_vision_object_shapes", return_value={
+                "detected": False, "message": "Aucun objet confirmé",
+            }):
+                audit = app.audit_visual_verification(folder)
+            self.assertEqual(6, audit["checked"])
+            self.assertEqual([5, 10], app.state["camera"]["verification_alerts"][0]["checkpoints"])
+
+    def test_startup_audit_merges_transient_alert_key_into_capture_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            folder = "print-20260803-alert-migration"
+            transient = "d" * 16
+            old_id = ac.hashlib.sha256(f"vision-verification:{transient}".encode()).hexdigest()[:32]
+            new_id = ac.hashlib.sha256(f"vision-verification:{folder}".encode()).hexdigest()[:32]
+            app.state["camera"]["captures"] = [{
+                "file": "layer-00005-20260803-010101.jpg", "folder": folder,
+                "print_id": transient, "layer": 5,
+                "object_map": {"objects": [{"id": "2565"}]},
+                "visual_verification": {"status": "unverified"},
+            }]
+            app.state["camera"]["verification_alerts"] = [
+                {"id": old_id, "status": "open", "session_key": transient, "layer": 5},
+                {"id": new_id, "status": "open", "session_key": folder,
+                 "layer": 15, "checkpoints": [5, 10, 15]},
+            ]
+            with mock.patch.object(ac.threading, "Thread") as worker:
+                app._schedule_recent_visual_audit()
+            old, current = app.state["camera"]["verification_alerts"]
+            self.assertEqual("superseded", old["status"])
+            self.assertEqual(new_id, old["superseded_by"])
+            self.assertEqual([5, 10, 15], current["checkpoints"])
+            worker.assert_not_called()
 
     def test_startup_restores_unlimited_vision_history_from_local_jpegs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1477,11 +1555,11 @@ class CompanionTests(unittest.TestCase):
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("3.8.5", report["application"]["version"])
+                self.assertEqual("3.8.6", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
                 self.assertIn("Poste de supervision", html)
                 self.assertIn("Historique Vision et rapports", html)
-                self.assertIn("Compteur local v3.8.5", html)
+                self.assertIn("Compteur local v3.8.6", html)
                 self.assertIn("shutdownCard.after(auditCard)", html)
                 self.assertIn("auditCard.after(reportsCard)", html)
                 snapshot_request = urllib.request.Request(
