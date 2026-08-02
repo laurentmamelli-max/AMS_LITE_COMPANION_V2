@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.7.0 — 2026-08-02
+
+- Les trois vues d’un point de capture sont désormais séparées par des pauses
+  aléatoires (4 à 24 secondes) afin d’obtenir des positions de tête variées.
+- Le bouton Vision compare maintenant l’image de départ d’une impression à la
+  capture ouverte, pour rendre son évolution visible dans le temps. Il ne
+  dessine toujours aucune projection ou zone rouge non fiable.
+
 ## 3.6.1 — 2026-08-02
 
 - Correctif Centre Vision : deux captures de la même couche sont désormais

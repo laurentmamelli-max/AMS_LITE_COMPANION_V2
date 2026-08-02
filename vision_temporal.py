@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Read-only comparison of multiple Bambu camera views from one layer.
+"""Read-only comparison between the first and current Bambu camera frames.
 
 The camera is attached to the moving print head.  Its pose changes between
 captures, so a red difference map would imply a plate alignment we cannot
 prove from every image.  The Centre Vision therefore presents the genuine
-views side by side for human review; it never triggers a printer action.
+initial and current images side by side for human review; it never triggers a
+printer action.
 """
 
 from __future__ import annotations
@@ -35,14 +36,14 @@ def _side_by_side(reference: Any, candidate: Any, cv2: Any, numpy: Any) -> dict[
     display_size = (max(1, round(width * scale)), max(1, round(height * scale)))
     left = cv2.resize(reference, display_size, interpolation=cv2.INTER_AREA)
     right = cv2.resize(candidate, display_size, interpolation=cv2.INTER_AREA)
-    cv2.putText(left, "Vue de reference", (14, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(right, "Autre point de vue", (14, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(left, "Image de depart", (14, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(right, "Image courante", (14, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (255, 255, 255), 2, cv2.LINE_AA)
     ok, encoded = cv2.imencode(".jpg", numpy.hstack([left, right]), [cv2.IMWRITE_JPEG_QUALITY, 88])
     if not ok:
         raise TemporalVisionError("Prévisualisation de comparaison impossible")
     return {
         "aligned": False, "matches": 0, "inliers": 0, "regions": [],
-        "message": "Vues côte à côte : aucun rouge n’est affiché sans recalage fiable de la plaque.",
+        "message": "Image de départ et image courante côte à côte : aucun rouge n’est affiché sans recalage fiable de la plaque.",
         "preview_data_url": "data:image/jpeg;base64," + base64.b64encode(encoded.tobytes()).decode("ascii"),
     }
 

@@ -19,6 +19,7 @@ import io
 import json
 import os
 import queue
+import random
 import re
 import secrets
 import signal
@@ -61,7 +62,7 @@ EVENTS_FILE = APP_DIR / "events.sqlite3"
 AUTOPILOT_FILE = APP_DIR / "autopilot.sqlite3"
 REPORTS_FILE = APP_DIR / "reports.sqlite3"
 HOST, PORT = "127.0.0.1", 8766
-__version__ = "3.6.1"
+__version__ = "3.7.0"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -301,10 +302,11 @@ def default_state() -> dict[str, Any]:
             "certificate_sha256": "",
             "capture_every_layers": 5,
             # A single frame at a layer boundary often catches the toolhead in
-            # the same place.  Keep a short read-only sequence so the next
-            # moves reveal the parts that were temporarily obscured.
+            # the same place. Keep a short sequence with random pauses so the
+            # head position varies naturally.
             "capture_views_per_layer": 3,
-            "capture_view_delay_seconds": 7,
+            "capture_view_delay_min_seconds": 4,
+            "capture_view_delay_max_seconds": 24,
             "last_seen_layer": 0,
             "last_requested_layer": 0,
             "status": "Caméra non configurée",
@@ -2247,7 +2249,8 @@ class Companion:
                 "status": state.get("camera", {}).get("status", ""),
                 "capture_every_layers": state.get("camera", {}).get("capture_every_layers", 5),
                 "capture_views_per_layer": state.get("camera", {}).get("capture_views_per_layer", 3),
-                "capture_view_delay_seconds": state.get("camera", {}).get("capture_view_delay_seconds", 7),
+                "capture_view_delay_min_seconds": state.get("camera", {}).get("capture_view_delay_min_seconds", 4),
+                "capture_view_delay_max_seconds": state.get("camera", {}).get("capture_view_delay_max_seconds", 24),
                 "storage": state.get("vision_storage", {}),
             },
             "guardian": state.get("guardian", {}),
@@ -2497,11 +2500,11 @@ class Companion:
         return {"detected": True, "similarity": float(result.get("similarity") or 0), "objects": clean}
 
     def compare_vision_captures(self, reference_filename: str, candidate_filename: str) -> dict[str, Any]:
-        """Compare two views of the same layer after local plate registration.
+        """Compare the initial frame of one print with its current frame.
 
-        This is intentionally independent of the 3MF silhouette matcher: it
-        answers the practical question "what became visible or changed between
-        these two camera positions?" and remains visual evidence only.
+        The moving camera has no stable plate pose, so this deliberately keeps
+        the two authentic images side by side. It answers the useful review
+        question "what has appeared since the beginning of this print?".
         """
         if reference_filename == candidate_filename:
             raise ValueError("Choisissez deux captures différentes à comparer")
@@ -2517,8 +2520,8 @@ class Companion:
                 (reference.get("folder") and reference.get("folder") == candidate.get("folder"))
                 or (reference.get("print_id") and reference.get("print_id") == candidate.get("print_id"))
             )
-            if not same_print or int(reference.get("layer", -1)) != int(candidate.get("layer", -2)):
-                raise ValueError("Les comparaisons sont limitées aux vues d’une même couche et impression")
+            if not same_print:
+                raise ValueError("Les comparaisons sont limitées aux images d’une même impression")
         runtime = self.state_path.parent / "vision-runtime"
         if runtime.is_dir() and str(runtime) not in sys.path:
             sys.path.insert(0, str(runtime))
@@ -2527,7 +2530,11 @@ class Companion:
         except ImportError as exc:
             raise RuntimeError("Module de comparaison Vision indisponible") from exc
         result = vision_temporal.compare(reference_path, candidate_path)
-        result.update({"reference": reference_filename, "candidate": candidate_filename})
+        result.update({
+            "reference": reference_filename, "candidate": candidate_filename,
+            "reference_layer": int(reference.get("layer", 0) or 0),
+            "candidate_layer": int(candidate.get("layer", 0) or 0),
+        })
         return result
 
     def observe_plate_guardian(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -3546,7 +3553,7 @@ class Companion:
             return {"ok": True, "deleted": deleted, "session_id": session_id}
 
     def _schedule_camera_capture_locked(self, report: dict[str, Any], state: str) -> None:
-        """Queue a short multi-view camera sequence at each layer interval."""
+        """Queue a randomized multi-view camera sequence at each interval."""
         # Vision is observational.  It must also cover a print already in
         # progress when Companion starts, even if the consumption bridge did
         # not arm that job first.
@@ -3575,7 +3582,7 @@ class Companion:
         if camera.get("capture_in_progress") or camera.get("pending_capture_layer"):
             camera["queued_capture_layer"] = layer
             camera["queued_capture_session_id"] = session_id
-            camera["status"] = f"Séquence en cours — couche {layer} mise en attente"
+            camera["status"] = f"Séquence aléatoire en cours — couche {layer} mise en attente"
             self.save()
             log(f"Caméra: séquence couche {layer} mise en attente")
             return
@@ -3583,11 +3590,11 @@ class Companion:
         camera["pending_capture_session_id"] = session_id
         camera["pending_capture_view"] = 0
         views = max(1, int(camera.get("capture_views_per_layer", 3) or 3))
-        camera["status"] = f"{views} vues demandées à la couche {layer}"
+        camera["status"] = f"{views} vues à délais aléatoires demandées à la couche {layer}"
         # Persist the request before starting the daemon.  A macOS relaunch
         # can otherwise kill the thread between this point and the JPEG save.
         self.save()
-        log(f"Caméra: séquence de {views} vues planifiée à la couche {layer}")
+        log(f"Caméra: séquence aléatoire de {views} vues planifiée à la couche {layer}")
         if camera.get("enabled") and camera.get("certificate_sha256"):
             threading.Thread(target=self._capture_pending_camera, daemon=True).start()
 
@@ -3608,7 +3615,8 @@ class Companion:
                     session_id = str(camera.get("pending_capture_session_id") or "")
                     view = int(camera.get("pending_capture_view", 0) or 0) + 1
                     views = max(1, int(camera.get("capture_views_per_layer", 3) or 3))
-                    delay = max(1, int(camera.get("capture_view_delay_seconds", 7) or 7))
+                    delay_min = max(1, int(camera.get("capture_view_delay_min_seconds", 4) or 4))
+                    delay_max = max(delay_min, int(camera.get("capture_view_delay_max_seconds", 24) or 24))
                     host = str(self.state["config"].get("ip") or "")
                     code = str(self.state["config"].get("access_code") or "")
                     fingerprint = str(camera.get("certificate_sha256") or "")
@@ -3668,10 +3676,14 @@ class Companion:
                         camera.pop("pending_capture_view", None)
                     self.save()
                 if more_views:
-                    # Deliberately wait between frames: the toolhead can move
-                    # significantly in this interval, yielding useful points
-                    # of view without ever issuing a printer command.
-                    time.sleep(delay)
+                    # A randomized pause avoids repeatedly sampling the same
+                    # toolhead phase. It changes no printer state.
+                    pause = random.randint(delay_min, delay_max)
+                    with self.lock:
+                        camera = self.state["camera"]
+                        camera["status"] = f"Vue {view}/{views} enregistrée — prochaine vue dans {pause} s"
+                        self.save()
+                    time.sleep(pause)
                     continue
 
                 with self.lock:
@@ -4102,7 +4114,7 @@ async function downloadArchivedReport(id){try{let response=await fetch('/api/rep
 createSpool=async function(){try{await api('/api/inventory/spools',{method:'POST',body:JSON.stringify({name:$('newSpoolName').value,material:$('newSpoolMaterial').value,brand:$('newSpoolBrand').value,color:$('newSpoolColor').value,initial_g:+$('newSpoolInitial').value,remaining_g:+$('newSpoolRemaining').value,storage_location:$('newSpoolLocation').value,low_stock_g:+$('newSpoolThreshold').value,created_at:$('newSpoolDate').value})});['newSpoolName','newSpoolMaterial','newSpoolBrand','newSpoolColor','newSpoolLocation'].forEach(id=>$(id).value='');delete $('newSpoolName').dataset.custom;catalogLoaded=false;msg('Bobine ajoutée au catalogue.');refresh()}catch(e){msg(e.message,true)}};
 const visionView=new URLSearchParams(location.search).get('vision')==='1';
 function openVision(){if(window.webkit?.messageHandlers?.companion)window.webkit.messageHandlers.companion.postMessage('openVision');else window.open('/?vision=1','ams-lite-vision')}
-function renderVision(s){let camera=s.camera||{},captures=camera.captures||[];$('visionStatus').textContent=camera.status||'Caméra non configurée';$('visionEnabled').checked=!!camera.enabled;$('visionFingerprint').value=camera.certificate_sha256||'';$('visionMeta').textContent=`Cadence : ${camera.capture_views_per_layer||3} vues espacées de ${camera.capture_view_delay_seconds||7} s toutes les ${camera.capture_every_layers||5} couches · dernière couche vue : ${camera.last_seen_layer||'—'}`;$('visionGallery').innerHTML=captures.length?captures.map(x=>`<article><b>Couche ${x.layer} · vue ${x.capture_view||1}/${x.capture_views_total||1}</b><br><span>${esc(x.captured_at)}</span><br><code>${esc(x.file)}</code></article>`).join(''):'<p>Aucune capture enregistrée.</p>'}
+function renderVision(s){let camera=s.camera||{},captures=camera.captures||[];$('visionStatus').textContent=camera.status||'Caméra non configurée';$('visionEnabled').checked=!!camera.enabled;$('visionFingerprint').value=camera.certificate_sha256||'';$('visionMeta').textContent=`Cadence : ${camera.capture_views_per_layer||3} vues avec pauses aléatoires de ${camera.capture_view_delay_min_seconds||4} à ${camera.capture_view_delay_max_seconds||24} s toutes les ${camera.capture_every_layers||5} couches · dernière couche vue : ${camera.last_seen_layer||'—'}`;$('visionGallery').innerHTML=captures.length?captures.map(x=>`<article><b>Couche ${x.layer} · vue ${x.capture_view||1}/${x.capture_views_total||1}</b><br><span>${esc(x.captured_at)}</span><br><code>${esc(x.file)}</code></article>`).join(''):'<p>Aucune capture enregistrée.</p>'}
 async function saveVision(){try{await api('/api/config',{method:'POST',body:JSON.stringify({camera_enabled:$('visionEnabled').checked,camera_certificate_sha256:$('visionFingerprint').value})});$('visionStatus').textContent='Configuration Vision enregistrée.'}catch(e){$('visionStatus').textContent=e.message}}
 async function discoverVision(){try{let result=await api('/api/camera/discover',{method:'POST',body:'{}'});$('visionFingerprint').value=result.fingerprint;$('visionStatus').textContent='Empreinte détectée. Vérifie-la puis enregistre la configuration.'}catch(e){$('visionStatus').textContent=e.message}}
 if(visionView){let button=document.createElement('button');button.className='secondary';button.textContent='Détecter la caméra';button.onclick=discoverVision;$('visionFingerprint').before(button)}
@@ -4132,18 +4144,18 @@ def render_vision_html(api_token: str) -> str:
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f4f5f6;color:#20242a;margin:0}main{max-width:1100px;margin:auto;padding:28px}section{background:#fff;border:1px solid #dfe3e7;border-radius:10px;padding:18px;margin-top:16px}button,input{font:inherit;box-sizing:border-box}button{padding:9px 13px;background:#00a23d;border:0;border-radius:7px;color:#fff;font-weight:600;cursor:pointer;margin:4px}.secondary{background:#59636e}.danger{background:#b5392e}.notice{padding:12px;border-radius:8px;background:#fff1e7;color:#934210;font-weight:600}.muted{color:#69717b}.warning{color:#9a3f10;font-weight:600}.fields{display:grid;grid-template-columns:repeat(2,minmax(120px,220px));gap:10px;align-items:end}.fields label{display:grid;gap:5px;font-size:13px}.fields input{padding:8px;border:1px solid #cbd1d7;border-radius:7px}#gallery{display:grid;gap:24px}.capture-group{border-top:1px solid #dfe3e7;padding-top:14px}.capture-group:first-child{border-top:0;padding-top:0}.capture-group-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.capture-group-head h3{margin:0}.capture-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin-top:10px}.capture-card{display:block;width:100%;padding:0;background:#fff;color:#20242a;text-align:left;border:1px solid #dfe3e7;overflow:hidden}.capture-card img{display:block;width:100%;aspect-ratio:4/3;object-fit:cover;background:#e9edf0}.capture-card div{padding:9px}.map-badge{display:inline-block;margin-top:5px;padding:2px 6px;border-radius:99px;background:#fff0ed;color:#a13228;font-size:11px}.capture-modal{position:fixed;inset:0;z-index:10;background:#000b;display:grid;place-items:center;padding:24px;box-sizing:border-box}.capture-modal[hidden]{display:none}.capture-dialog{position:relative;box-sizing:border-box;width:min(1120px,calc(100vw - 32px));max-height:calc(100vh - 32px);overflow:auto;background:#fff;border-radius:12px;padding:20px;box-shadow:0 12px 50px #0008}.capture-close{position:absolute;right:14px;top:8px;margin:0}.capture-stage{position:relative;display:inline-block;max-width:100%;margin-top:12px}.capture-stage.calibrating{cursor:crosshair}.capture-stage img{display:block;max-width:100%;max-height:66vh;border-radius:8px;background:#e9edf0}.capture-stage svg{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}.calibration-actions{display:flex;flex-wrap:wrap;gap:4px;margin:8px 0}.calibration-actions button{margin:0}.object-legend{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:7px;margin-top:12px}.object-legend:empty{display:none}.legend-item{display:flex;align-items:flex-start;gap:8px;width:100%;margin:0;padding:8px 10px;border:1px solid #dfe3e7;border-radius:8px;background:#fff;color:#20242a;text-align:left}.legend-item:hover,.legend-item.selected{border-color:#087535;background:#f2fbf5}.legend-swatch{flex:0 0 auto;width:22px;height:22px;border-radius:50%;display:grid;place-items:center;color:#fff;font-size:11px;font-weight:800}.legend-item b{display:block;font-size:12px;line-height:1.25}.legend-item small{display:block;margin-top:2px;color:#69717b;font-size:11px}.capture-info{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:14px}.capture-info div{background:#f5f7f8;border-radius:7px;padding:9px;overflow-wrap:anywhere}.capture-info b{display:block;font-size:12px;color:#66707a;margin-bottom:3px}.calibration-points{margin-top:8px;font-size:13px}.calibration-points b{color:#b5392e}@media(max-width:650px){main{padding:12px}.fields{grid-template-columns:1fr}.capture-dialog{padding:16px}}
 </style><main>
 <h1>Centre Vision</h1>
-<p class="notice">Captures automatiques périodiques : <strong>ce n’est pas une vidéo en direct</strong>. Trois vues espacées de sept secondes sont prises à la couche 5, puis toutes les 5 couches, afin de voir les objets masqués par la tête.</p>
+<p class="notice">Captures automatiques périodiques : <strong>ce n’est pas une vidéo en direct</strong>. Trois vues avec des pauses aléatoires sont prises à la couche 5, puis toutes les 5 couches, afin de voir les objets masqués par la tête.</p>
 <section><h2>Impression en cours</h2><p id="layerCounter" style="font-size:42px;font-weight:800;margin:4px 0;color:#087535">Couche —</p><p class="muted">Compteur reçu directement de l’imprimante.</p></section>
 <section><h2>Caméra</h2><p id="status">Chargement…</p><label><input id="enabled" type="checkbox"> Activer les captures automatiques (pas de flux vidéo)</label><p class="muted">Le Centre Vision se met à jour toutes les trois secondes après chaque nouvelle capture.</p><label>Empreinte TLS</label><input id="fingerprint" placeholder="Détecte-la automatiquement"><button class="secondary" onclick="discover()">Détecter la caméra</button><button onclick="saveCamera()">Enregistrer</button><p id="meta" class="muted"></p></section>
 <section><h2>Reconnaissance des formes 3MF</h2><p>Le moteur Vision reconstruit les silhouettes du plateau depuis le 3MF tranché et les cherche directement dans chaque capture. Il ne suit ni le fond, ni la tête de l’imprimante.</p><div class="fields"><label>Largeur G-code du plateau (mm)<input id="bedX" type="number" min="1" max="500" step="1" value="180"></label><label>Profondeur G-code du plateau (mm)<input id="bedY" type="number" min="1" max="500" step="1" value="180"></label></div><button class="secondary" onclick="installVisionEngine()">Installer le moteur de formes</button><button class="secondary" onclick="startAutoCalibration()">Rechercher les formes dans cette capture</button><button class="secondary" onclick="startCalibration()">Réglage manuel de secours…</button><p id="calibrationStatus" class="muted">Si aucune forme n’est assez sûre ou si les pièces sont masquées, aucun contour n’est affiché.</p></section>
 <section><h2>Captures par impression</h2><div id="gallery"></div></section></main>
-<div id="captureModal" class="capture-modal" hidden onclick="if(event.target===this)closeCapture()"><section class="capture-dialog"><button class="secondary capture-close" onclick="closeCapture()">Fermer</button><h2 id="captureTitle">Capture</h2><button id="compareTemporalButton" class="secondary" onclick="compareTemporalViews()">Comparer les vues de cette couche</button><button id="autoCalibrateCaptureButton" onclick="startAutoCalibration()">Rechercher les formes 3MF</button><button id="calibrateCaptureButton" onclick="startCalibration()">Réglage manuel de secours</button><div id="calibrationActions" class="calibration-actions" hidden><button class="secondary" onclick="undoCalibrationPoint()">Annuler le dernier coin</button><button class="secondary" onclick="skipCalibrationCorner()">Ce coin est hors champ</button><button class="danger" onclick="startCalibration()">Recommencer</button></div><p id="overlayNotice" class="muted"></p><div id="temporalComparison" class="temporal-comparison" hidden></div><div id="captureStage" class="capture-stage"><img id="captureLarge" alt="Capture agrandie"><svg id="captureOverlay" viewBox="0 0 1 1" preserveAspectRatio="none"></svg></div><div id="objectLegend" class="object-legend" aria-label="Légende des objets cartographiés"></div><p id="calibrationPoints" class="calibration-points"></p><div id="captureInfo" class="capture-info"></div></section></div>
+<div id="captureModal" class="capture-modal" hidden onclick="if(event.target===this)closeCapture()"><section class="capture-dialog"><button class="secondary capture-close" onclick="closeCapture()">Fermer</button><h2 id="captureTitle">Capture</h2><button id="compareTemporalButton" class="secondary" onclick="compareTemporalViews()">Comparer à l’image de départ</button><button id="autoCalibrateCaptureButton" onclick="startAutoCalibration()">Rechercher les formes 3MF</button><button id="calibrateCaptureButton" onclick="startCalibration()">Réglage manuel de secours</button><div id="calibrationActions" class="calibration-actions" hidden><button class="secondary" onclick="undoCalibrationPoint()">Annuler le dernier coin</button><button class="secondary" onclick="skipCalibrationCorner()">Ce coin est hors champ</button><button class="danger" onclick="startCalibration()">Recommencer</button></div><p id="overlayNotice" class="muted"></p><div id="temporalComparison" class="temporal-comparison" hidden></div><div id="captureStage" class="capture-stage"><img id="captureLarge" alt="Capture agrandie"><svg id="captureOverlay" viewBox="0 0 1 1" preserveAspectRatio="none"></svg></div><div id="objectLegend" class="object-legend" aria-label="Légende des objets cartographiés"></div><p id="calibrationPoints" class="calibration-points"></p><div id="captureInfo" class="capture-info"></div></section></div>
 <script>
 const token=__API_TOKEN__,statusEl=document.getElementById('status'),enabledEl=document.getElementById('enabled'),fingerprintEl=document.getElementById('fingerprint'),metaEl=document.getElementById('meta'),galleryEl=document.getElementById('gallery'),modalEl=document.getElementById('captureModal'),titleEl=document.getElementById('captureTitle'),largeEl=document.getElementById('captureLarge'),stageEl=document.getElementById('captureStage'),overlayEl=document.getElementById('captureOverlay'),overlayNoticeEl=document.getElementById('overlayNotice'),legendEl=document.getElementById('objectLegend'),infoEl=document.getElementById('captureInfo'),temporalEl=document.getElementById('temporalComparison'),calibrationStatusEl=document.getElementById('calibrationStatus'),calibrationPointsEl=document.getElementById('calibrationPoints'),calibrationActionsEl=document.getElementById('calibrationActions'),bedXEl=document.getElementById('bedX'),bedYEl=document.getElementById('bedY'),layerCounterEl=document.getElementById('layerCounter');
 let visionState=null,currentCapture=null,currentPlatePoints=null,currentShapeObjects=[],currentPlateMessage='',calibrationMode=false,calibrationPoints=[],calibrationEdgePoints=[],hiddenCornerIndex=-1,selectedObjectIndex=-1;const calibrationKey='ams-lite-vision-plate-calibration-v1';
 async function api(path,opt={}){const response=await fetch(path,{...opt,headers:{'X-AMS-Token':token,'Content-Type':'application/json'}}),body=await response.json();if(!response.ok)throw Error(body.error||'Erreur');return body}
 function esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function captureURL(file){return `/api/captures/${encodeURIComponent(file)}?token=${encodeURIComponent(token)}`}
-async function compareTemporalViews(){if(!currentCapture||modalEl.hidden)return;const alternatives=(window.visionCaptures||[]).filter(item=>item&&item.file!==currentCapture.file&&Number(item.layer)===Number(currentCapture.layer)&&((item.folder&&item.folder===currentCapture.folder)||(item.print_id&&item.print_id===currentCapture.print_id))).sort((a,b)=>String(b.captured_at||'').localeCompare(String(a.captured_at||'')));const candidate=alternatives[0];if(!candidate){temporalEl.hidden=false;temporalEl.textContent='Aucune autre vue de cette même couche n’est encore disponible.';return}temporalEl.hidden=false;temporalEl.textContent='Préparation des deux vues…';try{const result=await api('/api/vision/temporal/compare',{method:'POST',body:JSON.stringify({reference:currentCapture.file,candidate:candidate.file})});temporalEl.innerHTML=`<b>Comparaison vue ${currentCapture.capture_view||1} ↔ vue ${candidate.capture_view||1}</b><br><span class="muted">${esc(result.message||'Deux points de vue réels de la même couche, à comparer visuellement.')}</span><img style="display:block;width:100%;margin-top:9px;border-radius:7px" alt="Deux vues réelles de la même couche" src="${result.preview_data_url}">`}catch(error){temporalEl.textContent=error.message||'Comparaison des vues impossible.'}}
+async function compareTemporalViews(){if(!currentCapture||modalEl.hidden)return;const samePrint=(window.visionCaptures||[]).filter(item=>item&&((item.folder&&item.folder===currentCapture.folder)||(item.print_id&&item.print_id===currentCapture.print_id))).sort((a,b)=>String(a.captured_at||'').localeCompare(String(b.captured_at||'')));const reference=samePrint[0];if(!reference){temporalEl.hidden=false;temporalEl.textContent='Aucune image de départ n’est disponible pour cette impression.';return}if(reference.file===currentCapture.file){temporalEl.hidden=false;temporalEl.textContent='C’est déjà l’image de départ. Ouvre une capture plus récente pour voir l’évolution.';return}temporalEl.hidden=false;temporalEl.textContent='Préparation de l’image de départ et de l’image courante…';try{const result=await api('/api/vision/temporal/compare',{method:'POST',body:JSON.stringify({reference:reference.file,candidate:currentCapture.file})});temporalEl.innerHTML=`<b>Évolution : couche ${result.reference_layer||reference.layer} ↔ couche ${result.candidate_layer||currentCapture.layer}</b><br><span class="muted">${esc(result.message||'Image de départ et image courante à comparer visuellement.')}</span><img style="display:block;width:100%;margin-top:9px;border-radius:7px" alt="Image de départ et image courante" src="${result.preview_data_url}">`}catch(error){temporalEl.textContent=error.message||'Comparaison des images impossible.'}}
 function loadCalibration(){try{const value=JSON.parse(localStorage.getItem(calibrationKey)||'null');if(value&&Array.isArray(value.points)&&value.points.length===4)return value}catch(_){ }return null}function calibration(){const value=loadCalibration();if(value){bedXEl.value=value.width||180;bedYEl.value=value.height||180}return value}
 function setCalibrationStatus(message,isWarning=false){calibrationStatusEl.textContent=message;calibrationStatusEl.className=isWarning?'warning':'muted'}
 function solve(matrix,vector){const n=vector.length,a=matrix.map((row,i)=>row.slice().concat(vector[i]));for(let col=0;col<n;col++){let pivot=col;for(let row=col+1;row<n;row++)if(Math.abs(a[row][col])>Math.abs(a[pivot][col]))pivot=row;if(Math.abs(a[pivot][col])<1e-9)return null;[a[col],a[pivot]]=[a[pivot],a[col]];const scale=a[col][col];for(let j=col;j<=n;j++)a[col][j]/=scale;for(let row=0;row<n;row++)if(row!==col){const factor=a[row][col];for(let j=col;j<=n;j++)a[row][j]-=factor*a[col][j]}}return a.map(row=>row[n])}
@@ -4172,7 +4184,7 @@ function undoCalibrationPoint(){if(!calibrationMode)return;if(calibrationEdgePoi
 function skipCalibrationCorner(){if(!calibrationMode||calibrationPoints.length>=4)return;if(hiddenCornerIndex>=0){setCalibrationStatus('Un seul coin hors champ peut être reconstruit. Recommence avec une capture où les trois autres coins sont visibles.',true);return}hiddenCornerIndex=calibrationPoints.length;calibrationPoints.push(null);renderCalibrationProgress()}
 largeEl.addEventListener('click',event=>{if(!calibrationMode)return;const box=largeEl.getBoundingClientRect(),x=(event.clientX-box.left)/box.width,y=(event.clientY-box.top)/box.height;if(x<0||x>1||y<0||y>1)return;if(calibrationPoints.length<4)calibrationPoints.push([x,y]);else if(hiddenCornerIndex>=0&&calibrationEdgePoints.length<2)calibrationEdgePoints.push([x,y]);else return;renderCalibrationProgress();finishCalibration()});
 function clearCalibration(){localStorage.removeItem(calibrationKey);calibrationMode=false;calibrationPoints=[];calibrationEdgePoints=[];hiddenCornerIndex=-1;setCalibrationStatus('Calibration effacée.');renderCalibrationProgress();drawOverlay()}
-function render(state){visionState=state;const printer=state.printer||{},camera=state.camera||{},captures=Array.isArray(camera.captures)?camera.captures:[],storage=state.vision_storage||{};const views=camera.capture_views_per_layer||3,delay=camera.capture_view_delay_seconds||7;layerCounterEl.textContent=Number(printer.layer)>0?`Couche ${Number(printer.layer)}`:'Couche —';statusEl.textContent=camera.status||'Caméra non configurée';enabledEl.checked=!!camera.enabled;fingerprintEl.value=camera.certificate_sha256||'';metaEl.textContent=`Captures, pas vidéo : ${views} vues espacées de ${delay} s toutes les ${camera.capture_every_layers||5} couches · dernière couche reçue : ${camera.last_seen_layer||'—'} · ${storage.count||0} image(s).`;window.visionCaptures=captures;const groups=new Map();captures.forEach((item,index)=>{const key=item.folder||'en-cours';if(!groups.has(key))groups.set(key,{name:item.print_name||(item.folder?'Impression terminée':'Impression en cours'),items:[]});groups.get(key).items.push({item,index})});galleryEl.innerHTML=captures.length?[...groups.values()].map(group=>`<div class="capture-group"><div class="capture-group-head"><div><h3>${esc(group.name)}</h3><span>${group.items.length} image(s)</span></div></div><div class="capture-grid">${group.items.map(({item,index})=>{const objectCount=objectsFor(item).length;return `<button class="capture-card" onclick="openCapture(${index})"><img src="${captureURL(item.file)}" alt="Capture couche ${item.layer}, vue ${item.capture_view||1}"><div><b>Couche ${item.layer} · vue ${item.capture_view||1}/${item.capture_views_total||1}</b><br><span class="muted">${esc(item.captured_at)}</span>${objectCount?`<br><span class="map-badge">${objectCount} objet(s) cartographié(s)</span>`:''}</div></button>`}).join('')}</div></div>`).join(''):'<p>Aucune capture : la première séquence sera prise à la couche 5, pas immédiatement au lancement.</p>';calibration();}
+function render(state){visionState=state;const printer=state.printer||{},camera=state.camera||{},captures=Array.isArray(camera.captures)?camera.captures:[],storage=state.vision_storage||{};const views=camera.capture_views_per_layer||3,delayMin=camera.capture_view_delay_min_seconds||4,delayMax=camera.capture_view_delay_max_seconds||24;layerCounterEl.textContent=Number(printer.layer)>0?`Couche ${Number(printer.layer)}`:'Couche —';statusEl.textContent=camera.status||'Caméra non configurée';enabledEl.checked=!!camera.enabled;fingerprintEl.value=camera.certificate_sha256||'';metaEl.textContent=`Captures, pas vidéo : ${views} vues avec pauses aléatoires de ${delayMin} à ${delayMax} s toutes les ${camera.capture_every_layers||5} couches · dernière couche reçue : ${camera.last_seen_layer||'—'} · ${storage.count||0} image(s).`;window.visionCaptures=captures;const groups=new Map();captures.forEach((item,index)=>{const key=item.folder||'en-cours';if(!groups.has(key))groups.set(key,{name:item.print_name||(item.folder?'Impression terminée':'Impression en cours'),items:[]});groups.get(key).items.push({item,index})});galleryEl.innerHTML=captures.length?[...groups.values()].map(group=>`<div class="capture-group"><div class="capture-group-head"><div><h3>${esc(group.name)}</h3><span>${group.items.length} image(s)</span></div></div><div class="capture-grid">${group.items.map(({item,index})=>{const objectCount=objectsFor(item).length;return `<button class="capture-card" onclick="openCapture(${index})"><img src="${captureURL(item.file)}" alt="Capture couche ${item.layer}, vue ${item.capture_view||1}"><div><b>Couche ${item.layer} · vue ${item.capture_view||1}/${item.capture_views_total||1}</b><br><span class="muted">${esc(item.captured_at)}</span>${objectCount?`<br><span class="map-badge">${objectCount} objet(s) cartographié(s)</span>`:''}</div></button>`}).join('')}</div></div>`).join(''):'<p>Aucune capture : la première séquence sera prise à la couche 5, pas immédiatement au lancement.</p>';calibration();}
 async function load(){try{render(await api('/api/state'))}catch(error){statusEl.textContent=error.message}}async function saveCamera(){try{await api('/api/config',{method:'POST',body:JSON.stringify({camera_enabled:enabledEl.checked,camera_certificate_sha256:fingerprintEl.value})});await load()}catch(error){statusEl.textContent=error.message}}async function discover(){try{fingerprintEl.value=(await api('/api/camera/discover',{method:'POST',body:'{}'})).fingerprint;statusEl.textContent='Empreinte détectée : enregistre-la pour l’approuver.'}catch(error){statusEl.textContent=error.message}}document.addEventListener('keydown',event=>{if(event.key==='Escape')closeCapture()});load();setInterval(load,3000);
 </script></html>'''.replace("__API_TOKEN__", json.dumps(api_token))
 

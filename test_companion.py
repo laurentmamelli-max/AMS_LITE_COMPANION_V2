@@ -231,6 +231,7 @@ class CompanionTests(unittest.TestCase):
             self.assertEqual(5, app.state["camera"]["pending_capture_layer"])
             self.assertEqual(0, app.state["camera"]["pending_capture_view"])
             self.assertEqual(3, app.state["camera"]["capture_views_per_layer"])
+            self.assertLess(app.state["camera"]["capture_view_delay_min_seconds"], app.state["camera"]["capture_view_delay_max_seconds"])
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "cam", "layer_num": 5}})
             self.assertEqual(5, app.state["camera"]["last_requested_layer"])
 
@@ -376,7 +377,7 @@ class CompanionTests(unittest.TestCase):
             self.assertTrue(result["detected"])
             self.assertEqual(5, len(result["objects"][0]["contours"][0]))
 
-    def test_temporal_vision_compares_only_views_of_same_print_layer(self):
+    def test_temporal_vision_compares_initial_and_current_images_of_same_print(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             app = ac.Companion(root / "state.json")
@@ -396,6 +397,11 @@ class CompanionTests(unittest.TestCase):
             self.assertEqual(reference, result["reference"])
             self.assertEqual(candidate, result["candidate"])
             app.state["camera"]["captures"][1]["layer"] = 10
+            with mock.patch.dict(sys.modules, {"vision_temporal": engine}):
+                result = app.compare_vision_captures(reference, candidate)
+            self.assertEqual(5, result["reference_layer"])
+            self.assertEqual(10, result["candidate_layer"])
+            app.state["camera"]["captures"][1]["folder"] = "print-other"
             with self.assertRaises(ValueError):
                 app.compare_vision_captures(reference, candidate)
 
@@ -439,11 +445,13 @@ class CompanionTests(unittest.TestCase):
                 "pending_capture_session_id": "vision-session",
                 "pending_capture_view": 0,
                 "capture_views_per_layer": 3,
-                "capture_view_delay_seconds": 7,
+                "capture_view_delay_min_seconds": 4,
+                "capture_view_delay_max_seconds": 24,
             })
             frame = SimpleNamespace(jpeg=b"jpeg-data", sha256="b" * 64)
             with mock.patch.object(ac, "capture_jpeg", return_value=frame) as capture, \
                     mock.patch.object(ac.time, "sleep") as sleep, \
+                    mock.patch.object(ac.random, "randint", side_effect=[6, 19]) as randint, \
                     mock.patch.object(ac.time, "strftime", side_effect=[
                         "20260802-010101", "2026-08-02T01:01:01+0200",
                         "20260802-010108", "2026-08-02T01:01:08+0200",
@@ -456,6 +464,8 @@ class CompanionTests(unittest.TestCase):
             self.assertTrue(all(item["layer"] == 5 for item in captures))
             self.assertEqual(3, capture.call_count)
             self.assertEqual(2, sleep.call_count)
+            self.assertEqual([mock.call(6), mock.call(19)], sleep.call_args_list)
+            self.assertEqual(2, randint.call_count)
             self.assertEqual(0, app.state["camera"]["pending_capture_layer"])
             self.assertEqual("", app.state["camera"]["pending_capture_session_id"])
 
@@ -489,7 +499,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("3.6.1", report["application"]["version"])
+            self.assertEqual("3.7.0", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -1431,11 +1441,11 @@ class CompanionTests(unittest.TestCase):
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("3.6.1", report["application"]["version"])
+                self.assertEqual("3.7.0", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
                 self.assertIn("Poste de supervision", html)
                 self.assertIn("Historique Vision et rapports", html)
-                self.assertIn("Compteur local v3.6.1", html)
+                self.assertIn("Compteur local v3.7.0", html)
                 self.assertIn("shutdownCard.after(auditCard)", html)
                 self.assertIn("auditCard.after(reportsCard)", html)
                 snapshot_request = urllib.request.Request(

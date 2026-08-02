@@ -28,8 +28,8 @@ estimations et peuvent être corrigés manuellement après une pesée.
 ## Points principaux
 
 - application native macOS avec un Centre Vision indépendant ;
-- séquences de trois captures caméra locales espacées de sept secondes toutes les cinq couches, regroupées par impression ;
-- comparaison locale côte à côte de deux vues d’une même couche, pour révéler les objets masqués par la tête sans projection ni différence géométrique trompeuse ;
+- séquences de trois captures caméra locales avec des pauses aléatoires, toutes les cinq couches, regroupées par impression ;
+- comparaison locale côte à côte entre l’image de départ et l’image courante d’une même impression, sans projection ni différence géométrique trompeuse ;
 - cartographie des objets Bambu Studio, alertes Vision locales et exclusion
   unitaire disponible uniquement après un choix manuel, une confirmation et
   une connexion MQTT d’impression active ;
