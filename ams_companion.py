@@ -61,7 +61,7 @@ EVENTS_FILE = APP_DIR / "events.sqlite3"
 AUTOPILOT_FILE = APP_DIR / "autopilot.sqlite3"
 REPORTS_FILE = APP_DIR / "reports.sqlite3"
 HOST, PORT = "127.0.0.1", 8766
-__version__ = "3.5.1"
+__version__ = "3.6.0"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -2496,6 +2496,40 @@ class Companion:
             return {"detected": False, "message": "Aucune forme reconnue ne correspond aux objets G-code"}
         return {"detected": True, "similarity": float(result.get("similarity") or 0), "objects": clean}
 
+    def compare_vision_captures(self, reference_filename: str, candidate_filename: str) -> dict[str, Any]:
+        """Compare two views of the same layer after local plate registration.
+
+        This is intentionally independent of the 3MF silhouette matcher: it
+        answers the practical question "what became visible or changed between
+        these two camera positions?" and remains visual evidence only.
+        """
+        if reference_filename == candidate_filename:
+            raise ValueError("Choisissez deux captures différentes à comparer")
+        reference_path = self._vision_capture_path(reference_filename)
+        candidate_path = self._vision_capture_path(candidate_filename)
+        with self.lock:
+            captures = self.state.get("camera", {}).get("captures", [])
+            reference = next((item for item in captures if isinstance(item, dict) and item.get("file") == reference_filename), None)
+            candidate = next((item for item in captures if isinstance(item, dict) and item.get("file") == candidate_filename), None)
+            if not isinstance(reference, dict) or not isinstance(candidate, dict):
+                raise FileNotFoundError("Capture Vision introuvable")
+            same_print = (
+                (reference.get("folder") and reference.get("folder") == candidate.get("folder"))
+                or (reference.get("print_id") and reference.get("print_id") == candidate.get("print_id"))
+            )
+            if not same_print or int(reference.get("layer", -1)) != int(candidate.get("layer", -2)):
+                raise ValueError("Les comparaisons sont limitées aux vues d’une même couche et impression")
+        runtime = self.state_path.parent / "vision-runtime"
+        if runtime.is_dir() and str(runtime) not in sys.path:
+            sys.path.insert(0, str(runtime))
+        try:
+            import vision_temporal
+        except ImportError as exc:
+            raise RuntimeError("Module de comparaison Vision indisponible") from exc
+        result = vision_temporal.compare(reference_path, candidate_path)
+        result.update({"reference": reference_filename, "candidate": candidate_filename})
+        return result
+
     def observe_plate_guardian(self, data: dict[str, Any]) -> dict[str, Any]:
         """Accept detector evidence; the guardian has no printer-control path."""
         with self.lock:
@@ -3899,6 +3933,11 @@ class Handler(BaseHTTPRequestHandler):
                     # expected Vision outcome, not an invalid browser request.
                     result = {"detected": False, "message": str(exc)}
                 self.send_json(result)
+            elif path == "/api/vision/temporal/compare":
+                body = self.json_body()
+                self.send_json(self.app.compare_vision_captures(
+                    str(body.get("reference") or ""), str(body.get("candidate") or ""),
+                ))
             elif path == "/api/vision/calibration/capture":
                 self.json_body()
                 self.send_json(self.app.capture_calibration_frame())
@@ -4098,12 +4137,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 <section><h2>Caméra</h2><p id="status">Chargement…</p><label><input id="enabled" type="checkbox"> Activer les captures automatiques (pas de flux vidéo)</label><p class="muted">Le Centre Vision se met à jour toutes les trois secondes après chaque nouvelle capture.</p><label>Empreinte TLS</label><input id="fingerprint" placeholder="Détecte-la automatiquement"><button class="secondary" onclick="discover()">Détecter la caméra</button><button onclick="saveCamera()">Enregistrer</button><p id="meta" class="muted"></p></section>
 <section><h2>Reconnaissance des formes 3MF</h2><p>Le moteur Vision reconstruit les silhouettes du plateau depuis le 3MF tranché et les cherche directement dans chaque capture. Il ne suit ni le fond, ni la tête de l’imprimante.</p><div class="fields"><label>Largeur G-code du plateau (mm)<input id="bedX" type="number" min="1" max="500" step="1" value="180"></label><label>Profondeur G-code du plateau (mm)<input id="bedY" type="number" min="1" max="500" step="1" value="180"></label></div><button class="secondary" onclick="installVisionEngine()">Installer le moteur de formes</button><button class="secondary" onclick="startAutoCalibration()">Rechercher les formes dans cette capture</button><button class="secondary" onclick="startCalibration()">Réglage manuel de secours…</button><p id="calibrationStatus" class="muted">Si aucune forme n’est assez sûre ou si les pièces sont masquées, aucun contour n’est affiché.</p></section>
 <section><h2>Captures par impression</h2><div id="gallery"></div></section></main>
-<div id="captureModal" class="capture-modal" hidden onclick="if(event.target===this)closeCapture()"><section class="capture-dialog"><button class="secondary capture-close" onclick="closeCapture()">Fermer</button><h2 id="captureTitle">Capture</h2><button id="autoCalibrateCaptureButton" onclick="startAutoCalibration()">Rechercher les formes 3MF</button><button id="calibrateCaptureButton" onclick="startCalibration()">Réglage manuel de secours</button><div id="calibrationActions" class="calibration-actions" hidden><button class="secondary" onclick="undoCalibrationPoint()">Annuler le dernier coin</button><button class="secondary" onclick="skipCalibrationCorner()">Ce coin est hors champ</button><button class="danger" onclick="startCalibration()">Recommencer</button></div><p id="overlayNotice" class="muted"></p><div id="captureStage" class="capture-stage"><img id="captureLarge" alt="Capture agrandie"><svg id="captureOverlay" viewBox="0 0 1 1" preserveAspectRatio="none"></svg></div><div id="objectLegend" class="object-legend" aria-label="Légende des objets cartographiés"></div><p id="calibrationPoints" class="calibration-points"></p><div id="captureInfo" class="capture-info"></div></section></div>
+<div id="captureModal" class="capture-modal" hidden onclick="if(event.target===this)closeCapture()"><section class="capture-dialog"><button class="secondary capture-close" onclick="closeCapture()">Fermer</button><h2 id="captureTitle">Capture</h2><button id="compareTemporalButton" class="secondary" onclick="compareTemporalViews()">Comparer les vues de cette couche</button><button id="autoCalibrateCaptureButton" onclick="startAutoCalibration()">Rechercher les formes 3MF</button><button id="calibrateCaptureButton" onclick="startCalibration()">Réglage manuel de secours</button><div id="calibrationActions" class="calibration-actions" hidden><button class="secondary" onclick="undoCalibrationPoint()">Annuler le dernier coin</button><button class="secondary" onclick="skipCalibrationCorner()">Ce coin est hors champ</button><button class="danger" onclick="startCalibration()">Recommencer</button></div><p id="overlayNotice" class="muted"></p><div id="temporalComparison" class="temporal-comparison" hidden></div><div id="captureStage" class="capture-stage"><img id="captureLarge" alt="Capture agrandie"><svg id="captureOverlay" viewBox="0 0 1 1" preserveAspectRatio="none"></svg></div><div id="objectLegend" class="object-legend" aria-label="Légende des objets cartographiés"></div><p id="calibrationPoints" class="calibration-points"></p><div id="captureInfo" class="capture-info"></div></section></div>
 <script>
-const token=__API_TOKEN__,statusEl=document.getElementById('status'),enabledEl=document.getElementById('enabled'),fingerprintEl=document.getElementById('fingerprint'),metaEl=document.getElementById('meta'),galleryEl=document.getElementById('gallery'),modalEl=document.getElementById('captureModal'),titleEl=document.getElementById('captureTitle'),largeEl=document.getElementById('captureLarge'),stageEl=document.getElementById('captureStage'),overlayEl=document.getElementById('captureOverlay'),overlayNoticeEl=document.getElementById('overlayNotice'),legendEl=document.getElementById('objectLegend'),infoEl=document.getElementById('captureInfo'),calibrationStatusEl=document.getElementById('calibrationStatus'),calibrationPointsEl=document.getElementById('calibrationPoints'),calibrationActionsEl=document.getElementById('calibrationActions'),bedXEl=document.getElementById('bedX'),bedYEl=document.getElementById('bedY'),layerCounterEl=document.getElementById('layerCounter');
+const token=__API_TOKEN__,statusEl=document.getElementById('status'),enabledEl=document.getElementById('enabled'),fingerprintEl=document.getElementById('fingerprint'),metaEl=document.getElementById('meta'),galleryEl=document.getElementById('gallery'),modalEl=document.getElementById('captureModal'),titleEl=document.getElementById('captureTitle'),largeEl=document.getElementById('captureLarge'),stageEl=document.getElementById('captureStage'),overlayEl=document.getElementById('captureOverlay'),overlayNoticeEl=document.getElementById('overlayNotice'),legendEl=document.getElementById('objectLegend'),infoEl=document.getElementById('captureInfo'),temporalEl=document.getElementById('temporalComparison'),calibrationStatusEl=document.getElementById('calibrationStatus'),calibrationPointsEl=document.getElementById('calibrationPoints'),calibrationActionsEl=document.getElementById('calibrationActions'),bedXEl=document.getElementById('bedX'),bedYEl=document.getElementById('bedY'),layerCounterEl=document.getElementById('layerCounter');
 let visionState=null,currentCapture=null,currentPlatePoints=null,currentShapeObjects=[],currentPlateMessage='',calibrationMode=false,calibrationPoints=[],calibrationEdgePoints=[],hiddenCornerIndex=-1,selectedObjectIndex=-1;const calibrationKey='ams-lite-vision-plate-calibration-v1';
 async function api(path,opt={}){const response=await fetch(path,{...opt,headers:{'X-AMS-Token':token,'Content-Type':'application/json'}}),body=await response.json();if(!response.ok)throw Error(body.error||'Erreur');return body}
 function esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function captureURL(file){return `/api/captures/${encodeURIComponent(file)}?token=${encodeURIComponent(token)}`}
+async function compareTemporalViews(){if(!currentCapture||modalEl.hidden)return;const alternatives=(window.visionCaptures||[]).filter(item=>item&&item.file!==currentCapture.file&&Number(item.layer)===Number(currentCapture.layer)&&((item.folder&&item.folder===currentCapture.folder)||(item.print_id&&item.print_id===currentCapture.print_id))).sort((a,b)=>String(b.captured_at||'').localeCompare(String(a.captured_at||'')));const candidate=alternatives[0];if(!candidate){temporalEl.hidden=false;temporalEl.textContent='Aucune autre vue de cette même couche n’est encore disponible.';return}temporalEl.hidden=false;temporalEl.textContent='Recalage local des deux vues en cours…';try{const result=await api('/api/vision/temporal/compare',{method:'POST',body:JSON.stringify({reference:currentCapture.file,candidate:candidate.file})});temporalEl.innerHTML=`<b>Comparaison vue ${currentCapture.capture_view||1} ↔ vue ${candidate.capture_view||1}</b><br><span class="muted">${result.inliers} repères communs après recalage. Les zones rouges ont changé ou sont devenues visibles : vérifie-les visuellement.</span><img style="display:block;width:100%;margin-top:9px;border-radius:7px" alt="Comparaison temporelle des deux vues" src="${result.preview_data_url}">`}catch(error){temporalEl.textContent=error.message||'Comparaison des vues impossible.'}}
 function loadCalibration(){try{const value=JSON.parse(localStorage.getItem(calibrationKey)||'null');if(value&&Array.isArray(value.points)&&value.points.length===4)return value}catch(_){ }return null}function calibration(){const value=loadCalibration();if(value){bedXEl.value=value.width||180;bedYEl.value=value.height||180}return value}
 function setCalibrationStatus(message,isWarning=false){calibrationStatusEl.textContent=message;calibrationStatusEl.className=isWarning?'warning':'muted'}
 function solve(matrix,vector){const n=vector.length,a=matrix.map((row,i)=>row.slice().concat(vector[i]));for(let col=0;col<n;col++){let pivot=col;for(let row=col+1;row<n;row++)if(Math.abs(a[row][col])>Math.abs(a[pivot][col]))pivot=row;if(Math.abs(a[pivot][col])<1e-9)return null;[a[col],a[pivot]]=[a[pivot],a[col]];const scale=a[col][col];for(let j=col;j<=n;j++)a[col][j]/=scale;for(let row=0;row<n;row++)if(row!==col){const factor=a[row][col];for(let j=col;j<=n;j++)a[row][j]-=factor*a[col][j]}}return a.map(row=>row[n])}

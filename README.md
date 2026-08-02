@@ -29,6 +29,7 @@ estimations et peuvent être corrigés manuellement après une pesée.
 
 - application native macOS avec un Centre Vision indépendant ;
 - séquences de trois captures caméra locales espacées de sept secondes toutes les cinq couches, regroupées par impression ;
+- comparaison temporelle locale de deux vues d’une même couche : la plaque est recalée avant de mettre en évidence les zones nouvellement visibles ou modifiées ;
 - cartographie des objets Bambu Studio, alertes Vision locales et exclusion
   unitaire disponible uniquement après un choix manuel, une confirmation et
   une connexion MQTT d’impression active ;

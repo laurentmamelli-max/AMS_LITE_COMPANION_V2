@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.6.0 — 2026-08-02
+
+- Le Centre Vision compare maintenant deux vues d’une même couche. Il recale
+  d’abord la texture de la plaque avec ORB/RANSAC, puis affiche une image de
+  comparaison où les zones devenues visibles ou modifiées sont surlignées en
+  rouge. Cette preuve reste locale et demande toujours une vérification humaine.
+
 ## 3.5.1 — 2026-08-02
 
 - Correctif de fiabilité Vision : LINEMOD apprend maintenant 63 points de

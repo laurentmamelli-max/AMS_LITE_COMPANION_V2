@@ -288,6 +288,8 @@ class CompanionTests(unittest.TestCase):
         self.assertIn('function startAutoCalibration()', page)
         self.assertIn('function detectObjectShapes()', page)
         self.assertIn('/api/vision/shapes/detect', page)
+        self.assertIn('function compareTemporalViews()', page)
+        self.assertIn('/api/vision/temporal/compare', page)
         self.assertIn('item.contours', page)
         self.assertNotIn('b&&h?[[b.min_x', page)
         self.assertIn('Rechercher les formes 3MF', page)
@@ -373,6 +375,29 @@ class CompanionTests(unittest.TestCase):
                 result = app.detect_vision_object_shapes("frame.jpg")
             self.assertTrue(result["detected"])
             self.assertEqual(5, len(result["objects"][0]["contours"][0]))
+
+    def test_temporal_vision_compares_only_views_of_same_print_layer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = ac.Companion(root / "state.json")
+            reference, candidate = "layer-00005-20260802-010101.jpg", "layer-00005-20260802-010108.jpg"
+            app.state["camera"]["captures"] = [
+                {"file": reference, "layer": 5, "folder": "print-20260802-demo"},
+                {"file": candidate, "layer": 5, "folder": "print-20260802-demo"},
+            ]
+            app._vision_capture_path = lambda filename: root / filename  # type: ignore[method-assign]
+            engine = SimpleNamespace(compare=lambda first, second: {
+                "aligned": True, "matches": 40, "inliers": 25, "regions": [],
+                "preview_data_url": "data:image/jpeg;base64,AA==",
+            })
+            with mock.patch.dict(sys.modules, {"vision_temporal": engine}):
+                result = app.compare_vision_captures(reference, candidate)
+            self.assertTrue(result["aligned"])
+            self.assertEqual(reference, result["reference"])
+            self.assertEqual(candidate, result["candidate"])
+            app.state["camera"]["captures"][1]["layer"] = 10
+            with self.assertRaises(ValueError):
+                app.compare_vision_captures(reference, candidate)
 
     def test_camera_capture_lock_is_cleared_after_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -464,7 +489,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("3.5.1", report["application"]["version"])
+            self.assertEqual("3.6.0", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -1406,11 +1431,11 @@ class CompanionTests(unittest.TestCase):
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("3.5.1", report["application"]["version"])
+                self.assertEqual("3.6.0", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
                 self.assertIn("Poste de supervision", html)
                 self.assertIn("Historique Vision et rapports", html)
-                self.assertIn("Compteur local v3.5.1", html)
+                self.assertIn("Compteur local v3.6.0", html)
                 self.assertIn("shutdownCard.after(auditCard)", html)
                 self.assertIn("auditCard.after(reportsCard)", html)
                 snapshot_request = urllib.request.Request(
