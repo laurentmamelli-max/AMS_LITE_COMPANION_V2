@@ -1,5 +1,17 @@
 # Changelog
 
+## 3.8.0 — 2026-08-02
+
+- Le Centre Vision s’appuie désormais sur PrintGuard, moteur open source local
+  de détection de défauts d’impression, au lieu de présenter la comparaison de
+  vues mobiles comme une détection.
+- Chaque capture peut être analysée à la demande ou automatiquement ; son score
+  et son verdict sont conservés avec l’image. Un verdict de défaut crée une
+  alerte/popup de vérification uniquement.
+- PrintGuard reste une application distincte, limitée à `localhost`. Companion
+  ne lui transmet ni code LAN Bambu ni capacité de pause, annulation ou
+  exclusion. La cartographie 3MF est clairement ramenée à un repère manuel.
+
 ## 3.7.0 — 2026-08-02
 
 - Les trois vues d’un point de capture sont désormais séparées par des pauses

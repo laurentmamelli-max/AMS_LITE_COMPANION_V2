@@ -275,9 +275,10 @@ class CompanionTests(unittest.TestCase):
         self.assertIn('function openCapture(index)', page)
         self.assertIn('id="captureModal"', page)
         self.assertIn('ce n’est pas une vidéo en direct', page)
-        self.assertIn('Reconnaissance des formes 3MF', page)
-        self.assertIn('Installer le moteur de formes', page)
-        self.assertIn('Rechercher les formes dans cette capture', page)
+        self.assertIn('IA de détection PrintGuard', page)
+        self.assertIn('Tester PrintGuard', page)
+        self.assertIn('function classifyCurrentCapture()', page)
+        self.assertIn('Cartographie G-code (référence manuelle)', page)
         self.assertIn('Légende des objets cartographiés', page)
         self.assertIn('id="layerCounter"', page)
         self.assertIn('id="calibrateCaptureButton"', page)
@@ -293,7 +294,7 @@ class CompanionTests(unittest.TestCase):
         self.assertIn('/api/vision/temporal/compare', page)
         self.assertIn('item.contours', page)
         self.assertNotIn('b&&h?[[b.min_x', page)
-        self.assertIn('Rechercher les formes 3MF', page)
+        self.assertNotIn('Rechercher les formes 3MF', page)
         self.assertIn('id="objectLegend"', page)
         self.assertIn('function selectMappedObject(index)', page)
         self.assertNotIn('paint-order="stroke">${esc(object.label||object.id)}</text>', page)
@@ -499,7 +500,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("3.7.0", report["application"]["version"])
+            self.assertEqual("3.8.0", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -1441,11 +1442,11 @@ class CompanionTests(unittest.TestCase):
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("3.7.0", report["application"]["version"])
+                self.assertEqual("3.8.0", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
                 self.assertIn("Poste de supervision", html)
                 self.assertIn("Historique Vision et rapports", html)
-                self.assertIn("Compteur local v3.7.0", html)
+                self.assertIn("Compteur local v3.8.0", html)
                 self.assertIn("shutdownCard.after(auditCard)", html)
                 self.assertIn("auditCard.after(reportsCard)", html)
                 snapshot_request = urllib.request.Request(
@@ -1532,6 +1533,35 @@ class CompanionTests(unittest.TestCase):
                     server.shutdown()
                 thread.join(timeout=2)
                 server.server_close()
+
+
+    def test_printguard_is_local_alert_only_and_redacts_its_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.configure({
+                "printguard_enabled": True,
+                "printguard_base_url": "http://127.0.0.1:8000",
+                "printguard_token": "pg_secret",
+                "printguard_sensitivity": 1.2,
+            })
+            self.assertTrue(app.state["printguard"]["enabled"])
+            self.assertEqual("pg_secret", app.state["printguard"]["token"])
+            self.assertEqual("********", app.public_state()["printguard"]["token"])
+            with self.assertRaisesRegex(ValueError, "rester local"):
+                app.configure({"printguard_base_url": "https://example.invalid"})
+
+    def test_printguard_failure_becomes_a_review_only_alert(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.state["printguard"].update({
+                "enabled": True,
+                "last_result": {"prediction": "failure", "defect_score": 0.91,
+                                "frame_sha256": "a" * 64, "classified_at": "2026-08-02T10:00:00+0200"},
+            })
+            alerts = ac.build_alert_queue(app.public_state())
+            alert = next(item for item in alerts if item["source"] == "printguard")
+            self.assertEqual("review_only", alert["action"])
+            self.assertIn("aucune commande", alert["message"])
 
 
 if __name__ == "__main__":

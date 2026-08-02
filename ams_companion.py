@@ -46,6 +46,7 @@ from plate_guardian import PlateGuardian
 from bambu_camera import CameraError, capture_jpeg, discover_certificate_sha256
 from autopilot import AutoPilotPlanner
 from gcode_mapper import map_gcode_objects, object_map_summary
+from printguard_client import PrintGuardError, check as printguard_check, classify as printguard_classify
 
 
 APP_DIR = Path.home() / "Library" / "Application Support" / "AMS Lite Companion V2"
@@ -62,7 +63,7 @@ EVENTS_FILE = APP_DIR / "events.sqlite3"
 AUTOPILOT_FILE = APP_DIR / "autopilot.sqlite3"
 REPORTS_FILE = APP_DIR / "reports.sqlite3"
 HOST, PORT = "127.0.0.1", 8766
-__version__ = "3.7.0"
+__version__ = "3.8.0"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -104,6 +105,7 @@ def build_supervision_snapshot(
     now = time.time() if now_epoch is None else float(now_epoch)
     printer = state.get("printer") if isinstance(state.get("printer"), dict) else {}
     camera = state.get("camera") if isinstance(state.get("camera"), dict) else {}
+    printguard = state.get("printguard") if isinstance(state.get("printguard"), dict) else {}
     guardian = state.get("guardian") if isinstance(state.get("guardian"), dict) else {}
     autopilot = state.get("autopilot") if isinstance(state.get("autopilot"), dict) else {}
     active_job = state.get("active_job") if isinstance(state.get("active_job"), dict) else {}
@@ -173,7 +175,17 @@ def build_supervision_snapshot(
     else:
         mapping_level, mapping_message = "warning", "Cartographie G-code indisponible pour le travail actif"
 
-    levels = [printer_level, vision_level, reliability_level, guardian_level, autopilot_level, mapping_level]
+    pg_prediction = str((printguard.get("last_result") or {}).get("prediction") or "")
+    if not printguard.get("enabled"):
+        ai_level, ai_message = "info", "IA PrintGuard désactivée"
+    elif pg_prediction == "failure":
+        ai_level, ai_message = "critical", "PrintGuard signale une anomalie à vérifier"
+    elif str(printguard.get("status") or "").startswith("Erreur"):
+        ai_level, ai_message = "warning", str(printguard.get("status"))
+    else:
+        ai_level, ai_message = "ok", "PrintGuard analyse les captures localement"
+
+    levels = [printer_level, vision_level, ai_level, reliability_level, guardian_level, autopilot_level, mapping_level]
     if "critical" in levels:
         overall_level, overall_message = "critical", "Une intervention ou une vérification est requise"
     elif "warning" in levels:
@@ -194,6 +206,8 @@ def build_supervision_snapshot(
         "vision": {"level": vision_level, "message": vision_message,
                    "enabled": bool(camera.get("enabled")),
                    "capture_count": int((state.get("vision_storage") or {}).get("count") or 0)},
+        "ai": {"level": ai_level, "message": ai_message, "enabled": bool(printguard.get("enabled")),
+               "prediction": pg_prediction or "unknown"},
         "reliability": {"level": reliability_level, "message": reliability_message,
                         "event_count": len(events), "failed_events": failed_events,
                         "pending_events": pending_events, "latest_event_at": latest.get("received_at") or "",
@@ -234,6 +248,16 @@ def build_alert_queue(state: dict[str, Any]) -> list[dict[str, str]]:
             "title": f"Alerte Vision : {defect}",
             "message": f"{label} · {evidence} image(s) · confiance {confidence} %. Vérifie l’impression.",
             "created_at": str(proposal.get("created_at") or ""), "action": "review_only",
+        })
+    printguard = state.get("printguard") if isinstance(state.get("printguard"), dict) else {}
+    result = printguard.get("last_result") if isinstance(printguard.get("last_result"), dict) else {}
+    if printguard.get("enabled") and result.get("prediction") == "failure":
+        digest = str(result.get("frame_sha256") or "")
+        score = max(0, min(100, round(100 * _float(result.get("defect_score") or 0))))
+        alerts.append({
+            "id": f"printguard:{digest or 'current'}", "severity": "critical", "source": "printguard",
+            "title": "Alerte IA PrintGuard", "message": f"Risque de défaut détecté ({score} %). Vérifie l’impression : aucune commande n’a été envoyée.",
+            "created_at": str(result.get("classified_at") or ""), "action": "review_only",
         })
     return alerts
 
@@ -311,6 +335,14 @@ def default_state() -> dict[str, Any]:
             "last_requested_layer": 0,
             "status": "Caméra non configurée",
         },
+        "printguard": {
+            "enabled": False,
+            "base_url": "http://127.0.0.1:8000",
+            "token": "",
+            "sensitivity": 1.0,
+            "status": "PrintGuard non configuré",
+            "last_result": {},
+        },
         "spools": {
             str(i): {"name": f"Bobine A{i}", "initial_g": 1000.0, "remaining_g": 1000.0}
             for i in range(1, 5)
@@ -346,11 +378,12 @@ def load_state(path: Path = STATE_FILE) -> dict[str, Any]:
             for key in state:
                 if key not in loaded:
                     continue
-                if key == "bridge" and isinstance(loaded[key], dict):
+                if key in {"bridge", "printguard"} and isinstance(loaded[key], dict):
                     state[key].update(loaded[key])
-                    defaults = default_state()["bridge"]["default_mapping"]
-                    defaults.update(state[key].get("default_mapping", {}))
-                    state[key]["default_mapping"] = defaults
+                    if key == "bridge":
+                        defaults = default_state()["bridge"]["default_mapping"]
+                        defaults.update(state[key].get("default_mapping", {}))
+                        state[key]["default_mapping"] = defaults
                 else:
                     state[key] = loaded[key]
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
@@ -2201,6 +2234,7 @@ class Companion:
             self._sync_spools_from_inventory()
             clean = json.loads(json.dumps(self.state))
             clean["config"]["access_code"] = "" if not self.state["config"].get("access_code") else "********"
+            clean["printguard"]["token"] = "" if not self.state.get("printguard", {}).get("token") else "********"
             clean["imported"] = self.last_import
             clean["auto_import_available"] = self.auto_import is not None
             clean["inventory"] = self.inventory.public_state()
@@ -2252,6 +2286,11 @@ class Companion:
                 "capture_view_delay_min_seconds": state.get("camera", {}).get("capture_view_delay_min_seconds", 4),
                 "capture_view_delay_max_seconds": state.get("camera", {}).get("capture_view_delay_max_seconds", 24),
                 "storage": state.get("vision_storage", {}),
+            },
+            "printguard": {
+                "enabled": bool(state.get("printguard", {}).get("enabled")),
+                "status": state.get("printguard", {}).get("status", ""),
+                "last_result": state.get("printguard", {}).get("last_result", {}),
             },
             "guardian": state.get("guardian", {}),
             "autopilot": state.get("autopilot", {}),
@@ -2915,8 +2954,75 @@ class Companion:
                 )
             elif not camera.get("enabled"):
                 camera["status"] = "Captures automatiques désactivées"
+            printguard = self.state.setdefault("printguard", {})
+            if "printguard_enabled" in data:
+                printguard["enabled"] = bool(data["printguard_enabled"])
+            if "printguard_base_url" in data:
+                parsed = urllib.parse.urlparse(str(data["printguard_base_url"] or "").strip())
+                if parsed.scheme not in {"http", "https"} or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+                    raise ValueError("PrintGuard doit rester local (http://127.0.0.1:8000)")
+                printguard["base_url"] = parsed.geturl().rstrip("/")
+            if "printguard_token" in data:
+                token = str(data["printguard_token"] or "").strip()
+                if token and token != "********":
+                    printguard["token"] = token
+            if "printguard_sensitivity" in data:
+                try:
+                    printguard["sensitivity"] = max(0.1, min(4.0, float(data["printguard_sensitivity"])))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("Sensibilité PrintGuard invalide") from exc
+            if printguard.get("enabled") and not str(printguard.get("status") or "").startswith("Erreur"):
+                printguard["status"] = "PrintGuard prêt : analyse locale des prochaines captures"
             self.save()
         self.mqtt.restart()
+
+    def test_printguard(self) -> dict[str, Any]:
+        """Test the independent local engine; it has no control scope."""
+        with self.lock:
+            settings = dict(self.state.setdefault("printguard", {}))
+        try:
+            state = printguard_check(str(settings.get("base_url") or ""), str(settings.get("token") or ""))
+            cameras = state.get("cameras") if isinstance(state.get("cameras"), list) else []
+            with self.lock:
+                self.state["printguard"]["status"] = f"PrintGuard connecté localement ({len(cameras)} caméra(s) déclarée(s))"
+                self.save()
+            return {"ok": True, "message": self.state["printguard"]["status"]}
+        except PrintGuardError as exc:
+            with self.lock:
+                self.state["printguard"]["status"] = f"Erreur PrintGuard : {exc}"
+                self.save()
+            return {"ok": False, "message": str(exc)}
+
+    def classify_capture_with_printguard(self, filename: str) -> dict[str, Any]:
+        """Ask the external local model to assess one stored camera frame.
+
+        No Bambu credential and no print-control endpoint is ever shared with
+        PrintGuard.  A failure is an alert for a human, not an instruction.
+        """
+        image_path = self._vision_capture_path(filename)
+        with self.lock:
+            settings = dict(self.state.setdefault("printguard", {}))
+        if not settings.get("enabled"):
+            raise ValueError("Active d’abord PrintGuard dans le Centre Vision")
+        verdict = printguard_classify(
+            image_path.read_bytes(), str(settings.get("base_url") or ""), str(settings.get("token") or ""),
+            float(settings.get("sensitivity") or 1.0),
+        )
+        result = {**verdict, "frame_sha256": hashlib.sha256(image_path.read_bytes()).hexdigest(), "classified_at": now_iso()}
+        with self.lock:
+            captures = self.state.get("camera", {}).get("captures", [])
+            capture = next((item for item in captures if isinstance(item, dict) and item.get("file") == filename), None)
+            if isinstance(capture, dict):
+                capture["printguard"] = result
+            printguard = self.state["printguard"]
+            printguard["last_result"] = result
+            printguard["status"] = (
+                "Alerte PrintGuard : vérification humaine requise" if result["prediction"] == "failure"
+                else "PrintGuard : dernière capture analysée localement"
+            )
+            self.save()
+        log(f"PrintGuard: {result['prediction']} ({result['defect_score']:.2f}) pour {filename}")
+        return result
 
     def import_bambu_studio_configuration(self, data: dict[str, Any]) -> dict[str, Any]:
         """Reuse the current Bambu Studio LAN identity for this local Companion."""
@@ -3659,6 +3765,19 @@ class Companion:
                         camera["pending_capture_view"] = view
                         camera["status"] = f"Vue {view}/{views} enregistrée — couche {layer}"
                         self.save()
+                    # The external model is deliberately called only after
+                    # the authentic frame is durably saved.  A failing local
+                    # AI service must never prevent later captures.
+                    with self.lock:
+                        ai_enabled = bool(self.state.get("printguard", {}).get("enabled"))
+                    if ai_enabled:
+                        try:
+                            self.classify_capture_with_printguard(filename)
+                        except (PrintGuardError, OSError, ValueError) as exc:
+                            with self.lock:
+                                self.state["printguard"]["status"] = f"Erreur PrintGuard : {exc}"
+                                self.save()
+                            log(f"PrintGuard: analyse impossible pour {filename}: {exc}")
                 except (CameraError, OSError) as exc:
                     with self.lock:
                         camera = self.state["camera"]
@@ -3950,6 +4069,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(self.app.compare_vision_captures(
                     str(body.get("reference") or ""), str(body.get("candidate") or ""),
                 ))
+            elif path == "/api/vision/printguard/test":
+                self.json_body()
+                result = self.app.test_printguard()
+                self.send_json(result, 200 if result.get("ok") else 503)
+            elif path == "/api/vision/printguard/classify":
+                body = self.json_body()
+                self.send_json(self.app.classify_capture_with_printguard(str(body.get("file") or "")))
             elif path == "/api/vision/calibration/capture":
                 self.json_body()
                 self.send_json(self.app.capture_calibration_frame())
@@ -4147,14 +4273,18 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 <p class="notice">Captures automatiques périodiques : <strong>ce n’est pas une vidéo en direct</strong>. Trois vues avec des pauses aléatoires sont prises à la couche 5, puis toutes les 5 couches, afin de voir les objets masqués par la tête.</p>
 <section><h2>Impression en cours</h2><p id="layerCounter" style="font-size:42px;font-weight:800;margin:4px 0;color:#087535">Couche —</p><p class="muted">Compteur reçu directement de l’imprimante.</p></section>
 <section><h2>Caméra</h2><p id="status">Chargement…</p><label><input id="enabled" type="checkbox"> Activer les captures automatiques (pas de flux vidéo)</label><p class="muted">Le Centre Vision se met à jour toutes les trois secondes après chaque nouvelle capture.</p><label>Empreinte TLS</label><input id="fingerprint" placeholder="Détecte-la automatiquement"><button class="secondary" onclick="discover()">Détecter la caméra</button><button onclick="saveCamera()">Enregistrer</button><p id="meta" class="muted"></p></section>
-<section><h2>Reconnaissance des formes 3MF</h2><p>Le moteur Vision reconstruit les silhouettes du plateau depuis le 3MF tranché et les cherche directement dans chaque capture. Il ne suit ni le fond, ni la tête de l’imprimante.</p><div class="fields"><label>Largeur G-code du plateau (mm)<input id="bedX" type="number" min="1" max="500" step="1" value="180"></label><label>Profondeur G-code du plateau (mm)<input id="bedY" type="number" min="1" max="500" step="1" value="180"></label></div><button class="secondary" onclick="installVisionEngine()">Installer le moteur de formes</button><button class="secondary" onclick="startAutoCalibration()">Rechercher les formes dans cette capture</button><button class="secondary" onclick="startCalibration()">Réglage manuel de secours…</button><p id="calibrationStatus" class="muted">Si aucune forme n’est assez sûre ou si les pièces sont masquées, aucun contour n’est affiché.</p></section>
+<section><h2>IA de détection PrintGuard</h2><p>Détecteur local éprouvé, séparé de Companion. Les JPEG restent sur ce Mac et l’IA ne reçoit ni le code LAN Bambu ni aucun droit de pause ou d’annulation.</p><label><input id="printguardEnabled" type="checkbox"> Analyser automatiquement chaque nouvelle capture</label><div class="fields"><label>Adresse locale<input id="printguardURL" value="http://127.0.0.1:8000" inputmode="url"></label><label>Sensibilité (0,1 à 4)<input id="printguardSensitivity" type="number" min="0.1" max="4" step="0.1" value="1"></label></div><label>Jeton API optionnel<input id="printguardToken" type="password" placeholder="Seulement si PrintGuard exige un jeton"></label><button class="secondary" onclick="testPrintGuard()">Tester PrintGuard</button><button onclick="savePrintGuard()">Enregistrer l’IA</button><p id="printguardStatus" class="muted">Installe et lance PrintGuard, puis teste la connexion locale.</p></section>
+<section><h2>Cartographie G-code (référence manuelle)</h2><p>Les formes du 3MF servent uniquement de référence visuelle. Avec une caméra fixée sur la tête, aucune projection automatique ne peut désigner une pièce de façon fiable.</p><div class="fields"><label>Largeur G-code du plateau (mm)<input id="bedX" type="number" min="1" max="500" step="1" value="180"></label><label>Profondeur G-code du plateau (mm)<input id="bedY" type="number" min="1" max="500" step="1" value="180"></label></div><button class="secondary" onclick="startCalibration()">Réglage manuel de secours…</button><p id="calibrationStatus" class="muted">La cartographie reste un outil de contrôle humain, jamais une détection automatique.</p></section>
 <section><h2>Captures par impression</h2><div id="gallery"></div></section></main>
-<div id="captureModal" class="capture-modal" hidden onclick="if(event.target===this)closeCapture()"><section class="capture-dialog"><button class="secondary capture-close" onclick="closeCapture()">Fermer</button><h2 id="captureTitle">Capture</h2><button id="compareTemporalButton" class="secondary" onclick="compareTemporalViews()">Comparer à l’image de départ</button><button id="autoCalibrateCaptureButton" onclick="startAutoCalibration()">Rechercher les formes 3MF</button><button id="calibrateCaptureButton" onclick="startCalibration()">Réglage manuel de secours</button><div id="calibrationActions" class="calibration-actions" hidden><button class="secondary" onclick="undoCalibrationPoint()">Annuler le dernier coin</button><button class="secondary" onclick="skipCalibrationCorner()">Ce coin est hors champ</button><button class="danger" onclick="startCalibration()">Recommencer</button></div><p id="overlayNotice" class="muted"></p><div id="temporalComparison" class="temporal-comparison" hidden></div><div id="captureStage" class="capture-stage"><img id="captureLarge" alt="Capture agrandie"><svg id="captureOverlay" viewBox="0 0 1 1" preserveAspectRatio="none"></svg></div><div id="objectLegend" class="object-legend" aria-label="Légende des objets cartographiés"></div><p id="calibrationPoints" class="calibration-points"></p><div id="captureInfo" class="capture-info"></div></section></div>
+<div id="captureModal" class="capture-modal" hidden onclick="if(event.target===this)closeCapture()"><section class="capture-dialog"><button class="secondary capture-close" onclick="closeCapture()">Fermer</button><h2 id="captureTitle">Capture</h2><button id="printguardCaptureButton" onclick="classifyCurrentCapture()">Analyser avec PrintGuard</button><button id="compareTemporalButton" class="secondary" onclick="compareTemporalViews()">Comparer visuellement au départ</button><button id="calibrateCaptureButton" onclick="startCalibration()">Réglage manuel de secours</button><div id="calibrationActions" class="calibration-actions" hidden><button class="secondary" onclick="undoCalibrationPoint()">Annuler le dernier coin</button><button class="secondary" onclick="skipCalibrationCorner()">Ce coin est hors champ</button><button class="danger" onclick="startCalibration()">Recommencer</button></div><p id="overlayNotice" class="muted"></p><div id="temporalComparison" class="temporal-comparison" hidden></div><div id="captureStage" class="capture-stage"><img id="captureLarge" alt="Capture agrandie"><svg id="captureOverlay" viewBox="0 0 1 1" preserveAspectRatio="none"></svg></div><div id="objectLegend" class="object-legend" aria-label="Légende des objets cartographiés"></div><p id="calibrationPoints" class="calibration-points"></p><div id="captureInfo" class="capture-info"></div></section></div>
 <script>
-const token=__API_TOKEN__,statusEl=document.getElementById('status'),enabledEl=document.getElementById('enabled'),fingerprintEl=document.getElementById('fingerprint'),metaEl=document.getElementById('meta'),galleryEl=document.getElementById('gallery'),modalEl=document.getElementById('captureModal'),titleEl=document.getElementById('captureTitle'),largeEl=document.getElementById('captureLarge'),stageEl=document.getElementById('captureStage'),overlayEl=document.getElementById('captureOverlay'),overlayNoticeEl=document.getElementById('overlayNotice'),legendEl=document.getElementById('objectLegend'),infoEl=document.getElementById('captureInfo'),temporalEl=document.getElementById('temporalComparison'),calibrationStatusEl=document.getElementById('calibrationStatus'),calibrationPointsEl=document.getElementById('calibrationPoints'),calibrationActionsEl=document.getElementById('calibrationActions'),bedXEl=document.getElementById('bedX'),bedYEl=document.getElementById('bedY'),layerCounterEl=document.getElementById('layerCounter');
+const token=__API_TOKEN__,statusEl=document.getElementById('status'),enabledEl=document.getElementById('enabled'),fingerprintEl=document.getElementById('fingerprint'),metaEl=document.getElementById('meta'),galleryEl=document.getElementById('gallery'),modalEl=document.getElementById('captureModal'),titleEl=document.getElementById('captureTitle'),largeEl=document.getElementById('captureLarge'),stageEl=document.getElementById('captureStage'),overlayEl=document.getElementById('captureOverlay'),overlayNoticeEl=document.getElementById('overlayNotice'),legendEl=document.getElementById('objectLegend'),infoEl=document.getElementById('captureInfo'),temporalEl=document.getElementById('temporalComparison'),calibrationStatusEl=document.getElementById('calibrationStatus'),calibrationPointsEl=document.getElementById('calibrationPoints'),calibrationActionsEl=document.getElementById('calibrationActions'),bedXEl=document.getElementById('bedX'),bedYEl=document.getElementById('bedY'),layerCounterEl=document.getElementById('layerCounter'),printguardEnabledEl=document.getElementById('printguardEnabled'),printguardURLEl=document.getElementById('printguardURL'),printguardTokenEl=document.getElementById('printguardToken'),printguardSensitivityEl=document.getElementById('printguardSensitivity'),printguardStatusEl=document.getElementById('printguardStatus');
 let visionState=null,currentCapture=null,currentPlatePoints=null,currentShapeObjects=[],currentPlateMessage='',calibrationMode=false,calibrationPoints=[],calibrationEdgePoints=[],hiddenCornerIndex=-1,selectedObjectIndex=-1;const calibrationKey='ams-lite-vision-plate-calibration-v1';
 async function api(path,opt={}){const response=await fetch(path,{...opt,headers:{'X-AMS-Token':token,'Content-Type':'application/json'}}),body=await response.json();if(!response.ok)throw Error(body.error||'Erreur');return body}
 function esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function captureURL(file){return `/api/captures/${encodeURIComponent(file)}?token=${encodeURIComponent(token)}`}
+async function savePrintGuard(){try{await api('/api/config',{method:'POST',body:JSON.stringify({printguard_enabled:printguardEnabledEl.checked,printguard_base_url:printguardURLEl.value,printguard_token:printguardTokenEl.value,printguard_sensitivity:printguardSensitivityEl.value})});printguardTokenEl.value='';await load()}catch(error){printguardStatusEl.textContent=error.message||'Configuration PrintGuard impossible.'}}
+async function testPrintGuard(){try{printguardStatusEl.textContent='Connexion locale à PrintGuard…';const result=await api('/api/vision/printguard/test',{method:'POST',body:'{}'});printguardStatusEl.textContent=result.message||'PrintGuard connecté.';await load()}catch(error){printguardStatusEl.textContent=error.message||'PrintGuard indisponible.'}}
+async function classifyCurrentCapture(){if(!currentCapture)return;try{overlayNoticeEl.textContent='Analyse locale PrintGuard en cours…';const result=await api('/api/vision/printguard/classify',{method:'POST',body:JSON.stringify({file:currentCapture.file})});currentCapture.printguard=result;overlayNoticeEl.textContent=result.prediction==='failure'?`PrintGuard signale un risque de défaut (${Math.round(100*Number(result.defect_score||0))} %). Vérifie l’impression : aucune action n’a été envoyée.`:`PrintGuard ne signale pas de défaut sur cette capture (${Math.round(100*Number(result.defect_score||0))} %).`;await load()}catch(error){overlayNoticeEl.textContent=error.message||'Analyse PrintGuard impossible.'}}
 async function compareTemporalViews(){if(!currentCapture||modalEl.hidden)return;const samePrint=(window.visionCaptures||[]).filter(item=>item&&((item.folder&&item.folder===currentCapture.folder)||(item.print_id&&item.print_id===currentCapture.print_id))).sort((a,b)=>String(a.captured_at||'').localeCompare(String(b.captured_at||'')));const reference=samePrint[0];if(!reference){temporalEl.hidden=false;temporalEl.textContent='Aucune image de départ n’est disponible pour cette impression.';return}if(reference.file===currentCapture.file){temporalEl.hidden=false;temporalEl.textContent='C’est déjà l’image de départ. Ouvre une capture plus récente pour voir l’évolution.';return}temporalEl.hidden=false;temporalEl.textContent='Préparation de l’image de départ et de l’image courante…';try{const result=await api('/api/vision/temporal/compare',{method:'POST',body:JSON.stringify({reference:reference.file,candidate:currentCapture.file})});temporalEl.innerHTML=`<b>Évolution : couche ${result.reference_layer||reference.layer} ↔ couche ${result.candidate_layer||currentCapture.layer}</b><br><span class="muted">${esc(result.message||'Image de départ et image courante à comparer visuellement.')}</span><img style="display:block;width:100%;margin-top:9px;border-radius:7px" alt="Image de départ et image courante" src="${result.preview_data_url}">`}catch(error){temporalEl.textContent=error.message||'Comparaison des images impossible.'}}
 function loadCalibration(){try{const value=JSON.parse(localStorage.getItem(calibrationKey)||'null');if(value&&Array.isArray(value.points)&&value.points.length===4)return value}catch(_){ }return null}function calibration(){const value=loadCalibration();if(value){bedXEl.value=value.width||180;bedYEl.value=value.height||180}return value}
 function setCalibrationStatus(message,isWarning=false){calibrationStatusEl.textContent=message;calibrationStatusEl.className=isWarning?'warning':'muted'}
@@ -4168,7 +4298,7 @@ function calibrationGuide(){if(!calibrationMode)return '';const visible=calibrat
 function drawOverlay(){overlayEl.innerHTML='';legendEl.innerHTML='';if(!currentCapture)return;const objects=objectsFor(currentCapture),shapes=new Map((currentShapeObjects||[]).map(item=>[String(item.object_id),Array.isArray(item.contours)?item.contours:(Array.isArray(item.points)?[item.points]:[])])),guide=calibrationGuide();if(!objects.length){overlayEl.innerHTML=guide;overlayNoticeEl.textContent=calibrationMode?'Calibration en cours : les repères jaunes confirment chaque sélection.':currentPlateMessage||'Cette capture ancienne ne contient pas sa cartographie G-code.';return}if(!shapes.size){overlayEl.innerHTML=guide;overlayNoticeEl.textContent=calibrationMode?'Calibration en cours : les repères jaunes confirment chaque sélection.':currentPlateMessage||'Aucune forme assez sûre : aucun contour d’objet n’est affiché.';return}let count=0,svg='',legend='';objects.forEach((object,index)=>{const contours=shapes.get(String(object?.id));if(!Array.isArray(contours)||!contours.length)return;const valid=contours.filter(contour=>Array.isArray(contour)&&contour.length>=3&&!contour.some(point=>!Array.isArray(point)||point.length!==2||!Number.isFinite(point[0])||!Number.isFinite(point[1])));if(!valid.length)return;const color=outlineColors[index%outlineColors.length],selected=selectedObjectIndex===index;svg+=valid.map(contour=>`<polygon points="${contour.map(point=>`${point[0]},${point[1]}`).join(' ')}" fill="${selected?color+'33':'none'}" stroke="${selected?'#ef1f18':color}" stroke-width="${selected?'0.010':'0.005'}" vector-effect="non-scaling-stroke"/>`).join('');legend+=`<button class="legend-item ${selected?'selected':''}" onclick="selectMappedObject(${index})"><span class="legend-swatch" style="background:${color}">${index+1}</span><span><b>${esc(object.label||('Objet '+object.id))}</b><small>silhouette 3MF reconnue dans cette image${selected?' · contour sélectionné':''}</small></span></button>`;count++});overlayEl.innerHTML=svg+guide;legendEl.innerHTML=legend;overlayNoticeEl.textContent=calibrationMode?'Calibration en cours : les repères jaunes confirment chaque sélection.':count?`${count} silhouette(s) 3MF reconnue(s) dans cette image.`:'Aucune silhouette 3MF exploitable n’est affichée.'}
 function hiddenCornerEdges(){if(hiddenCornerIndex<0)return [];const previous=(hiddenCornerIndex+3)%4,next=(hiddenCornerIndex+1)%4;return [{corner:previous,label:`bord ${calibrationLabels[previous]} → ${calibrationLabels[hiddenCornerIndex]}`},{corner:next,label:`bord ${calibrationLabels[next]} → ${calibrationLabels[hiddenCornerIndex]}`}]}
 function renderCalibrationProgress(){const active=calibrationMode;calibrationActionsEl.hidden=!active;stageEl.classList.toggle('calibrating',active);if(!active){calibrationPointsEl.textContent='';return}const next=calibrationPoints.length,pointList=calibrationPoints.map((point,index)=>`${index+1}. ${calibrationLabels[index]} : ${point?'sélectionné':hiddenCornerIndex===index?'hors champ':'à renseigner'}`).join(' · '),edges=hiddenCornerEdges();let instruction=next<4?`Prochain point : <b>${calibrationLabels[next]}</b>.`:edges.length?calibrationEdgePoints.length===0?`Clique maintenant un point n’importe où sur le <b>${edges[0].label}</b>.`:calibrationEdgePoints.length===1?`Clique maintenant un point n’importe où sur le <b>${edges[1].label}</b>.`: 'Calcul de l’intersection des bords…':'Enregistrement…';calibrationPointsEl.innerHTML=`<b>Calibration en cours :</b> ${next}/4 coin(s) renseigné(s). ${instruction}<br><span class="muted">${pointList||'Clique un coin visible, ou marque le prochain coin « hors champ ». Les repères jaunes restent visibles sur l’image.'}${edges.length?' Les repères bleus E1 et E2 servent à prolonger les deux bords vers le coin hors champ.':''}</span>`;drawOverlay()}
-function openCapture(index){currentCapture=(window.visionCaptures||[])[index];if(!currentCapture)return;currentPlatePoints=null;currentShapeObjects=[];currentPlateMessage='Recherche des formes du 3MF dans cette capture…';calibrationMode=false;calibrationPoints=[];calibrationEdgePoints=[];hiddenCornerIndex=-1;selectedObjectIndex=-1;titleEl.textContent=`Capture · couche ${currentCapture.layer} · vue ${currentCapture.capture_view||1}/${currentCapture.capture_views_total||1}`;largeEl.src=captureURL(currentCapture.file);largeEl.alt=`Capture de la couche ${currentCapture.layer}, vue ${currentCapture.capture_view||1}`;infoEl.innerHTML=`<div><b>Impression</b>${esc(currentCapture.print_name||'Impression en cours')}</div><div><b>Couche</b>${currentCapture.layer}</div><div><b>Vue de la séquence</b>${currentCapture.capture_view||1}/${currentCapture.capture_views_total||1}</div><div><b>Date</b>${esc(currentCapture.captured_at)}</div><div><b>Fichier</b>${esc(currentCapture.file)}</div>`;modalEl.hidden=false;renderCalibrationProgress();largeEl.onload=()=>{drawOverlay();detectObjectShapes()};drawOverlay()}
+function openCapture(index){currentCapture=(window.visionCaptures||[])[index];if(!currentCapture)return;currentPlatePoints=null;currentShapeObjects=[];currentPlateMessage='Cartographie 3MF : référence humaine uniquement.';calibrationMode=false;calibrationPoints=[];calibrationEdgePoints=[];hiddenCornerIndex=-1;selectedObjectIndex=-1;titleEl.textContent=`Capture · couche ${currentCapture.layer} · vue ${currentCapture.capture_view||1}/${currentCapture.capture_views_total||1}`;largeEl.src=captureURL(currentCapture.file);largeEl.alt=`Capture de la couche ${currentCapture.layer}, vue ${currentCapture.capture_view||1}`;const pg=currentCapture.printguard||{},pgText=pg.prediction?`${pg.prediction==='failure'?'Risque signalé':'Aucun défaut signalé'} · ${Math.round(100*Number(pg.defect_score||0))} %`:'Pas encore analysée';infoEl.innerHTML=`<div><b>Impression</b>${esc(currentCapture.print_name||'Impression en cours')}</div><div><b>Couche</b>${currentCapture.layer}</div><div><b>Vue de la séquence</b>${currentCapture.capture_view||1}/${currentCapture.capture_views_total||1}</div><div><b>Analyse PrintGuard</b>${esc(pgText)}</div><div><b>Date</b>${esc(currentCapture.captured_at)}</div><div><b>Fichier</b>${esc(currentCapture.file)}</div>`;modalEl.hidden=false;renderCalibrationProgress();largeEl.onload=()=>{drawOverlay()};drawOverlay()}
 async function detectObjectShapes(){if(!currentCapture||modalEl.hidden)return;const file=currentCapture.file;try{const result=await api('/api/vision/shapes/detect',{method:'POST',body:JSON.stringify({file})});if(!currentCapture||currentCapture.file!==file)return;if(!result.detected||!Array.isArray(result.objects)){currentShapeObjects=[];currentPlateMessage=result.message||'Aucune forme du 3MF reconnue : aucun contour affiché.'}else{currentPlatePoints=null;currentShapeObjects=result.objects;currentPlateMessage=`Formes 3MF reconnues sur cette image (score ${Math.round(Number(result.similarity||0))} %). Vérifie les contours.`}drawOverlay()}catch(error){currentShapeObjects=[];currentPlateMessage=error.message||'Détection de formes impossible.';drawOverlay()}}
 function closeCapture(){modalEl.hidden=true;calibrationMode=false;calibrationPoints=[];calibrationEdgePoints=[];currentShapeObjects=[];hiddenCornerIndex=-1;selectedObjectIndex=-1;largeEl.removeAttribute('src');overlayEl.innerHTML='';legendEl.innerHTML='';renderCalibrationProgress()}
 function startCalibration(){if(!currentCapture||modalEl.hidden){setCalibrationStatus('Ouvre une capture dans la galerie, puis lance la calibration.',true);return}currentShapeObjects=[];currentPlatePoints=null;calibrationMode=true;calibrationPoints=[];calibrationEdgePoints=[];hiddenCornerIndex=-1;setCalibrationStatus('Clique les coins visibles dans l’ordre indiqué. Si le coin suivant est coupé par l’image, utilise « Ce coin est hors champ » : deux clics sur les bords permettront de le reconstruire avec la bonne perspective.');renderCalibrationProgress()}
@@ -4184,7 +4314,7 @@ function undoCalibrationPoint(){if(!calibrationMode)return;if(calibrationEdgePoi
 function skipCalibrationCorner(){if(!calibrationMode||calibrationPoints.length>=4)return;if(hiddenCornerIndex>=0){setCalibrationStatus('Un seul coin hors champ peut être reconstruit. Recommence avec une capture où les trois autres coins sont visibles.',true);return}hiddenCornerIndex=calibrationPoints.length;calibrationPoints.push(null);renderCalibrationProgress()}
 largeEl.addEventListener('click',event=>{if(!calibrationMode)return;const box=largeEl.getBoundingClientRect(),x=(event.clientX-box.left)/box.width,y=(event.clientY-box.top)/box.height;if(x<0||x>1||y<0||y>1)return;if(calibrationPoints.length<4)calibrationPoints.push([x,y]);else if(hiddenCornerIndex>=0&&calibrationEdgePoints.length<2)calibrationEdgePoints.push([x,y]);else return;renderCalibrationProgress();finishCalibration()});
 function clearCalibration(){localStorage.removeItem(calibrationKey);calibrationMode=false;calibrationPoints=[];calibrationEdgePoints=[];hiddenCornerIndex=-1;setCalibrationStatus('Calibration effacée.');renderCalibrationProgress();drawOverlay()}
-function render(state){visionState=state;const printer=state.printer||{},camera=state.camera||{},captures=Array.isArray(camera.captures)?camera.captures:[],storage=state.vision_storage||{};const views=camera.capture_views_per_layer||3,delayMin=camera.capture_view_delay_min_seconds||4,delayMax=camera.capture_view_delay_max_seconds||24;layerCounterEl.textContent=Number(printer.layer)>0?`Couche ${Number(printer.layer)}`:'Couche —';statusEl.textContent=camera.status||'Caméra non configurée';enabledEl.checked=!!camera.enabled;fingerprintEl.value=camera.certificate_sha256||'';metaEl.textContent=`Captures, pas vidéo : ${views} vues avec pauses aléatoires de ${delayMin} à ${delayMax} s toutes les ${camera.capture_every_layers||5} couches · dernière couche reçue : ${camera.last_seen_layer||'—'} · ${storage.count||0} image(s).`;window.visionCaptures=captures;const groups=new Map();captures.forEach((item,index)=>{const key=item.folder||'en-cours';if(!groups.has(key))groups.set(key,{name:item.print_name||(item.folder?'Impression terminée':'Impression en cours'),items:[]});groups.get(key).items.push({item,index})});galleryEl.innerHTML=captures.length?[...groups.values()].map(group=>`<div class="capture-group"><div class="capture-group-head"><div><h3>${esc(group.name)}</h3><span>${group.items.length} image(s)</span></div></div><div class="capture-grid">${group.items.map(({item,index})=>{const objectCount=objectsFor(item).length;return `<button class="capture-card" onclick="openCapture(${index})"><img src="${captureURL(item.file)}" alt="Capture couche ${item.layer}, vue ${item.capture_view||1}"><div><b>Couche ${item.layer} · vue ${item.capture_view||1}/${item.capture_views_total||1}</b><br><span class="muted">${esc(item.captured_at)}</span>${objectCount?`<br><span class="map-badge">${objectCount} objet(s) cartographié(s)</span>`:''}</div></button>`}).join('')}</div></div>`).join(''):'<p>Aucune capture : la première séquence sera prise à la couche 5, pas immédiatement au lancement.</p>';calibration();}
+function render(state){visionState=state;const printer=state.printer||{},camera=state.camera||{},printguard=state.printguard||{},captures=Array.isArray(camera.captures)?camera.captures:[],storage=state.vision_storage||{};const views=camera.capture_views_per_layer||3,delayMin=camera.capture_view_delay_min_seconds||4,delayMax=camera.capture_view_delay_max_seconds||24;layerCounterEl.textContent=Number(printer.layer)>0?`Couche ${Number(printer.layer)}`:'Couche —';statusEl.textContent=camera.status||'Caméra non configurée';enabledEl.checked=!!camera.enabled;fingerprintEl.value=camera.certificate_sha256||'';printguardEnabledEl.checked=!!printguard.enabled;printguardURLEl.value=printguard.base_url||'http://127.0.0.1:8000';printguardSensitivityEl.value=printguard.sensitivity||1;printguardStatusEl.textContent=printguard.status||'PrintGuard non configuré';metaEl.textContent=`Captures, pas vidéo : ${views} vues avec pauses aléatoires de ${delayMin} à ${delayMax} s toutes les ${camera.capture_every_layers||5} couches · dernière couche reçue : ${camera.last_seen_layer||'—'} · ${storage.count||0} image(s).`;window.visionCaptures=captures;const groups=new Map();captures.forEach((item,index)=>{const key=item.folder||'en-cours';if(!groups.has(key))groups.set(key,{name:item.print_name||(item.folder?'Impression terminée':'Impression en cours'),items:[]});groups.get(key).items.push({item,index})});galleryEl.innerHTML=captures.length?[...groups.values()].map(group=>`<div class="capture-group"><div class="capture-group-head"><div><h3>${esc(group.name)}</h3><span>${group.items.length} image(s)</span></div></div><div class="capture-grid">${group.items.map(({item,index})=>{const objectCount=objectsFor(item).length,pg=item.printguard||{},aiBadge=pg.prediction?`<br><span class="map-badge">PrintGuard : ${pg.prediction==='failure'?'risque signalé':'aucun défaut'} (${Math.round(100*Number(pg.defect_score||0))} %)</span>`:'';return `<button class="capture-card" onclick="openCapture(${index})"><img src="${captureURL(item.file)}" alt="Capture couche ${item.layer}, vue ${item.capture_view||1}"><div><b>Couche ${item.layer} · vue ${item.capture_view||1}/${item.capture_views_total||1}</b><br><span class="muted">${esc(item.captured_at)}</span>${aiBadge}${objectCount?`<br><span class="map-badge">${objectCount} objet(s) cartographié(s)</span>`:''}</div></button>`}).join('')}</div></div>`).join(''):'<p>Aucune capture : la première séquence sera prise à la couche 5, pas immédiatement au lancement.</p>';calibration();}
 async function load(){try{render(await api('/api/state'))}catch(error){statusEl.textContent=error.message}}async function saveCamera(){try{await api('/api/config',{method:'POST',body:JSON.stringify({camera_enabled:enabledEl.checked,camera_certificate_sha256:fingerprintEl.value})});await load()}catch(error){statusEl.textContent=error.message}}async function discover(){try{fingerprintEl.value=(await api('/api/camera/discover',{method:'POST',body:'{}'})).fingerprint;statusEl.textContent='Empreinte détectée : enregistre-la pour l’approuver.'}catch(error){statusEl.textContent=error.message}}document.addEventListener('keydown',event=>{if(event.key==='Escape')closeCapture()});load();setInterval(load,3000);
 </script></html>'''.replace("__API_TOKEN__", json.dumps(api_token))
 

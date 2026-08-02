@@ -29,7 +29,11 @@ estimations et peuvent être corrigés manuellement après une pesée.
 
 - application native macOS avec un Centre Vision indépendant ;
 - séquences de trois captures caméra locales avec des pauses aléatoires, toutes les cinq couches, regroupées par impression ;
-- comparaison locale côte à côte entre l’image de départ et l’image courante d’une même impression, sans projection ni différence géométrique trompeuse ;
+- IA de détection locale PrintGuard appliquée aux captures (défaut global,
+  aucune commande d’imprimante), avec popup de vérification et score conservé
+  auprès de chaque image ;
+- comparaison locale côte à côte disponible comme outil de revue visuelle, sans
+  projection ni différence géométrique trompeuse ;
 - cartographie des objets Bambu Studio, alertes Vision locales et exclusion
   unitaire disponible uniquement après un choix manuel, une confirmation et
   une connexion MQTT d’impression active ;
@@ -54,8 +58,20 @@ estimations et peuvent être corrigés manuellement après une pesée.
 - conservation du travail actif après redémarrage ;
 - arrêt automatique lorsque Bambu Studio est fermé ;
 - aucun service permanent en arrière-plan ;
-- reconnaissance des formes 3MF par le moteur libre OpenCV LINEMOD, installé
-  localement et séparément du suivi d’impression.
+- cartographie 3MF conservée comme référence manuelle : avec une caméra montée
+  sur la tête, elle ne prétend plus localiser automatiquement les objets.
+
+## Détection IA stable
+
+Companion V3.8 utilise le moteur open source [PrintGuard](https://github.com/oliverbravery/PrintGuard)
+comme application locale indépendante. Installez et lancez PrintGuard, puis dans
+le Centre Vision activez « Analyser automatiquement chaque nouvelle capture »
+et cliquez « Tester PrintGuard ». Par défaut, Companion communique uniquement
+avec `http://127.0.0.1:8000` : les images ne quittent pas le Mac et le code LAN
+Bambu n’est jamais transmis au moteur IA.
+
+Une alerte PrintGuard ne pause, n’annule et n’exclut jamais rien. L’exclusion
+manuelle Bambu déjà présente reste un choix séparé, explicitement confirmé.
 
 ## Compatibilité
 
