@@ -63,7 +63,7 @@ EVENTS_FILE = APP_DIR / "events.sqlite3"
 AUTOPILOT_FILE = APP_DIR / "autopilot.sqlite3"
 REPORTS_FILE = APP_DIR / "reports.sqlite3"
 HOST, PORT = "127.0.0.1", 8766
-__version__ = "3.8.0"
+__version__ = "3.8.1"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -2136,6 +2136,11 @@ class Companion:
                 atomic_save(self.state, self.state_path)
         self._restore_recent_auto_import()
         self._refresh_active_object_map_from_recent_archive()
+        # Versions antérieures conservaient les JPEG mais plafonnaient leur
+        # index à 200 entrées.  Répare cet historique au démarrage, sans
+        # toucher aux fichiers : chaque image locale redevient consultable.
+        if self._reindex_vision_captures():
+            self.save()
         # A relaunch during an already running print must not leave the
         # existing images orphaned in the common capture directory.  Adopt
         # only the currently ungrouped images: future captures are tagged as
@@ -2353,6 +2358,72 @@ class Companion:
             else:
                 active += 1
         return {"count": count, "bytes": total_bytes, "completed": completed, "active": active}
+
+    def _reindex_vision_captures(self) -> int:
+        """Restore metadata for valid local Vision JPEGs missing from state.
+
+        The capture folder is private application data.  Only immediate JPEGs
+        with Companion's canonical name are considered, so this never indexes
+        arbitrary user files or follows symlinks.  The method deliberately
+        keeps every valid record: storage is freed only through the explicit
+        delete controls in Centre Vision.
+        """
+        root = self.state_path.parent / "captures"
+        if not root.is_dir() or root.is_symlink():
+            return 0
+        filename_pattern = re.compile(r"layer-(\d{5})-(\d{8})-(\d{6})\.jpg")
+        folder_pattern = re.compile(r"print-[a-zA-Z0-9._-]+")
+        with self.lock:
+            camera = self.state.setdefault("camera", {})
+            captures = camera.setdefault("captures", [])
+            if not isinstance(captures, list):
+                captures = []
+                camera["captures"] = captures
+            known: set[tuple[str, str]] = set()
+            for item in captures:
+                if not isinstance(item, dict):
+                    continue
+                filename = str(item.get("file") or "")
+                folder = str(item.get("folder") or "")
+                if filename_pattern.fullmatch(filename) and (not folder or folder_pattern.fullmatch(folder)):
+                    known.add((folder, filename))
+            completed_names = {
+                str(item.get("folder")): str(item.get("name") or "Impression archivée")
+                for item in camera.get("completed_prints", [])
+                if isinstance(item, dict) and folder_pattern.fullmatch(str(item.get("folder") or ""))
+            }
+            candidates: list[tuple[Path, str]] = []
+            candidates.extend((path, "") for path in root.glob("layer-*.jpg"))
+            for directory in root.iterdir():
+                if directory.is_dir() and not directory.is_symlink() and folder_pattern.fullmatch(directory.name):
+                    candidates.extend((path, directory.name) for path in directory.glob("layer-*.jpg"))
+            restored: list[dict[str, Any]] = []
+            for path, folder in candidates:
+                match = filename_pattern.fullmatch(path.name)
+                if not match or path.is_symlink() or not path.is_file() or (folder, path.name) in known:
+                    continue
+                try:
+                    size_bytes = path.stat().st_size
+                    captured_at = datetime.strptime(
+                        f"{match.group(2)}-{match.group(3)}", "%Y%m%d-%H%M%S"
+                    ).strftime("%Y-%m-%dT%H:%M:%S") + time.strftime("%z")
+                except (OSError, ValueError):
+                    continue
+                restored_item: dict[str, Any] = {
+                    "layer": int(match.group(1)), "captured_at": captured_at,
+                    "file": path.name, "size_bytes": size_bytes,
+                }
+                if folder:
+                    restored_item["folder"] = folder
+                    restored_item["print_name"] = completed_names.get(folder, "Impression archivée")
+                restored.append(restored_item)
+                known.add((folder, path.name))
+            if not restored:
+                return 0
+            captures.extend(restored)
+            captures.sort(key=lambda item: str(item.get("captured_at") or item.get("file") or ""), reverse=True)
+            log(f"Vision: {len(restored)} capture(s) historique(s) réindexée(s)")
+            return len(restored)
 
     def _vision_capture_path(self, filename: str) -> Path:
         """Resolve only a capture indexed by this local Companion instance."""
@@ -3607,7 +3678,11 @@ class Companion:
                 (item for item in completed if isinstance(item, dict) and item.get("folder") == folder_name),
                 None,
             )
-            if not target:
+            indexed = any(
+                isinstance(image, dict) and image.get("folder") == folder_name
+                for image in camera.get("captures", [])
+            )
+            if not target and not indexed:
                 raise ValueError("Impression de captures introuvable")
             root = self.state_path.parent / "captures"
             folder = root / folder_name
@@ -3761,7 +3836,6 @@ class Companion:
                     with self.lock:
                         camera = self.state["camera"]
                         camera.setdefault("captures", []).insert(0, result)
-                        camera["captures"] = camera["captures"][:200]
                         camera["pending_capture_view"] = view
                         camera["status"] = f"Vue {view}/{views} enregistrée — couche {layer}"
                         self.save()
@@ -3855,7 +3929,6 @@ class Companion:
             with self.lock:
                 camera = self.state["camera"]
                 camera.setdefault("captures", []).insert(0, result)
-                camera["captures"] = camera["captures"][:200]
                 camera["status"] = "Capture de calibration enregistrée"
                 self.save()
             return result
@@ -4279,7 +4352,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 <div id="captureModal" class="capture-modal" hidden onclick="if(event.target===this)closeCapture()"><section class="capture-dialog"><button class="secondary capture-close" onclick="closeCapture()">Fermer</button><h2 id="captureTitle">Capture</h2><button id="printguardCaptureButton" onclick="classifyCurrentCapture()">Analyser avec PrintGuard</button><button id="compareTemporalButton" class="secondary" onclick="compareTemporalViews()">Comparer visuellement au départ</button><button id="calibrateCaptureButton" onclick="startCalibration()">Réglage manuel de secours</button><div id="calibrationActions" class="calibration-actions" hidden><button class="secondary" onclick="undoCalibrationPoint()">Annuler le dernier coin</button><button class="secondary" onclick="skipCalibrationCorner()">Ce coin est hors champ</button><button class="danger" onclick="startCalibration()">Recommencer</button></div><p id="overlayNotice" class="muted"></p><div id="temporalComparison" class="temporal-comparison" hidden></div><div id="captureStage" class="capture-stage"><img id="captureLarge" alt="Capture agrandie"><svg id="captureOverlay" viewBox="0 0 1 1" preserveAspectRatio="none"></svg></div><div id="objectLegend" class="object-legend" aria-label="Légende des objets cartographiés"></div><p id="calibrationPoints" class="calibration-points"></p><div id="captureInfo" class="capture-info"></div></section></div>
 <script>
 const token=__API_TOKEN__,statusEl=document.getElementById('status'),enabledEl=document.getElementById('enabled'),fingerprintEl=document.getElementById('fingerprint'),metaEl=document.getElementById('meta'),galleryEl=document.getElementById('gallery'),modalEl=document.getElementById('captureModal'),titleEl=document.getElementById('captureTitle'),largeEl=document.getElementById('captureLarge'),stageEl=document.getElementById('captureStage'),overlayEl=document.getElementById('captureOverlay'),overlayNoticeEl=document.getElementById('overlayNotice'),legendEl=document.getElementById('objectLegend'),infoEl=document.getElementById('captureInfo'),temporalEl=document.getElementById('temporalComparison'),calibrationStatusEl=document.getElementById('calibrationStatus'),calibrationPointsEl=document.getElementById('calibrationPoints'),calibrationActionsEl=document.getElementById('calibrationActions'),bedXEl=document.getElementById('bedX'),bedYEl=document.getElementById('bedY'),layerCounterEl=document.getElementById('layerCounter'),printguardEnabledEl=document.getElementById('printguardEnabled'),printguardURLEl=document.getElementById('printguardURL'),printguardTokenEl=document.getElementById('printguardToken'),printguardSensitivityEl=document.getElementById('printguardSensitivity'),printguardStatusEl=document.getElementById('printguardStatus');
-let visionState=null,currentCapture=null,currentPlatePoints=null,currentShapeObjects=[],currentPlateMessage='',calibrationMode=false,calibrationPoints=[],calibrationEdgePoints=[],hiddenCornerIndex=-1,selectedObjectIndex=-1;const calibrationKey='ams-lite-vision-plate-calibration-v1';
+let visionState=null,currentCapture=null,currentPlatePoints=null,currentShapeObjects=[],currentPlateMessage='',calibrationMode=false,calibrationPoints=[],calibrationEdgePoints=[],hiddenCornerIndex=-1,selectedObjectIndex=-1,visionGalleryLimit=180;const calibrationKey='ams-lite-vision-plate-calibration-v1';
 async function api(path,opt={}){const response=await fetch(path,{...opt,headers:{'X-AMS-Token':token,'Content-Type':'application/json'}}),body=await response.json();if(!response.ok)throw Error(body.error||'Erreur');return body}
 function esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function captureURL(file){return `/api/captures/${encodeURIComponent(file)}?token=${encodeURIComponent(token)}`}
 async function savePrintGuard(){try{await api('/api/config',{method:'POST',body:JSON.stringify({printguard_enabled:printguardEnabledEl.checked,printguard_base_url:printguardURLEl.value,printguard_token:printguardTokenEl.value,printguard_sensitivity:printguardSensitivityEl.value})});printguardTokenEl.value='';await load()}catch(error){printguardStatusEl.textContent=error.message||'Configuration PrintGuard impossible.'}}
@@ -4314,7 +4387,10 @@ function undoCalibrationPoint(){if(!calibrationMode)return;if(calibrationEdgePoi
 function skipCalibrationCorner(){if(!calibrationMode||calibrationPoints.length>=4)return;if(hiddenCornerIndex>=0){setCalibrationStatus('Un seul coin hors champ peut être reconstruit. Recommence avec une capture où les trois autres coins sont visibles.',true);return}hiddenCornerIndex=calibrationPoints.length;calibrationPoints.push(null);renderCalibrationProgress()}
 largeEl.addEventListener('click',event=>{if(!calibrationMode)return;const box=largeEl.getBoundingClientRect(),x=(event.clientX-box.left)/box.width,y=(event.clientY-box.top)/box.height;if(x<0||x>1||y<0||y>1)return;if(calibrationPoints.length<4)calibrationPoints.push([x,y]);else if(hiddenCornerIndex>=0&&calibrationEdgePoints.length<2)calibrationEdgePoints.push([x,y]);else return;renderCalibrationProgress();finishCalibration()});
 function clearCalibration(){localStorage.removeItem(calibrationKey);calibrationMode=false;calibrationPoints=[];calibrationEdgePoints=[];hiddenCornerIndex=-1;setCalibrationStatus('Calibration effacée.');renderCalibrationProgress();drawOverlay()}
-function render(state){visionState=state;const printer=state.printer||{},camera=state.camera||{},printguard=state.printguard||{},captures=Array.isArray(camera.captures)?camera.captures:[],storage=state.vision_storage||{};const views=camera.capture_views_per_layer||3,delayMin=camera.capture_view_delay_min_seconds||4,delayMax=camera.capture_view_delay_max_seconds||24;layerCounterEl.textContent=Number(printer.layer)>0?`Couche ${Number(printer.layer)}`:'Couche —';statusEl.textContent=camera.status||'Caméra non configurée';enabledEl.checked=!!camera.enabled;fingerprintEl.value=camera.certificate_sha256||'';printguardEnabledEl.checked=!!printguard.enabled;printguardURLEl.value=printguard.base_url||'http://127.0.0.1:8000';printguardSensitivityEl.value=printguard.sensitivity||1;printguardStatusEl.textContent=printguard.status||'PrintGuard non configuré';metaEl.textContent=`Captures, pas vidéo : ${views} vues avec pauses aléatoires de ${delayMin} à ${delayMax} s toutes les ${camera.capture_every_layers||5} couches · dernière couche reçue : ${camera.last_seen_layer||'—'} · ${storage.count||0} image(s).`;window.visionCaptures=captures;const groups=new Map();captures.forEach((item,index)=>{const key=item.folder||'en-cours';if(!groups.has(key))groups.set(key,{name:item.print_name||(item.folder?'Impression terminée':'Impression en cours'),items:[]});groups.get(key).items.push({item,index})});galleryEl.innerHTML=captures.length?[...groups.values()].map(group=>`<div class="capture-group"><div class="capture-group-head"><div><h3>${esc(group.name)}</h3><span>${group.items.length} image(s)</span></div></div><div class="capture-grid">${group.items.map(({item,index})=>{const objectCount=objectsFor(item).length,pg=item.printguard||{},aiBadge=pg.prediction?`<br><span class="map-badge">PrintGuard : ${pg.prediction==='failure'?'risque signalé':'aucun défaut'} (${Math.round(100*Number(pg.defect_score||0))} %)</span>`:'';return `<button class="capture-card" onclick="openCapture(${index})"><img src="${captureURL(item.file)}" alt="Capture couche ${item.layer}, vue ${item.capture_view||1}"><div><b>Couche ${item.layer} · vue ${item.capture_view||1}/${item.capture_views_total||1}</b><br><span class="muted">${esc(item.captured_at)}</span>${aiBadge}${objectCount?`<br><span class="map-badge">${objectCount} objet(s) cartographié(s)</span>`:''}</div></button>`}).join('')}</div></div>`).join(''):'<p>Aucune capture : la première séquence sera prise à la couche 5, pas immédiatement au lancement.</p>';calibration();}
+async function deleteCapturePrint(folder){if(!confirm('Supprimer définitivement toutes les images de cette impression ?'))return;try{await api(`/api/captures/${encodeURIComponent(folder)}/delete`,{method:'POST',body:'{}'});closeCapture();await load()}catch(error){statusEl.textContent=error.message||'Suppression impossible.'}}
+async function deleteActiveCaptureSession(sessionId){if(!confirm('Supprimer les images déjà prises de cette impression ? Les prochaines captures resteront actives.'))return;try{await api(`/api/captures/session/${encodeURIComponent(sessionId)}/delete`,{method:'POST',body:'{}'});closeCapture();await load()}catch(error){statusEl.textContent=error.message||'Suppression impossible.'}}
+function showMoreCaptures(){visionGalleryLimit+=180;if(visionState)render(visionState)}
+function render(state){visionState=state;const printer=state.printer||{},camera=state.camera||{},printguard=state.printguard||{},captures=Array.isArray(camera.captures)?camera.captures:[],storage=state.vision_storage||{};const views=camera.capture_views_per_layer||3,delayMin=camera.capture_view_delay_min_seconds||4,delayMax=camera.capture_view_delay_max_seconds||24;layerCounterEl.textContent=Number(printer.layer)>0?`Couche ${Number(printer.layer)}`:'Couche —';statusEl.textContent=camera.status||'Caméra non configurée';enabledEl.checked=!!camera.enabled;fingerprintEl.value=camera.certificate_sha256||'';printguardEnabledEl.checked=!!printguard.enabled;printguardURLEl.value=printguard.base_url||'http://127.0.0.1:8000';printguardSensitivityEl.value=printguard.sensitivity||1;printguardStatusEl.textContent=printguard.status||'PrintGuard non configuré';metaEl.textContent=`Captures, pas vidéo : ${views} vues avec pauses aléatoires de ${delayMin} à ${delayMax} s toutes les ${camera.capture_every_layers||5} couches · dernière couche reçue : ${camera.last_seen_layer||'—'} · ${storage.count||0} image(s) conservée(s) localement.`;window.visionCaptures=captures;const visibleCaptures=captures.slice(0,visionGalleryLimit),groups=new Map();visibleCaptures.forEach((item,index)=>{const key=item.folder||'en-cours';if(!groups.has(key))groups.set(key,{name:item.print_name||(item.folder?'Impression terminée':'Impression en cours'),folder:item.folder||'',sessionId:item.print_id||'',items:[]});groups.get(key).items.push({item,index})});const gallery=visibleCaptures.length?[...groups.values()].map(group=>{const deletion=group.folder?`<button class="danger" onclick="deleteCapturePrint('${esc(group.folder)}')">Supprimer</button>`:/^[a-f0-9]{16}$/.test(group.sessionId)?`<button class="danger" onclick="deleteActiveCaptureSession('${esc(group.sessionId)}')">Supprimer</button>`:'';return `<div class="capture-group"><div class="capture-group-head"><div><h3>${esc(group.name)}</h3><span>${group.items.length} image(s)</span></div>${deletion}</div><div class="capture-grid">${group.items.map(({item,index})=>{const objectCount=objectsFor(item).length,pg=item.printguard||{},aiBadge=pg.prediction?`<br><span class="map-badge">PrintGuard : ${pg.prediction==='failure'?'risque signalé':'aucun défaut'} (${Math.round(100*Number(pg.defect_score||0))} %)</span>`:'';return `<button class="capture-card" onclick="openCapture(${index})"><img src="${captureURL(item.file)}" alt="Capture couche ${item.layer}, vue ${item.capture_view||1}"><div><b>Couche ${item.layer} · vue ${item.capture_view||1}/${item.capture_views_total||1}</b><br><span class="muted">${esc(item.captured_at)}</span>${aiBadge}${objectCount?`<br><span class="map-badge">${objectCount} objet(s) cartographié(s)</span>`:''}</div></button>`}).join('')}</div></div>`}).join(''):'<p>Aucune capture : la première séquence sera prise à la couche 5, pas immédiatement au lancement.</p>';const remaining=captures.length-visibleCaptures.length;galleryEl.innerHTML=gallery+(remaining>0?`<p class="muted">${remaining} image(s) plus ancienne(s) restent dans l’historique local.<br><button class="secondary" onclick="showMoreCaptures()">Afficher 180 images supplémentaires</button></p>`:'');calibration();}
 async function load(){try{render(await api('/api/state'))}catch(error){statusEl.textContent=error.message}}async function saveCamera(){try{await api('/api/config',{method:'POST',body:JSON.stringify({camera_enabled:enabledEl.checked,camera_certificate_sha256:fingerprintEl.value})});await load()}catch(error){statusEl.textContent=error.message}}async function discover(){try{fingerprintEl.value=(await api('/api/camera/discover',{method:'POST',body:'{}'})).fingerprint;statusEl.textContent='Empreinte détectée : enregistre-la pour l’approuver.'}catch(error){statusEl.textContent=error.message}}document.addEventListener('keydown',event=>{if(event.key==='Escape')closeCapture()});load();setInterval(load,3000);
 </script></html>'''.replace("__API_TOKEN__", json.dumps(api_token))
 

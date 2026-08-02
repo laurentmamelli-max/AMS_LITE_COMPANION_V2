@@ -273,6 +273,10 @@ class CompanionTests(unittest.TestCase):
         self.assertIn('/api/captures/${encodeURIComponent(file)}?token=${encodeURIComponent(token)}', page)
         self.assertIn('.capture-card img', page)
         self.assertIn('function openCapture(index)', page)
+        self.assertIn('function showMoreCaptures()', page)
+        self.assertIn('function deleteCapturePrint(folder)', page)
+        self.assertIn('visionGalleryLimit=180', page)
+        self.assertIn('images supplémentaires', page)
         self.assertIn('id="captureModal"', page)
         self.assertIn('ce n’est pas une vidéo en direct', page)
         self.assertIn('IA de détection PrintGuard', page)
@@ -500,7 +504,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("3.8.0", report["application"]["version"])
+            self.assertEqual("3.8.1", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -574,6 +578,31 @@ class CompanionTests(unittest.TestCase):
                 {"count": 2, "bytes": 8, "completed": 1, "active": 1},
                 app.vision_storage(),
             )
+
+    def test_startup_restores_unlimited_vision_history_from_local_jpegs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            root = path.parent / "captures"
+            folder = "print-20260802-historique"
+            (root / folder).mkdir(parents=True)
+            active = "layer-00005-20260802-010101.jpg"
+            completed = "layer-00010-20260802-010202.jpg"
+            (root / active).write_bytes(b"active")
+            (root / folder / completed).write_bytes(b"completed")
+            app = ac.Companion(path)
+            captures = app.state["camera"]["captures"]
+            self.assertEqual(2, len(captures))
+            self.assertEqual({active, completed}, {item["file"] for item in captures})
+            restored = next(item for item in captures if item["file"] == completed)
+            self.assertEqual(folder, restored["folder"])
+            self.assertEqual("Impression archivée", restored["print_name"])
+            self.assertEqual(
+                {"count": 2, "bytes": 15, "completed": 1, "active": 1},
+                app.vision_storage(),
+            )
+            deleted = app.delete_capture_print(folder)
+            self.assertEqual(1, deleted["deleted"])
+            self.assertFalse((root / folder).exists())
 
     def test_guardian_rejects_an_object_missing_from_active_gcode_map(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1442,11 +1471,11 @@ class CompanionTests(unittest.TestCase):
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("3.8.0", report["application"]["version"])
+                self.assertEqual("3.8.1", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
                 self.assertIn("Poste de supervision", html)
                 self.assertIn("Historique Vision et rapports", html)
-                self.assertIn("Compteur local v3.8.0", html)
+                self.assertIn("Compteur local v3.8.1", html)
                 self.assertIn("shutdownCard.after(auditCard)", html)
                 self.assertIn("auditCard.after(reportsCard)", html)
                 snapshot_request = urllib.request.Request(

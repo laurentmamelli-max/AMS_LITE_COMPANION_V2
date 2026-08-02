@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.8.1 — 2026-08-02
+
+- Le Centre Vision ne limite plus son historique à 200 captures. Les futures
+  captures restent toutes indexées jusqu'à leur suppression explicite.
+- Au lancement, Companion restaure automatiquement dans l'historique les JPEG
+  valides que l'ancienne limite avait laissés sur le disque.
+- La galerie charge les 180 images les plus récentes, puis propose d'afficher
+  les suivantes afin de garder la fenêtre fluide, sans masquer l'historique.
+
 ## 3.8.0 — 2026-08-02
 
 - Le Centre Vision s’appuie désormais sur PrintGuard, moteur open source local
