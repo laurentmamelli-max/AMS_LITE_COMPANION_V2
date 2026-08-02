@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.8.5 — 2026-08-03
+
+- Une alerte de vérification Vision ouvre désormais directement le Centre
+  Vision, avec les deux choix clairs « Ouvrir Centre Vision » et « Plus tard ».
+- Suppression du doublon de popup dans le panneau Companion : une seule alerte
+  locale est présentée pour une même vérification.
+
 ## 3.8.4 — 2026-08-03
 
 - Correctif Centre Vision : une erreur JavaScript empêchait le chargement de

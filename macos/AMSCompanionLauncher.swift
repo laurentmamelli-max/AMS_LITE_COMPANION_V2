@@ -500,15 +500,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
         let title = alert["title"] as? String ?? "Alerte Companion"
         let message = alert["message"] as? String ?? "Vérifie l’impression."
+        let source = alert["source"] as? String ?? ""
+        let opensVision = source == "vision_guard"
         let popup = NSAlert()
         popup.messageText = title
         popup.informativeText = "\(message)\n\nAucune commande n’est envoyée à l’imprimante."
         popup.alertStyle = .warning
-        popup.addButton(withTitle: "Afficher le Gardien")
+        popup.addButton(withTitle: opensVision ? "Ouvrir Centre Vision" : "Afficher la supervision")
         popup.addButton(withTitle: "Plus tard")
         NSApp.activate(ignoringOtherApps: true)
         if popup.runModal() == .alertFirstButtonReturn {
-            showPanel()
+            if opensVision {
+                presentVision()
+            } else {
+                showPanel()
+            }
         }
     }
 
