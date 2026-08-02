@@ -64,11 +64,11 @@ estimations et peuvent être corrigés manuellement après une pesée.
 ## Détection IA stable
 
 Companion V3.8 utilise le moteur open source [PrintGuard](https://github.com/oliverbravery/PrintGuard)
-comme application locale indépendante. Installez et lancez PrintGuard, puis dans
-le Centre Vision activez « Analyser automatiquement chaque nouvelle capture »
-et cliquez « Tester PrintGuard ». Par défaut, Companion communique uniquement
-avec `http://127.0.0.1:8000` : les images ne quittent pas le Mac et le code LAN
-Bambu n’est jamais transmis au moteur IA.
+comme application locale indépendante. Sur le Mac de production, PrintGuard est
+installé depuis son tag source verrouillé et lancé automatiquement en arrière-plan
+sur `127.0.0.1:8000`. Dans le Centre Vision, activez « Analyser automatiquement
+chaque nouvelle capture » puis cliquez « Tester PrintGuard ». Les images ne
+quittent pas le Mac et le code LAN Bambu n’est jamais transmis au moteur IA.
 
 Une alerte PrintGuard ne pause, n’annule et n’exclut jamais rien. L’exclusion
 manuelle Bambu déjà présente reste un choix séparé, explicitement confirmé.

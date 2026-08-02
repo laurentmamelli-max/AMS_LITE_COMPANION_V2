@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>fr.laurentmamelli.printguard.local</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>exec env DATA_DIR=&quot;$HOME/Library/Application Support/AMS Lite Companion V2/printguard-data&quot; MODEL_DIR=&quot;$HOME/Library/Application Support/AMS Lite Companion V2/printguard-engine-v2.3.7/models&quot; STATIC_DIR=&quot;$HOME/Library/Application Support/AMS Lite Companion V2/printguard-engine-v2.3.7/web/dist&quot; PYTHONPATH=&quot;$HOME/Library/Application Support/AMS Lite Companion V2/printguard-engine-v2.3.7&quot; LOG_FILE=&quot;$HOME/Library/Application Support/AMS Lite Companion V2/printguard-data/printguard.log&quot; &quot;$HOME/Library/Application Support/AMS Lite Companion V2/printguard-engine-v2.3.7/.venv/bin/python&quot; -m uvicorn printguard.server.app:create_app --factory --host 127.0.0.1 --port 8000</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/Users/laurent/Library/Application Support/AMS Lite Companion V2/printguard-data/printguard-launch.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/laurent/Library/Application Support/AMS Lite Companion V2/printguard-data/printguard-launch-error.log</string>
+</dict>
+</plist>

@@ -11,6 +11,9 @@
 - PrintGuard reste une application distincte, limitée à `localhost`. Companion
   ne lui transmet ni code LAN Bambu ni capacité de pause, annulation ou
   exclusion. La cartographie 3MF est clairement ramenée à un repère manuel.
+- Ajout du service macOS local `fr.laurentmamelli.printguard.local`, qui lance
+  le moteur sur `127.0.0.1` au démarrage de session sans jamais l’exposer au
+  réseau local.
 
 ## 3.7.0 — 2026-08-02
 
