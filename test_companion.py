@@ -229,6 +229,8 @@ class CompanionTests(unittest.TestCase):
             self.assertNotIn("pending_capture_layer", app.state["camera"])
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "cam", "layer_num": 5}})
             self.assertEqual(5, app.state["camera"]["pending_capture_layer"])
+            self.assertEqual(0, app.state["camera"]["pending_capture_view"])
+            self.assertEqual(3, app.state["camera"]["capture_views_per_layer"])
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "cam", "layer_num": 5}})
             self.assertEqual(5, app.state["camera"]["last_requested_layer"])
 
@@ -362,6 +364,49 @@ class CompanionTests(unittest.TestCase):
             persisted = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(5, persisted["camera"]["pending_capture_layer"])
 
+    def test_camera_keeps_one_following_checkpoint_while_sequence_is_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.state["camera"].update({
+                "capture_in_progress": True,
+                "pending_capture_layer": 5,
+                "pending_capture_session_id": "first-session",
+                "last_requested_layer": 5,
+            })
+            with app.lock:
+                app._schedule_camera_capture_locked({"layer_num": 10}, "RUNNING")
+            self.assertEqual(5, app.state["camera"]["pending_capture_layer"])
+            self.assertEqual(10, app.state["camera"]["queued_capture_layer"])
+            self.assertEqual(10, app.state["camera"]["last_requested_layer"])
+
+    def test_camera_sequence_records_three_spaced_views_for_one_layer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.state["camera"].update({
+                "pending_capture_layer": 5,
+                "pending_capture_session_id": "vision-session",
+                "pending_capture_view": 0,
+                "capture_views_per_layer": 3,
+                "capture_view_delay_seconds": 7,
+            })
+            frame = SimpleNamespace(jpeg=b"jpeg-data", sha256="b" * 64)
+            with mock.patch.object(ac, "capture_jpeg", return_value=frame) as capture, \
+                    mock.patch.object(ac.time, "sleep") as sleep, \
+                    mock.patch.object(ac.time, "strftime", side_effect=[
+                        "20260802-010101", "2026-08-02T01:01:01+0200",
+                        "20260802-010108", "2026-08-02T01:01:08+0200",
+                        "20260802-010115", "2026-08-02T01:01:15+0200",
+                    ]):
+                app._capture_pending_camera()
+            captures = app.state["camera"]["captures"]
+            self.assertEqual(3, len(captures))
+            self.assertEqual([3, 2, 1], [item["capture_view"] for item in captures])
+            self.assertTrue(all(item["layer"] == 5 for item in captures))
+            self.assertEqual(3, capture.call_count)
+            self.assertEqual(2, sleep.call_count)
+            self.assertEqual(0, app.state["camera"]["pending_capture_layer"])
+            self.assertEqual("", app.state["camera"]["pending_capture_session_id"])
+
     def test_mqtt_events_are_durable_and_never_store_the_lan_code(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.json"
@@ -392,7 +437,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("3.4.5", report["application"]["version"])
+            self.assertEqual("3.5.0", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -1334,11 +1379,11 @@ class CompanionTests(unittest.TestCase):
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("3.4.5", report["application"]["version"])
+                self.assertEqual("3.5.0", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
                 self.assertIn("Poste de supervision", html)
                 self.assertIn("Historique Vision et rapports", html)
-                self.assertIn("Compteur local v3.4.5", html)
+                self.assertIn("Compteur local v3.5.0", html)
                 self.assertIn("shutdownCard.after(auditCard)", html)
                 self.assertIn("auditCard.after(reportsCard)", html)
                 snapshot_request = urllib.request.Request(

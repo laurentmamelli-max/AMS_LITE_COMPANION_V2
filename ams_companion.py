@@ -61,7 +61,7 @@ EVENTS_FILE = APP_DIR / "events.sqlite3"
 AUTOPILOT_FILE = APP_DIR / "autopilot.sqlite3"
 REPORTS_FILE = APP_DIR / "reports.sqlite3"
 HOST, PORT = "127.0.0.1", 8766
-__version__ = "3.4.5"
+__version__ = "3.5.0"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -300,6 +300,11 @@ def default_state() -> dict[str, Any]:
             "enabled": False,
             "certificate_sha256": "",
             "capture_every_layers": 5,
+            # A single frame at a layer boundary often catches the toolhead in
+            # the same place.  Keep a short read-only sequence so the next
+            # moves reveal the parts that were temporarily obscured.
+            "capture_views_per_layer": 3,
+            "capture_view_delay_seconds": 7,
             "last_seen_layer": 0,
             "last_requested_layer": 0,
             "status": "Caméra non configurée",
@@ -2241,6 +2246,8 @@ class Companion:
                 "enabled": bool(state.get("camera", {}).get("enabled")),
                 "status": state.get("camera", {}).get("status", ""),
                 "capture_every_layers": state.get("camera", {}).get("capture_every_layers", 5),
+                "capture_views_per_layer": state.get("camera", {}).get("capture_views_per_layer", 3),
+                "capture_view_delay_seconds": state.get("camera", {}).get("capture_view_delay_seconds", 7),
                 "storage": state.get("vision_storage", {}),
             },
             "guardian": state.get("guardian", {}),
@@ -2845,8 +2852,8 @@ class Companion:
                 camera["certificate_sha256"] = fingerprint
             if camera.get("enabled") and camera.get("certificate_sha256"):
                 camera["status"] = (
-                    f"Surveillance active — une capture toutes les "
-                    f"{int(camera.get('capture_every_layers', 5) or 5)} couches"
+                    f"Surveillance active — {int(camera.get('capture_views_per_layer', 3) or 3)} vues "
+                    f"toutes les {int(camera.get('capture_every_layers', 5) or 5)} couches"
                 )
             elif not camera.get("enabled"):
                 camera["status"] = "Captures automatiques désactivées"
@@ -3326,6 +3333,9 @@ class Companion:
         camera["last_requested_layer"] = 0
         camera.pop("pending_capture_layer", None)
         camera.pop("pending_capture_session_id", None)
+        camera.pop("pending_capture_view", None)
+        camera.pop("queued_capture_layer", None)
+        camera.pop("queued_capture_session_id", None)
         if adopt_ungrouped:
             for image in camera.get("captures", []):
                 if isinstance(image, dict) and not image.get("print_id") and not image.get("folder"):
@@ -3374,6 +3384,16 @@ class Companion:
         if not session_id or not re.fullmatch(r"print-[a-zA-Z0-9._-]+", folder_name):
             log("Vision: session de captures invalide, rangement ignoré")
             return
+        # A sequence is only useful while the print is moving.  Stop the
+        # remaining delayed views at the terminal MQTT event; a frame already
+        # in flight may still be stored safely in the completed folder below.
+        if str(camera.get("pending_capture_session_id") or "") == session_id:
+            camera["pending_capture_layer"] = 0
+            camera["pending_capture_session_id"] = ""
+            camera.pop("pending_capture_view", None)
+        if str(camera.get("queued_capture_session_id") or "") == session_id:
+            camera.pop("queued_capture_layer", None)
+            camera.pop("queued_capture_session_id", None)
         root = self.state_path.parent / "captures"
         destination = root / folder_name
         secure_directory(destination)
@@ -3475,7 +3495,7 @@ class Companion:
             return {"ok": True, "deleted": deleted, "session_id": session_id}
 
     def _schedule_camera_capture_locked(self, report: dict[str, Any], state: str) -> None:
-        """Queue one future camera capture at each configured layer interval."""
+        """Queue a short multi-view camera sequence at each layer interval."""
         # Vision is observational.  It must also cover a print already in
         # progress when Companion starts, even if the consumption bridge did
         # not arm that job first.
@@ -3492,78 +3512,129 @@ class Companion:
         camera["last_seen_layer"] = max(int(camera.get("last_seen_layer", 0) or 0), layer)
         if layer % every or layer <= int(camera.get("last_requested_layer", 0) or 0):
             return
-        camera["last_requested_layer"] = layer
-        camera["pending_capture_layer"] = layer
         active_print = camera.get("active_print")
-        camera["pending_capture_session_id"] = (
+        session_id = (
             str(active_print.get("id") or "") if isinstance(active_print, dict) else ""
         )
-        camera["status"] = f"Capture demandée à la couche {layer}"
+        camera["last_requested_layer"] = layer
+        # Do not overwrite a sequence currently reading the camera.  One
+        # following layer checkpoint is retained and starts as soon as the
+        # current sequence completes, so fast, low layers do not race the
+        # daemon or accidentally save an image under the wrong layer number.
+        if camera.get("capture_in_progress") or camera.get("pending_capture_layer"):
+            camera["queued_capture_layer"] = layer
+            camera["queued_capture_session_id"] = session_id
+            camera["status"] = f"Séquence en cours — couche {layer} mise en attente"
+            self.save()
+            log(f"Caméra: séquence couche {layer} mise en attente")
+            return
+        camera["pending_capture_layer"] = layer
+        camera["pending_capture_session_id"] = session_id
+        camera["pending_capture_view"] = 0
+        views = max(1, int(camera.get("capture_views_per_layer", 3) or 3))
+        camera["status"] = f"{views} vues demandées à la couche {layer}"
         # Persist the request before starting the daemon.  A macOS relaunch
         # can otherwise kill the thread between this point and the JPEG save.
         self.save()
-        log(f"Caméra: capture planifiée à la couche {layer}")
+        log(f"Caméra: séquence de {views} vues planifiée à la couche {layer}")
         if camera.get("enabled") and camera.get("certificate_sha256"):
             threading.Thread(target=self._capture_pending_camera, daemon=True).start()
 
     def _capture_pending_camera(self) -> None:
-        """Capture outside the MQTT lock; failures remain local and observable."""
+        """Capture spaced views outside the MQTT lock, without printer control."""
         with self.lock:
             camera = self.state.setdefault("camera", {})
-            layer = int(camera.get("pending_capture_layer", 0) or 0)
-            if not layer or camera.get("capture_in_progress"):
+            if camera.get("capture_in_progress"):
                 return
             camera["capture_in_progress"] = True
-            session_id = str(camera.get("pending_capture_session_id") or "")
-            host = str(self.state["config"].get("ip") or "")
-            code = str(self.state["config"].get("access_code") or "")
-            fingerprint = str(camera.get("certificate_sha256") or "")
         try:
-            frame = capture_jpeg(host, code, fingerprint)
-            root = self.state_path.parent / "captures"
-            secure_directory(root)
-            stamp = time.strftime("%Y%m%d-%H%M%S")
-            filename = f"layer-{layer:05d}-{stamp}.jpg"
-            with self.lock:
-                completed = next(
-                    (item for item in self.state["camera"].get("completed_prints", [])
-                     if isinstance(item, dict) and item.get("id") == session_id),
-                    None,
-                )
-                completed_folder = str(completed.get("folder") or "") if completed else ""
-            image_folder = root
-            if re.fullmatch(r"print-[a-zA-Z0-9._-]+", completed_folder):
-                image_folder = root / completed_folder
-                secure_directory(image_folder)
-            image_path = image_folder / filename
-            image_path.write_bytes(frame.jpeg)
-            os.chmod(image_path, 0o600)
-            active_job = self.state.get("active_job")
-            active_map = active_job.get("object_map", {}) if isinstance(active_job, dict) else {}
-            result = {"layer": layer, "captured_at": now_iso(), "file": filename,
-                      "sha256": frame.sha256, "size_bytes": len(frame.jpeg), "print_id": session_id,
-                      # Keep the verified G-code map alongside the frame so a
-                      # completed print can still be reviewed with its object
-                      # overlay, even after the next job starts.
-                      "object_map": active_map if isinstance(active_map, dict) else {}}
-            if completed_folder:
-                result["folder"] = completed_folder
-                result["print_name"] = str(completed.get("name") or "Impression Bambu")
-            with self.lock:
-                camera = self.state["camera"]
-                camera.setdefault("captures", []).insert(0, result)
-                camera["captures"] = camera["captures"][:200]
-                camera["pending_capture_layer"] = 0
-                camera["pending_capture_session_id"] = ""
-                camera["status"] = f"Capture enregistrée — couche {layer}"
-                self.save()
-        except CameraError as exc:
-            with self.lock:
-                camera = self.state["camera"]
-                camera["pending_capture_layer"] = 0
-                camera["pending_capture_session_id"] = ""
-                camera["status"] = f"Capture caméra impossible : {exc}"
-                self.save()
+            while True:
+                with self.lock:
+                    camera = self.state.setdefault("camera", {})
+                    layer = int(camera.get("pending_capture_layer", 0) or 0)
+                    if not layer:
+                        break
+                    session_id = str(camera.get("pending_capture_session_id") or "")
+                    view = int(camera.get("pending_capture_view", 0) or 0) + 1
+                    views = max(1, int(camera.get("capture_views_per_layer", 3) or 3))
+                    delay = max(1, int(camera.get("capture_view_delay_seconds", 7) or 7))
+                    host = str(self.state["config"].get("ip") or "")
+                    code = str(self.state["config"].get("access_code") or "")
+                    fingerprint = str(camera.get("certificate_sha256") or "")
+                try:
+                    frame = capture_jpeg(host, code, fingerprint)
+                    root = self.state_path.parent / "captures"
+                    secure_directory(root)
+                    stamp = time.strftime("%Y%m%d-%H%M%S")
+                    filename = f"layer-{layer:05d}-{stamp}.jpg"
+                    with self.lock:
+                        completed = next(
+                            (item for item in self.state["camera"].get("completed_prints", [])
+                             if isinstance(item, dict) and item.get("id") == session_id),
+                            None,
+                        )
+                        completed_folder = str(completed.get("folder") or "") if completed else ""
+                    image_folder = root
+                    if re.fullmatch(r"print-[a-zA-Z0-9._-]+", completed_folder):
+                        image_folder = root / completed_folder
+                        secure_directory(image_folder)
+                    image_path = image_folder / filename
+                    image_path.write_bytes(frame.jpeg)
+                    os.chmod(image_path, 0o600)
+                    active_job = self.state.get("active_job")
+                    active_map = active_job.get("object_map", {}) if isinstance(active_job, dict) else {}
+                    result = {"layer": layer, "captured_at": now_iso(), "file": filename,
+                              "sha256": frame.sha256, "size_bytes": len(frame.jpeg), "print_id": session_id,
+                              "capture_view": view, "capture_views_total": views,
+                              # Keep the verified G-code map alongside the frame so a
+                              # completed print can still be reviewed with its object
+                              # overlay, even after the next job starts.
+                              "object_map": active_map if isinstance(active_map, dict) else {}}
+                    if completed_folder:
+                        result["folder"] = completed_folder
+                        result["print_name"] = str(completed.get("name") or "Impression Bambu")
+                    with self.lock:
+                        camera = self.state["camera"]
+                        camera.setdefault("captures", []).insert(0, result)
+                        camera["captures"] = camera["captures"][:200]
+                        camera["pending_capture_view"] = view
+                        camera["status"] = f"Vue {view}/{views} enregistrée — couche {layer}"
+                        self.save()
+                except (CameraError, OSError) as exc:
+                    with self.lock:
+                        camera = self.state["camera"]
+                        camera["pending_capture_view"] = view
+                        camera["status"] = f"Vue {view}/{views} impossible : {exc}"
+                        self.save()
+
+                with self.lock:
+                    camera = self.state["camera"]
+                    still_pending = int(camera.get("pending_capture_layer", 0) or 0) == layer
+                    more_views = view < views and still_pending
+                    if not more_views:
+                        camera["pending_capture_layer"] = 0
+                        camera["pending_capture_session_id"] = ""
+                        camera.pop("pending_capture_view", None)
+                    self.save()
+                if more_views:
+                    # Deliberately wait between frames: the toolhead can move
+                    # significantly in this interval, yielding useful points
+                    # of view without ever issuing a printer command.
+                    time.sleep(delay)
+                    continue
+
+                with self.lock:
+                    camera = self.state["camera"]
+                    queued_layer = int(camera.pop("queued_capture_layer", 0) or 0)
+                    queued_session = str(camera.pop("queued_capture_session_id", "") or "")
+                    if queued_layer:
+                        camera["pending_capture_layer"] = queued_layer
+                        camera["pending_capture_session_id"] = queued_session
+                        camera["pending_capture_view"] = 0
+                        camera["status"] = f"Séquence reprise à la couche {queued_layer}"
+                        self.save()
+                        continue
+                break
         finally:
             with self.lock:
                 camera = self.state["camera"]
@@ -3975,7 +4046,7 @@ async function downloadArchivedReport(id){try{let response=await fetch('/api/rep
 createSpool=async function(){try{await api('/api/inventory/spools',{method:'POST',body:JSON.stringify({name:$('newSpoolName').value,material:$('newSpoolMaterial').value,brand:$('newSpoolBrand').value,color:$('newSpoolColor').value,initial_g:+$('newSpoolInitial').value,remaining_g:+$('newSpoolRemaining').value,storage_location:$('newSpoolLocation').value,low_stock_g:+$('newSpoolThreshold').value,created_at:$('newSpoolDate').value})});['newSpoolName','newSpoolMaterial','newSpoolBrand','newSpoolColor','newSpoolLocation'].forEach(id=>$(id).value='');delete $('newSpoolName').dataset.custom;catalogLoaded=false;msg('Bobine ajoutée au catalogue.');refresh()}catch(e){msg(e.message,true)}};
 const visionView=new URLSearchParams(location.search).get('vision')==='1';
 function openVision(){if(window.webkit?.messageHandlers?.companion)window.webkit.messageHandlers.companion.postMessage('openVision');else window.open('/?vision=1','ams-lite-vision')}
-function renderVision(s){let camera=s.camera||{},captures=camera.captures||[];$('visionStatus').textContent=camera.status||'Caméra non configurée';$('visionEnabled').checked=!!camera.enabled;$('visionFingerprint').value=camera.certificate_sha256||'';$('visionMeta').textContent=`Cadence : une image toutes les ${camera.capture_every_layers||5} couches · dernière couche vue : ${camera.last_seen_layer||'—'}`;$('visionGallery').innerHTML=captures.length?captures.map(x=>`<article><b>Couche ${x.layer}</b><br><span>${esc(x.captured_at)}</span><br><code>${esc(x.file)}</code></article>`).join(''):'<p>Aucune capture enregistrée.</p>'}
+function renderVision(s){let camera=s.camera||{},captures=camera.captures||[];$('visionStatus').textContent=camera.status||'Caméra non configurée';$('visionEnabled').checked=!!camera.enabled;$('visionFingerprint').value=camera.certificate_sha256||'';$('visionMeta').textContent=`Cadence : ${camera.capture_views_per_layer||3} vues espacées de ${camera.capture_view_delay_seconds||7} s toutes les ${camera.capture_every_layers||5} couches · dernière couche vue : ${camera.last_seen_layer||'—'}`;$('visionGallery').innerHTML=captures.length?captures.map(x=>`<article><b>Couche ${x.layer} · vue ${x.capture_view||1}/${x.capture_views_total||1}</b><br><span>${esc(x.captured_at)}</span><br><code>${esc(x.file)}</code></article>`).join(''):'<p>Aucune capture enregistrée.</p>'}
 async function saveVision(){try{await api('/api/config',{method:'POST',body:JSON.stringify({camera_enabled:$('visionEnabled').checked,camera_certificate_sha256:$('visionFingerprint').value})});$('visionStatus').textContent='Configuration Vision enregistrée.'}catch(e){$('visionStatus').textContent=e.message}}
 async function discoverVision(){try{let result=await api('/api/camera/discover',{method:'POST',body:'{}'});$('visionFingerprint').value=result.fingerprint;$('visionStatus').textContent='Empreinte détectée. Vérifie-la puis enregistre la configuration.'}catch(e){$('visionStatus').textContent=e.message}}
 if(visionView){let button=document.createElement('button');button.className='secondary';button.textContent='Détecter la caméra';button.onclick=discoverVision;$('visionFingerprint').before(button)}
@@ -4005,7 +4076,7 @@ def render_vision_html(api_token: str) -> str:
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f4f5f6;color:#20242a;margin:0}main{max-width:1100px;margin:auto;padding:28px}section{background:#fff;border:1px solid #dfe3e7;border-radius:10px;padding:18px;margin-top:16px}button,input{font:inherit;box-sizing:border-box}button{padding:9px 13px;background:#00a23d;border:0;border-radius:7px;color:#fff;font-weight:600;cursor:pointer;margin:4px}.secondary{background:#59636e}.danger{background:#b5392e}.notice{padding:12px;border-radius:8px;background:#fff1e7;color:#934210;font-weight:600}.muted{color:#69717b}.warning{color:#9a3f10;font-weight:600}.fields{display:grid;grid-template-columns:repeat(2,minmax(120px,220px));gap:10px;align-items:end}.fields label{display:grid;gap:5px;font-size:13px}.fields input{padding:8px;border:1px solid #cbd1d7;border-radius:7px}#gallery{display:grid;gap:24px}.capture-group{border-top:1px solid #dfe3e7;padding-top:14px}.capture-group:first-child{border-top:0;padding-top:0}.capture-group-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.capture-group-head h3{margin:0}.capture-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin-top:10px}.capture-card{display:block;width:100%;padding:0;background:#fff;color:#20242a;text-align:left;border:1px solid #dfe3e7;overflow:hidden}.capture-card img{display:block;width:100%;aspect-ratio:4/3;object-fit:cover;background:#e9edf0}.capture-card div{padding:9px}.map-badge{display:inline-block;margin-top:5px;padding:2px 6px;border-radius:99px;background:#fff0ed;color:#a13228;font-size:11px}.capture-modal{position:fixed;inset:0;z-index:10;background:#000b;display:grid;place-items:center;padding:24px;box-sizing:border-box}.capture-modal[hidden]{display:none}.capture-dialog{position:relative;box-sizing:border-box;width:min(1120px,calc(100vw - 32px));max-height:calc(100vh - 32px);overflow:auto;background:#fff;border-radius:12px;padding:20px;box-shadow:0 12px 50px #0008}.capture-close{position:absolute;right:14px;top:8px;margin:0}.capture-stage{position:relative;display:inline-block;max-width:100%;margin-top:12px}.capture-stage.calibrating{cursor:crosshair}.capture-stage img{display:block;max-width:100%;max-height:66vh;border-radius:8px;background:#e9edf0}.capture-stage svg{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}.calibration-actions{display:flex;flex-wrap:wrap;gap:4px;margin:8px 0}.calibration-actions button{margin:0}.object-legend{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:7px;margin-top:12px}.object-legend:empty{display:none}.legend-item{display:flex;align-items:flex-start;gap:8px;width:100%;margin:0;padding:8px 10px;border:1px solid #dfe3e7;border-radius:8px;background:#fff;color:#20242a;text-align:left}.legend-item:hover,.legend-item.selected{border-color:#087535;background:#f2fbf5}.legend-swatch{flex:0 0 auto;width:22px;height:22px;border-radius:50%;display:grid;place-items:center;color:#fff;font-size:11px;font-weight:800}.legend-item b{display:block;font-size:12px;line-height:1.25}.legend-item small{display:block;margin-top:2px;color:#69717b;font-size:11px}.capture-info{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:14px}.capture-info div{background:#f5f7f8;border-radius:7px;padding:9px;overflow-wrap:anywhere}.capture-info b{display:block;font-size:12px;color:#66707a;margin-bottom:3px}.calibration-points{margin-top:8px;font-size:13px}.calibration-points b{color:#b5392e}@media(max-width:650px){main{padding:12px}.fields{grid-template-columns:1fr}.capture-dialog{padding:16px}}
 </style><main>
 <h1>Centre Vision</h1>
-<p class="notice">Captures automatiques périodiques : <strong>ce n’est pas une vidéo en direct</strong>. Une image est prise à la couche 5, puis toutes les 5 couches.</p>
+<p class="notice">Captures automatiques périodiques : <strong>ce n’est pas une vidéo en direct</strong>. Trois vues espacées de sept secondes sont prises à la couche 5, puis toutes les 5 couches, afin de voir les objets masqués par la tête.</p>
 <section><h2>Impression en cours</h2><p id="layerCounter" style="font-size:42px;font-weight:800;margin:4px 0;color:#087535">Couche —</p><p class="muted">Compteur reçu directement de l’imprimante.</p></section>
 <section><h2>Caméra</h2><p id="status">Chargement…</p><label><input id="enabled" type="checkbox"> Activer les captures automatiques (pas de flux vidéo)</label><p class="muted">Le Centre Vision se met à jour toutes les trois secondes après chaque nouvelle capture.</p><label>Empreinte TLS</label><input id="fingerprint" placeholder="Détecte-la automatiquement"><button class="secondary" onclick="discover()">Détecter la caméra</button><button onclick="saveCamera()">Enregistrer</button><p id="meta" class="muted"></p></section>
 <section><h2>Reconnaissance des formes 3MF</h2><p>Le moteur Vision reconstruit les silhouettes du plateau depuis le 3MF tranché et les cherche directement dans chaque capture. Il ne suit ni le fond, ni la tête de l’imprimante.</p><div class="fields"><label>Largeur G-code du plateau (mm)<input id="bedX" type="number" min="1" max="500" step="1" value="180"></label><label>Profondeur G-code du plateau (mm)<input id="bedY" type="number" min="1" max="500" step="1" value="180"></label></div><button class="secondary" onclick="installVisionEngine()">Installer le moteur de formes</button><button class="secondary" onclick="startAutoCalibration()">Rechercher les formes dans cette capture</button><button class="secondary" onclick="startCalibration()">Réglage manuel de secours…</button><p id="calibrationStatus" class="muted">Si aucune forme n’est assez sûre ou si les pièces sont masquées, aucun contour n’est affiché.</p></section>
@@ -4028,7 +4099,7 @@ function calibrationGuide(){if(!calibrationMode)return '';const visible=calibrat
 function drawOverlay(){overlayEl.innerHTML='';legendEl.innerHTML='';if(!currentCapture)return;const objects=objectsFor(currentCapture),shapes=new Map((currentShapeObjects||[]).map(item=>[String(item.object_id),item.points])),saved=currentPlatePoints?{points:currentPlatePoints,width:Number(bedXEl.value)||180,height:Number(bedYEl.value)||180}:null,guide=calibrationGuide();if(!objects.length){overlayEl.innerHTML=guide;overlayNoticeEl.textContent=calibrationMode?'Calibration en cours : les repères jaunes confirment chaque sélection.':currentPlateMessage||'Cette capture ancienne ne contient pas sa cartographie G-code.';return}if(!shapes.size&&!saved){overlayEl.innerHTML=guide;overlayNoticeEl.textContent=calibrationMode?'Calibration en cours : les repères jaunes confirment chaque sélection.':currentPlateMessage||'Aucune forme assez sûre : aucun contour d’objet n’est affiché.';return}const h=saved?homography(saved.points,Number(saved.width)||180,Number(saved.height)||180):null;if(saved&&!h){overlayEl.innerHTML=guide;overlayNoticeEl.textContent='Perspective manuelle invalide : aucun contour affiché.';return}let count=0,svg='',legend='';objects.forEach((object,index)=>{const b=object?.bounds_xy,recognized=shapes.get(String(object?.id)),corners=Array.isArray(recognized)?recognized:(b&&h?[[b.min_x,b.min_y],[b.max_x,b.min_y],[b.max_x,b.max_y],[b.min_x,b.max_y]].map(([x,y])=>project(h,Number(x),Number(y))):null);if(!Array.isArray(corners)||corners.length!==4||corners.some(point=>!point||!Number.isFinite(point[0])||!Number.isFinite(point[1])))return;const color=outlineColors[index%outlineColors.length],selected=selectedObjectIndex===index,points=corners.map(point=>`${point[0]},${point[1]}`).join(' ');svg+=`<polygon points="${points}" fill="${selected?color+'33':'none'}" stroke="${selected?'#ef1f18':color}" stroke-width="${selected?'0.010':'0.005'}" vector-effect="non-scaling-stroke"/>`;legend+=`<button class="legend-item ${selected?'selected':''}" onclick="selectMappedObject(${index})"><span class="legend-swatch" style="background:${color}">${index+1}</span><span><b>${esc(object.label||('Objet '+object.id))}</b><small>${recognized?'forme 3MF reconnue dans cette image':b?`X ${Number(b.min_x).toFixed(1)}–${Number(b.max_x).toFixed(1)} · Y ${Number(b.min_y).toFixed(1)}–${Number(b.max_y).toFixed(1)}`:'Zone XY indisponible'}${selected?' · contour sélectionné':''}</small></span></button>`;count++});overlayEl.innerHTML=svg+guide;legendEl.innerHTML=legend;overlayNoticeEl.textContent=calibrationMode?'Calibration en cours : les repères jaunes confirment chaque sélection.':count?`${count} contour(s) ${shapes.size?'issus des formes du 3MF reconnues dans cette image.':'projetés par le réglage manuel de cette image.'}`:'Les objets cartographiés n’ont pas de forme exploitable.'}
 function hiddenCornerEdges(){if(hiddenCornerIndex<0)return [];const previous=(hiddenCornerIndex+3)%4,next=(hiddenCornerIndex+1)%4;return [{corner:previous,label:`bord ${calibrationLabels[previous]} → ${calibrationLabels[hiddenCornerIndex]}`},{corner:next,label:`bord ${calibrationLabels[next]} → ${calibrationLabels[hiddenCornerIndex]}`}]}
 function renderCalibrationProgress(){const active=calibrationMode;calibrationActionsEl.hidden=!active;stageEl.classList.toggle('calibrating',active);if(!active){calibrationPointsEl.textContent='';return}const next=calibrationPoints.length,pointList=calibrationPoints.map((point,index)=>`${index+1}. ${calibrationLabels[index]} : ${point?'sélectionné':hiddenCornerIndex===index?'hors champ':'à renseigner'}`).join(' · '),edges=hiddenCornerEdges();let instruction=next<4?`Prochain point : <b>${calibrationLabels[next]}</b>.`:edges.length?calibrationEdgePoints.length===0?`Clique maintenant un point n’importe où sur le <b>${edges[0].label}</b>.`:calibrationEdgePoints.length===1?`Clique maintenant un point n’importe où sur le <b>${edges[1].label}</b>.`: 'Calcul de l’intersection des bords…':'Enregistrement…';calibrationPointsEl.innerHTML=`<b>Calibration en cours :</b> ${next}/4 coin(s) renseigné(s). ${instruction}<br><span class="muted">${pointList||'Clique un coin visible, ou marque le prochain coin « hors champ ». Les repères jaunes restent visibles sur l’image.'}${edges.length?' Les repères bleus E1 et E2 servent à prolonger les deux bords vers le coin hors champ.':''}</span>`;drawOverlay()}
-function openCapture(index){currentCapture=(window.visionCaptures||[])[index];if(!currentCapture)return;currentPlatePoints=null;currentShapeObjects=[];currentPlateMessage='Recherche des formes du 3MF dans cette capture…';calibrationMode=false;calibrationPoints=[];calibrationEdgePoints=[];hiddenCornerIndex=-1;selectedObjectIndex=-1;titleEl.textContent=`Capture · couche ${currentCapture.layer}`;largeEl.src=captureURL(currentCapture.file);largeEl.alt=`Capture de la couche ${currentCapture.layer}`;infoEl.innerHTML=`<div><b>Impression</b>${esc(currentCapture.print_name||'Impression en cours')}</div><div><b>Couche</b>${currentCapture.layer}</div><div><b>Date</b>${esc(currentCapture.captured_at)}</div><div><b>Fichier</b>${esc(currentCapture.file)}</div>`;modalEl.hidden=false;renderCalibrationProgress();largeEl.onload=()=>{drawOverlay();detectObjectShapes()};drawOverlay()}
+function openCapture(index){currentCapture=(window.visionCaptures||[])[index];if(!currentCapture)return;currentPlatePoints=null;currentShapeObjects=[];currentPlateMessage='Recherche des formes du 3MF dans cette capture…';calibrationMode=false;calibrationPoints=[];calibrationEdgePoints=[];hiddenCornerIndex=-1;selectedObjectIndex=-1;titleEl.textContent=`Capture · couche ${currentCapture.layer} · vue ${currentCapture.capture_view||1}/${currentCapture.capture_views_total||1}`;largeEl.src=captureURL(currentCapture.file);largeEl.alt=`Capture de la couche ${currentCapture.layer}, vue ${currentCapture.capture_view||1}`;infoEl.innerHTML=`<div><b>Impression</b>${esc(currentCapture.print_name||'Impression en cours')}</div><div><b>Couche</b>${currentCapture.layer}</div><div><b>Vue de la séquence</b>${currentCapture.capture_view||1}/${currentCapture.capture_views_total||1}</div><div><b>Date</b>${esc(currentCapture.captured_at)}</div><div><b>Fichier</b>${esc(currentCapture.file)}</div>`;modalEl.hidden=false;renderCalibrationProgress();largeEl.onload=()=>{drawOverlay();detectObjectShapes()};drawOverlay()}
 async function detectObjectShapes(){if(!currentCapture||modalEl.hidden)return;const file=currentCapture.file;try{const result=await api('/api/vision/shapes/detect',{method:'POST',body:JSON.stringify({file})});if(!currentCapture||currentCapture.file!==file)return;if(!result.detected||!Array.isArray(result.objects)){currentShapeObjects=[];currentPlateMessage=result.message||'Aucune forme du 3MF reconnue : aucun contour affiché.'}else{currentPlatePoints=null;currentShapeObjects=result.objects;currentPlateMessage=`Formes 3MF reconnues sur cette image (score ${Math.round(Number(result.similarity||0))} %). Vérifie les contours.`}drawOverlay()}catch(error){currentShapeObjects=[];currentPlateMessage=error.message||'Détection de formes impossible.';drawOverlay()}}
 function closeCapture(){modalEl.hidden=true;calibrationMode=false;calibrationPoints=[];calibrationEdgePoints=[];currentShapeObjects=[];hiddenCornerIndex=-1;selectedObjectIndex=-1;largeEl.removeAttribute('src');overlayEl.innerHTML='';legendEl.innerHTML='';renderCalibrationProgress()}
 function startCalibration(){if(!currentCapture||modalEl.hidden){setCalibrationStatus('Ouvre une capture dans la galerie, puis lance la calibration.',true);return}currentShapeObjects=[];currentPlatePoints=null;calibrationMode=true;calibrationPoints=[];calibrationEdgePoints=[];hiddenCornerIndex=-1;setCalibrationStatus('Clique les coins visibles dans l’ordre indiqué. Si le coin suivant est coupé par l’image, utilise « Ce coin est hors champ » : deux clics sur les bords permettront de le reconstruire avec la bonne perspective.');renderCalibrationProgress()}
@@ -4044,7 +4115,7 @@ function undoCalibrationPoint(){if(!calibrationMode)return;if(calibrationEdgePoi
 function skipCalibrationCorner(){if(!calibrationMode||calibrationPoints.length>=4)return;if(hiddenCornerIndex>=0){setCalibrationStatus('Un seul coin hors champ peut être reconstruit. Recommence avec une capture où les trois autres coins sont visibles.',true);return}hiddenCornerIndex=calibrationPoints.length;calibrationPoints.push(null);renderCalibrationProgress()}
 largeEl.addEventListener('click',event=>{if(!calibrationMode)return;const box=largeEl.getBoundingClientRect(),x=(event.clientX-box.left)/box.width,y=(event.clientY-box.top)/box.height;if(x<0||x>1||y<0||y>1)return;if(calibrationPoints.length<4)calibrationPoints.push([x,y]);else if(hiddenCornerIndex>=0&&calibrationEdgePoints.length<2)calibrationEdgePoints.push([x,y]);else return;renderCalibrationProgress();finishCalibration()});
 function clearCalibration(){localStorage.removeItem(calibrationKey);calibrationMode=false;calibrationPoints=[];calibrationEdgePoints=[];hiddenCornerIndex=-1;setCalibrationStatus('Calibration effacée.');renderCalibrationProgress();drawOverlay()}
-function render(state){visionState=state;const printer=state.printer||{},camera=state.camera||{},captures=Array.isArray(camera.captures)?camera.captures:[],storage=state.vision_storage||{};layerCounterEl.textContent=Number(printer.layer)>0?`Couche ${Number(printer.layer)}`:'Couche —';statusEl.textContent=camera.status||'Caméra non configurée';enabledEl.checked=!!camera.enabled;fingerprintEl.value=camera.certificate_sha256||'';metaEl.textContent=`Captures, pas vidéo : une image toutes les ${camera.capture_every_layers||5} couches · dernière couche reçue : ${camera.last_seen_layer||'—'} · ${storage.count||0} image(s).`;window.visionCaptures=captures;const groups=new Map();captures.forEach((item,index)=>{const key=item.folder||'en-cours';if(!groups.has(key))groups.set(key,{name:item.print_name||(item.folder?'Impression terminée':'Impression en cours'),items:[]});groups.get(key).items.push({item,index})});galleryEl.innerHTML=captures.length?[...groups.values()].map(group=>`<div class="capture-group"><div class="capture-group-head"><div><h3>${esc(group.name)}</h3><span>${group.items.length} image(s)</span></div></div><div class="capture-grid">${group.items.map(({item,index})=>{const objectCount=objectsFor(item).length;return `<button class="capture-card" onclick="openCapture(${index})"><img src="${captureURL(item.file)}" alt="Capture couche ${item.layer}"><div><b>Couche ${item.layer}</b><br><span class="muted">${esc(item.captured_at)}</span>${objectCount?`<br><span class="map-badge">${objectCount} objet(s) cartographié(s)</span>`:''}</div></button>`}).join('')}</div></div>`).join(''):'<p>Aucune capture : la première sera prise à la couche 5, pas immédiatement au lancement.</p>';calibration();}
+function render(state){visionState=state;const printer=state.printer||{},camera=state.camera||{},captures=Array.isArray(camera.captures)?camera.captures:[],storage=state.vision_storage||{};const views=camera.capture_views_per_layer||3,delay=camera.capture_view_delay_seconds||7;layerCounterEl.textContent=Number(printer.layer)>0?`Couche ${Number(printer.layer)}`:'Couche —';statusEl.textContent=camera.status||'Caméra non configurée';enabledEl.checked=!!camera.enabled;fingerprintEl.value=camera.certificate_sha256||'';metaEl.textContent=`Captures, pas vidéo : ${views} vues espacées de ${delay} s toutes les ${camera.capture_every_layers||5} couches · dernière couche reçue : ${camera.last_seen_layer||'—'} · ${storage.count||0} image(s).`;window.visionCaptures=captures;const groups=new Map();captures.forEach((item,index)=>{const key=item.folder||'en-cours';if(!groups.has(key))groups.set(key,{name:item.print_name||(item.folder?'Impression terminée':'Impression en cours'),items:[]});groups.get(key).items.push({item,index})});galleryEl.innerHTML=captures.length?[...groups.values()].map(group=>`<div class="capture-group"><div class="capture-group-head"><div><h3>${esc(group.name)}</h3><span>${group.items.length} image(s)</span></div></div><div class="capture-grid">${group.items.map(({item,index})=>{const objectCount=objectsFor(item).length;return `<button class="capture-card" onclick="openCapture(${index})"><img src="${captureURL(item.file)}" alt="Capture couche ${item.layer}, vue ${item.capture_view||1}"><div><b>Couche ${item.layer} · vue ${item.capture_view||1}/${item.capture_views_total||1}</b><br><span class="muted">${esc(item.captured_at)}</span>${objectCount?`<br><span class="map-badge">${objectCount} objet(s) cartographié(s)</span>`:''}</div></button>`}).join('')}</div></div>`).join(''):'<p>Aucune capture : la première séquence sera prise à la couche 5, pas immédiatement au lancement.</p>';calibration();}
 async function load(){try{render(await api('/api/state'))}catch(error){statusEl.textContent=error.message}}async function saveCamera(){try{await api('/api/config',{method:'POST',body:JSON.stringify({camera_enabled:enabledEl.checked,camera_certificate_sha256:fingerprintEl.value})});await load()}catch(error){statusEl.textContent=error.message}}async function discover(){try{fingerprintEl.value=(await api('/api/camera/discover',{method:'POST',body:'{}'})).fingerprint;statusEl.textContent='Empreinte détectée : enregistre-la pour l’approuver.'}catch(error){statusEl.textContent=error.message}}document.addEventListener('keydown',event=>{if(event.key==='Escape')closeCapture()});load();setInterval(load,3000);
 </script></html>'''.replace("__API_TOKEN__", json.dumps(api_token))
 

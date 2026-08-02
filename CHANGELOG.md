@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.5.0 — 2026-08-02
+
+- Chaque point de capture Vision produit désormais trois vues, espacées de sept
+  secondes, à la couche 5 puis toutes les cinq couches. Les vues successives
+  montrent la tête dans des positions différentes et réduisent les objets
+  occultés sur la plaque.
+- Les séquences et un éventuel point de capture suivant sont persistés : un
+  redémarrage reprend le travail en attente sans envoyer de commande à
+  l’imprimante.
+- La galerie et la vue agrandie affichent le numéro de vue dans la séquence.
+
 ## 3.4.5 — 2026-08-02
 
 - La recherche Vision affiche désormais son diagnostic réel (3MF historique
