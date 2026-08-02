@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.8.4 — 2026-08-03
+
+- Correctif Centre Vision : une erreur JavaScript empêchait le chargement de
+  la galerie après le nettoyage 3.8.3. Les captures déjà enregistrées restent
+  intactes et sont à nouveau affichées.
+- Ajout d'un test de syntaxe de l'interface Vision dans la validation macOS.
+
 ## 3.8.3 — 2026-08-03
 
 - Nettoyage du Centre Vision : suppression du réglage manuel de perspective,
