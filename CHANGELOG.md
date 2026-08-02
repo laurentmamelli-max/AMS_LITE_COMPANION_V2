@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.5.1 — 2026-08-02
+
+- Correctif de fiabilité Vision : LINEMOD apprend maintenant 63 points de
+  contour au lieu de 5. Les correspondances ambiguës ou non confirmées par la
+  couleur du filament sont rejetées, sans contour affiché.
+- Les superpositions automatiques utilisent la silhouette réelle extraite du
+  masque 3MF ; les boîtes rectangulaires approximatives ne sont plus dessinées.
+
 ## 3.5.0 — 2026-08-02
 
 - Chaque point de capture Vision produit désormais trois vues, espacées de sept

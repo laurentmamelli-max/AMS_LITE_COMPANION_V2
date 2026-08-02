@@ -61,7 +61,7 @@ EVENTS_FILE = APP_DIR / "events.sqlite3"
 AUTOPILOT_FILE = APP_DIR / "autopilot.sqlite3"
 REPORTS_FILE = APP_DIR / "reports.sqlite3"
 HOST, PORT = "127.0.0.1", 8766
-__version__ = "3.5.0"
+__version__ = "3.5.1"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -2457,24 +2457,41 @@ class Companion:
             return {"detected": False, "message": "Dimensions de capture invalides"}
         clean: list[dict[str, Any]] = []
         for item in objects:
-            if not isinstance(item, dict) or not isinstance(item.get("points"), list):
+            if not isinstance(item, dict):
                 continue
-            points: list[list[float]] = []
-            for point in item["points"]:
-                if not isinstance(point, list) or len(point) != 2:
-                    points = []
-                    break
-                x, y = point
-                if not isinstance(x, (float, int)) or not isinstance(y, (float, int)):
-                    points = []
-                    break
-                points.append([float(x) / width, float(y) / height])
+            raw_contours = item.get("contours")
+            if not isinstance(raw_contours, list):
+                # Compatibility with a prior engine response.  New results
+                # always carry real multi-point silhouettes in ``contours``.
+                raw_points = item.get("points")
+                raw_contours = [raw_points] if isinstance(raw_points, list) else []
+            contours: list[list[list[float]]] = []
+            for raw_contour in raw_contours:
+                if not isinstance(raw_contour, list):
+                    continue
+                points: list[list[float]] = []
+                for point in raw_contour:
+                    if not isinstance(point, list) or len(point) != 2:
+                        points = []
+                        break
+                    x, y = point
+                    if not isinstance(x, (float, int)) or not isinstance(y, (float, int)):
+                        points = []
+                        break
+                    points.append([float(x) / width, float(y) / height])
+                if len(points) >= 3 and not any(
+                    not -0.1 <= value <= 1.1 for point in points for value in point
+                ):
+                    contours.append(points)
             object_id = str(item.get("object_id") or "")
-            if object_id not in labels or len(points) != 4:
+            if object_id not in labels or not contours:
                 continue
-            if any(not -0.1 <= value <= 1.1 for point in points for value in point):
-                continue
-            clean.append({"object_id": object_id, "label": labels[object_id], "points": points})
+            clean.append({
+                "object_id": object_id, "label": labels[object_id], "contours": contours,
+                # Keep the first silhouette for older local browser windows;
+                # it is never a four-corner bounding box in the new engine.
+                "points": contours[0],
+            })
         if not clean:
             return {"detected": False, "message": "Aucune forme reconnue ne correspond aux objets G-code"}
         return {"detected": True, "similarity": float(result.get("similarity") or 0), "objects": clean}
@@ -4096,7 +4113,7 @@ const outlineColors=['#d92d20','#b42318','#c11574','#7a5af8','#444ce7','#175cd3'
 function selectMappedObject(index){selectedObjectIndex=selectedObjectIndex===index?-1:index;drawOverlay()}
 const calibrationLabels=['X0 / Y0','Xmax / Y0','Xmax / Ymax','X0 / Ymax'];
 function calibrationGuide(){if(!calibrationMode)return '';const visible=calibrationPoints.map((point,index)=>point?{point,index}:null).filter(Boolean),joined=visible.map(item=>item.point.join(',')).join(' ');let svg=joined?`<polyline points="${joined}" fill="none" stroke="#f5a623" stroke-width="0.006" vector-effect="non-scaling-stroke"/>`:'';visible.forEach(({point,index})=>{svg+=`<circle cx="${point[0]}" cy="${point[1]}" r="0.020" fill="#f5a623" stroke="#fff" stroke-width="0.006" vector-effect="non-scaling-stroke"/><text x="${point[0]}" y="${point[1]}" text-anchor="middle" dominant-baseline="central" fill="#20242a" font-size="0.028" font-weight="800">${index+1}</text>`});calibrationEdgePoints.forEach((point,index)=>{svg+=`<circle cx="${point[0]}" cy="${point[1]}" r="0.018" fill="#2878d4" stroke="#fff" stroke-width="0.006" vector-effect="non-scaling-stroke"/><text x="${point[0]}" y="${point[1]}" text-anchor="middle" dominant-baseline="central" fill="#fff" font-size="0.023" font-weight="800">E${index+1}</text>`});return svg}
-function drawOverlay(){overlayEl.innerHTML='';legendEl.innerHTML='';if(!currentCapture)return;const objects=objectsFor(currentCapture),shapes=new Map((currentShapeObjects||[]).map(item=>[String(item.object_id),item.points])),saved=currentPlatePoints?{points:currentPlatePoints,width:Number(bedXEl.value)||180,height:Number(bedYEl.value)||180}:null,guide=calibrationGuide();if(!objects.length){overlayEl.innerHTML=guide;overlayNoticeEl.textContent=calibrationMode?'Calibration en cours : les repères jaunes confirment chaque sélection.':currentPlateMessage||'Cette capture ancienne ne contient pas sa cartographie G-code.';return}if(!shapes.size&&!saved){overlayEl.innerHTML=guide;overlayNoticeEl.textContent=calibrationMode?'Calibration en cours : les repères jaunes confirment chaque sélection.':currentPlateMessage||'Aucune forme assez sûre : aucun contour d’objet n’est affiché.';return}const h=saved?homography(saved.points,Number(saved.width)||180,Number(saved.height)||180):null;if(saved&&!h){overlayEl.innerHTML=guide;overlayNoticeEl.textContent='Perspective manuelle invalide : aucun contour affiché.';return}let count=0,svg='',legend='';objects.forEach((object,index)=>{const b=object?.bounds_xy,recognized=shapes.get(String(object?.id)),corners=Array.isArray(recognized)?recognized:(b&&h?[[b.min_x,b.min_y],[b.max_x,b.min_y],[b.max_x,b.max_y],[b.min_x,b.max_y]].map(([x,y])=>project(h,Number(x),Number(y))):null);if(!Array.isArray(corners)||corners.length!==4||corners.some(point=>!point||!Number.isFinite(point[0])||!Number.isFinite(point[1])))return;const color=outlineColors[index%outlineColors.length],selected=selectedObjectIndex===index,points=corners.map(point=>`${point[0]},${point[1]}`).join(' ');svg+=`<polygon points="${points}" fill="${selected?color+'33':'none'}" stroke="${selected?'#ef1f18':color}" stroke-width="${selected?'0.010':'0.005'}" vector-effect="non-scaling-stroke"/>`;legend+=`<button class="legend-item ${selected?'selected':''}" onclick="selectMappedObject(${index})"><span class="legend-swatch" style="background:${color}">${index+1}</span><span><b>${esc(object.label||('Objet '+object.id))}</b><small>${recognized?'forme 3MF reconnue dans cette image':b?`X ${Number(b.min_x).toFixed(1)}–${Number(b.max_x).toFixed(1)} · Y ${Number(b.min_y).toFixed(1)}–${Number(b.max_y).toFixed(1)}`:'Zone XY indisponible'}${selected?' · contour sélectionné':''}</small></span></button>`;count++});overlayEl.innerHTML=svg+guide;legendEl.innerHTML=legend;overlayNoticeEl.textContent=calibrationMode?'Calibration en cours : les repères jaunes confirment chaque sélection.':count?`${count} contour(s) ${shapes.size?'issus des formes du 3MF reconnues dans cette image.':'projetés par le réglage manuel de cette image.'}`:'Les objets cartographiés n’ont pas de forme exploitable.'}
+function drawOverlay(){overlayEl.innerHTML='';legendEl.innerHTML='';if(!currentCapture)return;const objects=objectsFor(currentCapture),shapes=new Map((currentShapeObjects||[]).map(item=>[String(item.object_id),Array.isArray(item.contours)?item.contours:(Array.isArray(item.points)?[item.points]:[])])),guide=calibrationGuide();if(!objects.length){overlayEl.innerHTML=guide;overlayNoticeEl.textContent=calibrationMode?'Calibration en cours : les repères jaunes confirment chaque sélection.':currentPlateMessage||'Cette capture ancienne ne contient pas sa cartographie G-code.';return}if(!shapes.size){overlayEl.innerHTML=guide;overlayNoticeEl.textContent=calibrationMode?'Calibration en cours : les repères jaunes confirment chaque sélection.':currentPlateMessage||'Aucune forme assez sûre : aucun contour d’objet n’est affiché.';return}let count=0,svg='',legend='';objects.forEach((object,index)=>{const contours=shapes.get(String(object?.id));if(!Array.isArray(contours)||!contours.length)return;const valid=contours.filter(contour=>Array.isArray(contour)&&contour.length>=3&&!contour.some(point=>!Array.isArray(point)||point.length!==2||!Number.isFinite(point[0])||!Number.isFinite(point[1])));if(!valid.length)return;const color=outlineColors[index%outlineColors.length],selected=selectedObjectIndex===index;svg+=valid.map(contour=>`<polygon points="${contour.map(point=>`${point[0]},${point[1]}`).join(' ')}" fill="${selected?color+'33':'none'}" stroke="${selected?'#ef1f18':color}" stroke-width="${selected?'0.010':'0.005'}" vector-effect="non-scaling-stroke"/>`).join('');legend+=`<button class="legend-item ${selected?'selected':''}" onclick="selectMappedObject(${index})"><span class="legend-swatch" style="background:${color}">${index+1}</span><span><b>${esc(object.label||('Objet '+object.id))}</b><small>silhouette 3MF reconnue dans cette image${selected?' · contour sélectionné':''}</small></span></button>`;count++});overlayEl.innerHTML=svg+guide;legendEl.innerHTML=legend;overlayNoticeEl.textContent=calibrationMode?'Calibration en cours : les repères jaunes confirment chaque sélection.':count?`${count} silhouette(s) 3MF reconnue(s) dans cette image.`:'Aucune silhouette 3MF exploitable n’est affichée.'}
 function hiddenCornerEdges(){if(hiddenCornerIndex<0)return [];const previous=(hiddenCornerIndex+3)%4,next=(hiddenCornerIndex+1)%4;return [{corner:previous,label:`bord ${calibrationLabels[previous]} → ${calibrationLabels[hiddenCornerIndex]}`},{corner:next,label:`bord ${calibrationLabels[next]} → ${calibrationLabels[hiddenCornerIndex]}`}]}
 function renderCalibrationProgress(){const active=calibrationMode;calibrationActionsEl.hidden=!active;stageEl.classList.toggle('calibrating',active);if(!active){calibrationPointsEl.textContent='';return}const next=calibrationPoints.length,pointList=calibrationPoints.map((point,index)=>`${index+1}. ${calibrationLabels[index]} : ${point?'sélectionné':hiddenCornerIndex===index?'hors champ':'à renseigner'}`).join(' · '),edges=hiddenCornerEdges();let instruction=next<4?`Prochain point : <b>${calibrationLabels[next]}</b>.`:edges.length?calibrationEdgePoints.length===0?`Clique maintenant un point n’importe où sur le <b>${edges[0].label}</b>.`:calibrationEdgePoints.length===1?`Clique maintenant un point n’importe où sur le <b>${edges[1].label}</b>.`: 'Calcul de l’intersection des bords…':'Enregistrement…';calibrationPointsEl.innerHTML=`<b>Calibration en cours :</b> ${next}/4 coin(s) renseigné(s). ${instruction}<br><span class="muted">${pointList||'Clique un coin visible, ou marque le prochain coin « hors champ ». Les repères jaunes restent visibles sur l’image.'}${edges.length?' Les repères bleus E1 et E2 servent à prolonger les deux bords vers le coin hors champ.':''}</span>`;drawOverlay()}
 function openCapture(index){currentCapture=(window.visionCaptures||[])[index];if(!currentCapture)return;currentPlatePoints=null;currentShapeObjects=[];currentPlateMessage='Recherche des formes du 3MF dans cette capture…';calibrationMode=false;calibrationPoints=[];calibrationEdgePoints=[];hiddenCornerIndex=-1;selectedObjectIndex=-1;titleEl.textContent=`Capture · couche ${currentCapture.layer} · vue ${currentCapture.capture_view||1}/${currentCapture.capture_views_total||1}`;largeEl.src=captureURL(currentCapture.file);largeEl.alt=`Capture de la couche ${currentCapture.layer}, vue ${currentCapture.capture_view||1}`;infoEl.innerHTML=`<div><b>Impression</b>${esc(currentCapture.print_name||'Impression en cours')}</div><div><b>Couche</b>${currentCapture.layer}</div><div><b>Vue de la séquence</b>${currentCapture.capture_view||1}/${currentCapture.capture_views_total||1}</div><div><b>Date</b>${esc(currentCapture.captured_at)}</div><div><b>Fichier</b>${esc(currentCapture.file)}</div>`;modalEl.hidden=false;renderCalibrationProgress();largeEl.onload=()=>{drawOverlay();detectObjectShapes()};drawOverlay()}

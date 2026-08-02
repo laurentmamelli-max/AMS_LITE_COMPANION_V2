@@ -60,6 +60,28 @@ class PlateLayout:
     image: Any
     mask: Any
     object_boxes: dict[str, tuple[int, int, int, int]]
+    object_contours: dict[str, list[list[tuple[float, float]]]]
+    object_colours: dict[str, tuple[int, int, int]]
+
+
+def _object_contours(mask: Any, cv2: Any, numpy: Any) -> list[list[tuple[float, float]]]:
+    """Extract simplified exterior silhouettes, never a rectangular proxy."""
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    result: list[list[tuple[float, float]]] = []
+    for contour in contours:
+        if cv2.contourArea(contour) < 8:
+            continue
+        perimeter = cv2.arcLength(contour, True)
+        # Preserve the identity of the part while avoiding hundreds of points
+        # in the JSON response and the browser SVG.
+        epsilon = max(0.8, perimeter * 0.006)
+        simplified = cv2.approxPolyDP(contour, epsilon, True).reshape(-1, 2)
+        while len(simplified) > 80:
+            epsilon *= 1.35
+            simplified = cv2.approxPolyDP(contour, epsilon, True).reshape(-1, 2)
+        if len(simplified) >= 3 and numpy.isfinite(simplified).all():
+            result.append([(float(x), float(y)) for x, y in simplified])
+    return result
 
 
 def _safe_crop(image: Any, mask: Any, numpy: Any) -> tuple[Any, Any] | None:
@@ -153,6 +175,8 @@ def extract_plate_layout(archive_path: Path, plate_id: str, object_map: dict[str
                  and str(item.get("plate") or "") == str(plate_id) and item.get("bounds_xy")}
     union = numpy.zeros(pick.shape[:2], dtype=numpy.uint8)
     full_boxes: dict[str, tuple[int, int, int, int]] = {}
+    full_contours: dict[str, list[list[tuple[float, float]]]] = {}
+    object_colours: dict[str, tuple[int, int, int]] = {}
     for object_id in canonical:
         try:
             value = int(object_id)
@@ -166,6 +190,13 @@ def extract_plate_layout(archive_path: Path, plate_id: str, object_map: dict[str
         y0, x0 = points.min(axis=0)
         y1, x1 = points.max(axis=0)
         full_boxes[object_id] = (int(x0), int(y0), int(x1) + 1, int(y1) + 1)
+        contours = _object_contours(object_mask, cv2, numpy)
+        if contours:
+            full_contours[object_id] = contours
+            pixels = image[object_mask > 0]
+            if len(pixels):
+                colour = numpy.median(pixels, axis=0)
+                object_colours[object_id] = tuple(int(value) for value in colour[:3])
         union = numpy.maximum(union, object_mask)
     crop = _crop_bounds(union, numpy)
     if not crop or not full_boxes:
@@ -173,7 +204,15 @@ def extract_plate_layout(archive_path: Path, plate_id: str, object_map: dict[str
     left, top, right, bottom = crop
     boxes = {object_id: (x0 - left, y0 - top, x1 - left, y1 - top)
              for object_id, (x0, y0, x1, y1) in full_boxes.items()}
-    return PlateLayout(image=image[top:bottom, left:right].copy(), mask=union[top:bottom, left:right].copy(), object_boxes=boxes)
+    contours = {
+        object_id: [[(x - left, y - top) for x, y in contour] for contour in object_contours]
+        for object_id, object_contours in full_contours.items()
+    }
+    colours = {object_id: colour for object_id, colour in object_colours.items() if object_id in contours}
+    return PlateLayout(
+        image=image[top:bottom, left:right].copy(), mask=union[top:bottom, left:right].copy(),
+        object_boxes=boxes, object_contours=contours, object_colours=colours,
+    )
 
 
 def _variants(template: ShapeTemplate, cv2: Any, numpy: Any) -> list[tuple[Any, Any]]:
@@ -223,7 +262,41 @@ def _layout_variants(layout: PlateLayout, cv2: Any, numpy: Any) -> list[tuple[An
     return variants
 
 
-def detect_plate_layout(frame_path: Path, layout: PlateLayout, *, threshold: float = 68.0) -> dict[str, Any]:
+def _colour_supported(
+    frame: Any, contours: list[list[list[float]]], expected_bgr: tuple[int, int, int] | None,
+    cv2: Any, numpy: Any,
+) -> bool:
+    """Require visual material evidence where an object is projected.
+
+    A silhouette-only match may accidentally lock on to the print head.  The
+    Bambu top preview carries each sliced object's filament colour, which is a
+    useful independent check.  Colourless/dark prints deliberately fail safe:
+    no overlay is preferable to an incorrect one.
+    """
+    if expected_bgr is None:
+        return False
+    expected = cv2.cvtColor(numpy.uint8([[expected_bgr]]), cv2.COLOR_BGR2HSV)[0, 0]
+    if int(expected[1]) < 45 or int(expected[2]) < 50:
+        return False
+    mask = numpy.zeros(frame.shape[:2], dtype=numpy.uint8)
+    polygons = [numpy.round(numpy.asarray(contour)).astype(numpy.int32) for contour in contours if len(contour) >= 3]
+    if not polygons:
+        return False
+    cv2.fillPoly(mask, polygons, 255)
+    pixels = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[mask > 0]
+    if len(pixels) < 30:
+        return False
+    hue_delta = numpy.abs(pixels[:, 0].astype(numpy.int16) - int(expected[0]))
+    hue_delta = numpy.minimum(hue_delta, 180 - hue_delta)
+    matching = (
+        (hue_delta <= 22)
+        & (pixels[:, 1] >= max(80, int(expected[1]) * 42 // 100))
+        & (pixels[:, 2] >= max(55, int(expected[2]) * 55 // 100))
+    )
+    return float(numpy.mean(matching)) >= 0.40
+
+
+def detect_plate_layout(frame_path: Path, layout: PlateLayout, *, threshold: float = 82.0) -> dict[str, Any]:
     """Locate the complete printed-object layout and recover each object polygon.
 
     Unlike background registration, the score is derived exclusively from the
@@ -234,12 +307,18 @@ def detect_plate_layout(frame_path: Path, layout: PlateLayout, *, threshold: flo
     frame = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
     if frame is None:
         raise ValueError("Capture Vision illisible")
-    detector = cv2.linemod.Detector([cv2.linemod.ColorGradient_create(8, 5, 25)], [8, 4])
+    # The old value accidentally asked LINEMOD for only five features.  That
+    # made unrelated areas look like a perfect match.  Sixty-three gradients
+    # make the complete plate silhouette discriminating enough for Vision.
+    detector = cv2.linemod.Detector([cv2.linemod.ColorGradient_create(10, 63, 20)], [8, 4])
     transforms: dict[int, Any] = {}
     for image, mask, transform in _layout_variants(layout, cv2, numpy):
         template_id, _ = detector.addTemplate([image], "plate", mask)
         if template_id >= 0:
-            transforms[int(template_id)] = transform
+            learned = detector.getTemplates("plate", template_id)
+            feature_count = len(learned[0].features) if learned else 0
+            if feature_count >= 48:
+                transforms[int(template_id)] = transform
     if not transforms:
         return {"detected": False, "message": "Aucun gabarit 3MF exploitable"}
     matches, _ = detector.match([frame], float(threshold), ["plate"])
@@ -251,13 +330,42 @@ def detect_plate_layout(frame_path: Path, layout: PlateLayout, *, threshold: flo
         return {"detected": False, "message": "Transformation du gabarit absente"}
     translation = numpy.array([[1, 0, float(best.x)], [0, 1, float(best.y)], [0, 0, 1]], dtype=numpy.float32)
     transform = translation @ transform
-    objects: list[dict[str, Any]] = []
-    for object_id, (x0, y0, x1, y1) in layout.object_boxes.items():
-        corners = numpy.float32([[[x0, y0], [x1, y0], [x1, y1], [x0, y1]]])
-        projected = cv2.perspectiveTransform(corners, transform)[0]
-        if not numpy.isfinite(projected).all():
+    # A high raw LINEMOD score alone is not evidence: repeated machine edges
+    # can score closely at several unrelated positions.  In that case hiding
+    # the overlay is safer than putting a plausible-looking contour on the
+    # wrong part.
+    best_center = numpy.array([float(best.x), float(best.y)])
+    for candidate in matches:
+        if candidate is best or float(candidate.similarity) < float(best.similarity) - 3.0:
             continue
-        objects.append({"object_id": object_id, "points": [[round(float(x), 5), round(float(y), 5)] for x, y in projected]})
+        if int(candidate.template_id) not in transforms:
+            continue
+        if numpy.linalg.norm(numpy.array([float(candidate.x), float(candidate.y)]) - best_center) > 120:
+            return {
+                "detected": False,
+                "message": "Correspondance de formes ambiguë : aucun contour n’est affiché",
+            }
+    objects: list[dict[str, Any]] = []
+    for object_id, contours in layout.object_contours.items():
+        projected_contours: list[list[list[float]]] = []
+        for contour in contours:
+            projected = cv2.perspectiveTransform(numpy.float32([contour]), transform)[0]
+            if not numpy.isfinite(projected).all() or len(projected) < 3:
+                continue
+            projected_contours.append([
+                [round(float(x), 5), round(float(y), 5)] for x, y in projected
+            ])
+        if not projected_contours:
+            continue
+        if not _colour_supported(frame, projected_contours, layout.object_colours.get(object_id), cv2, numpy):
+            continue
+        objects.append({"object_id": object_id, "contours": projected_contours})
+    required_objects = max(1, (len(layout.object_contours) * 2 + 2) // 3)
+    if len(objects) < required_objects:
+        return {
+            "detected": False,
+            "message": "La couleur et la forme ne confirment pas assez la position : aucun contour n’est affiché",
+        }
     return {
         "detected": bool(objects), "similarity": round(float(best.similarity), 2),
         "objects": objects, "template_id": int(best.template_id),

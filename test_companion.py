@@ -288,6 +288,8 @@ class CompanionTests(unittest.TestCase):
         self.assertIn('function startAutoCalibration()', page)
         self.assertIn('function detectObjectShapes()', page)
         self.assertIn('/api/vision/shapes/detect', page)
+        self.assertIn('item.contours', page)
+        self.assertNotIn('b&&h?[[b.min_x', page)
         self.assertIn('Rechercher les formes 3MF', page)
         self.assertIn('id="objectLegend"', page)
         self.assertIn('function selectMappedObject(index)', page)
@@ -346,6 +348,31 @@ class CompanionTests(unittest.TestCase):
                 result = app.detect_vision_object_shapes(frame.name)
             self.assertTrue(result["detected"])
             self.assertEqual("495", result["objects"][0]["object_id"])
+
+    def test_shape_detector_preserves_a_real_multi_point_silhouette(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "job.3mf"
+            source.write_bytes(b"3mf")
+            (root / "frame.jpg").write_bytes(b"frame")
+            app = ac.Companion(root / "state.json")
+            app._vision_capture_path = lambda filename: root / filename  # type: ignore[method-assign]
+            app.state["active_job"] = {"file": "job.3mf", "plate": "1", "object_map": {
+                "objects": [{"id": "944", "label": "Pièce test", "plate": "1", "bounds_xy": {"min_x": 1}}],
+            }}
+            app.state["bridge"]["recent_import"] = {"source_path": str(source), "filename": "job.3mf"}
+            engine = SimpleNamespace(
+                available=lambda: True,
+                extract_plate_layout=lambda *args: object(),
+                detect_plate_layout=lambda *args: {"detected": True, "similarity": 93.0, "width": 100,
+                                                    "height": 50, "objects": [{"object_id": "944", "contours": [[
+                                                        [10, 5], [30, 5], [35, 12], [22, 20], [10, 14],
+                                                    ]]}]},
+            )
+            with mock.patch.dict(sys.modules, {"vision_linemod": engine}):
+                result = app.detect_vision_object_shapes("frame.jpg")
+            self.assertTrue(result["detected"])
+            self.assertEqual(5, len(result["objects"][0]["contours"][0]))
 
     def test_camera_capture_lock_is_cleared_after_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -437,7 +464,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("3.5.0", report["application"]["version"])
+            self.assertEqual("3.5.1", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -1379,11 +1406,11 @@ class CompanionTests(unittest.TestCase):
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("3.5.0", report["application"]["version"])
+                self.assertEqual("3.5.1", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
                 self.assertIn("Poste de supervision", html)
                 self.assertIn("Historique Vision et rapports", html)
-                self.assertIn("Compteur local v3.5.0", html)
+                self.assertIn("Compteur local v3.5.1", html)
                 self.assertIn("shutdownCard.after(auditCard)", html)
                 self.assertIn("auditCard.after(reportsCard)", html)
                 snapshot_request = urllib.request.Request(
