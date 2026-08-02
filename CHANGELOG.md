@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.8.3 — 2026-08-03
+
+- Nettoyage du Centre Vision : suppression du réglage manuel de perspective,
+  de la planche de calibration et de la comparaison à l'image de départ.
+- À l'ouverture d'une capture, les silhouettes 3MF sont recherchées
+  automatiquement ; le résultat reste un repère et le Garde-fou Vision reste
+  l'alerte de contrôle humain.
+
 ## 3.8.2 — 2026-08-03
 
 - Ajout du **Garde-fou Vision** : à chaque séquence de trois vues, Companion

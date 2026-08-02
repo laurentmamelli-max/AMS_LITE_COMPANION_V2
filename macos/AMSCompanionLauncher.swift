@@ -740,62 +740,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         guard message.name == "companion", let command = message.body as? String else { return }
         if command == "openCatalog" { showCatalog() }
         if command == "openVision" { showVision() }
-        if command == "downloadCalibrationSheet" { downloadCalibrationSheet() }
-        if command == "installVisionEngine" { installVisionEngine() }
-    }
-
-    private func installVisionEngine() {
-        guard let script = Bundle.main.url(forResource: "Installer_Moteur_Vision", withExtension: "command") else {
-            showAlert(title: "Installeur introuvable",
-                      message: "Le composant Vision n’est pas inclus dans cette application. Réinstalle la version complète de Companion.")
-            return
-        }
-        do {
-            let task = Process()
-            task.executableURL = URL(fileURLWithPath: "/bin/bash")
-            task.arguments = [script.path, pythonExecutable() ?? "/usr/bin/python3"]
-            task.standardOutput = FileHandle.nullDevice
-            task.standardError = FileHandle.nullDevice
-            try task.run()
-            showAlert(title: "Installation lancée",
-                      message: "Le moteur OpenCV s’installe localement. Attends la fin de l’installation, puis ouvre à nouveau la capture et lance la reconnaissance des formes 3MF.")
-        } catch {
-            showAlert(title: "Installation impossible",
-                      message: "Companion n’a pas pu lancer l’installation du moteur Vision : \(error.localizedDescription)")
-        }
-    }
-
-    private func downloadCalibrationSheet() {
-        guard var components = URLComponents(string: "http://127.0.0.1:8766/api/vision/calibration-sheet.pdf") else { return }
-        components.queryItems = [URLQueryItem(name: "token", value: apiToken)]
-        guard let url = components.url else { return }
-        URLSession.shared.dataTask(with: url) { [weak self] data, response, error in
-            let success = (response as? HTTPURLResponse)?.statusCode == 200
-            guard let data = data, success, data.starts(with: Data("%PDF".utf8)) else {
-                DispatchQueue.main.async {
-                    self?.showAlert(title: "Planche non téléchargée",
-                                    message: "Companion n’a pas pu créer la planche PDF. Vérifie que le moteur est démarré puis réessaie.")
-                }
-                return
-            }
-            do {
-                let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
-                    ?? FileManager.default.homeDirectoryForCurrentUser
-                let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
-                let destination = downloads.appendingPathComponent("ams-companion-calibration-180mm-\(stamp).pdf")
-                try data.write(to: destination, options: .atomic)
-                DispatchQueue.main.async {
-                    self?.showAlert(title: "Planche enregistrée",
-                                    message: "La planche PDF est dans Téléchargements. Imprime-la à 100 %, sans ajustement.")
-                    NSWorkspace.shared.activateFileViewerSelecting([destination])
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    self?.showAlert(title: "Planche non enregistrée",
-                                    message: "Impossible d’écrire dans Téléchargements : \(error.localizedDescription)")
-                }
-            }
-        }.resume()
     }
 
     private func showAlert(title: String, message: String) {

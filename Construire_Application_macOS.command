@@ -45,37 +45,10 @@ xcrun swiftc \
   -o "$BUILD/AMS-Lite-Companion-V2-x86_64" \
   "$ROOT/macos/AMSCompanionLauncher.swift"
 
-xcrun swiftc \
-  -O \
-  -target arm64-apple-macosx11.0 \
-  -framework AppKit \
-  -framework Foundation \
-  -framework Vision \
-  -framework CoreImage \
-  -framework ImageIO \
-  -o "$BUILD/ams_vision_calibration-arm64" \
-  "$ROOT/macos/AMSVisionCalibration.swift"
-
-xcrun swiftc \
-  -O \
-  -target x86_64-apple-macosx10.15 \
-  -framework AppKit \
-  -framework Foundation \
-  -framework Vision \
-  -framework CoreImage \
-  -framework ImageIO \
-  -o "$BUILD/ams_vision_calibration-x86_64" \
-  "$ROOT/macos/AMSVisionCalibration.swift"
-
 xcrun lipo -create \
   "$BUILD/AMS-Lite-Companion-V2-arm64" \
   "$BUILD/AMS-Lite-Companion-V2-x86_64" \
   -output "$MACOS/AMS-Lite-Companion-V2"
-
-xcrun lipo -create \
-  "$BUILD/ams_vision_calibration-arm64" \
-  "$BUILD/ams_vision_calibration-x86_64" \
-  -output "$RESOURCES/ams_vision_calibration"
 
 cp "$ROOT/ams_companion.py" "$RESOURCES/ams_companion.py"
 cp "$ROOT/plate_guardian.py" "$RESOURCES/plate_guardian.py"
@@ -83,20 +56,18 @@ cp "$ROOT/bambu_camera.py" "$RESOURCES/bambu_camera.py"
 cp "$ROOT/gcode_mapper.py" "$RESOURCES/gcode_mapper.py"
 cp "$ROOT/printguard_client.py" "$RESOURCES/printguard_client.py"
 cp "$ROOT/vision_linemod.py" "$RESOURCES/vision_linemod.py"
-cp "$ROOT/vision_temporal.py" "$RESOURCES/vision_temporal.py"
 cp "$ROOT/Installer_Moteur_Vision.command" "$RESOURCES/Installer_Moteur_Vision.command"
 cp "$ROOT/autopilot.py" "$RESOURCES/autopilot.py"
 cp "$ROOT/macos/Info.plist" "$CONTENTS/Info.plist"
-chmod 755 "$MACOS/AMS-Lite-Companion-V2" "$RESOURCES/ams_vision_calibration" "$RESOURCES/Installer_Moteur_Vision.command"
-chmod 644 "$RESOURCES/ams_companion.py" "$RESOURCES/plate_guardian.py" "$RESOURCES/bambu_camera.py" "$RESOURCES/gcode_mapper.py" "$RESOURCES/printguard_client.py" "$RESOURCES/vision_linemod.py" "$RESOURCES/vision_temporal.py" "$RESOURCES/autopilot.py" "$CONTENTS/Info.plist"
+chmod 755 "$MACOS/AMS-Lite-Companion-V2" "$RESOURCES/Installer_Moteur_Vision.command"
+chmod 644 "$RESOURCES/ams_companion.py" "$RESOURCES/plate_guardian.py" "$RESOURCES/bambu_camera.py" "$RESOURCES/gcode_mapper.py" "$RESOURCES/printguard_client.py" "$RESOURCES/vision_linemod.py" "$RESOURCES/autopilot.py" "$CONTENTS/Info.plist"
 
 # A signed bundle can launch only if each local Python dependency is present
 # beside the engine.  Import from the actual Resources directory before
 # signing so a forgotten module is caught during the release build.
 (
   cd "$RESOURCES"
-  PYTHONDONTWRITEBYTECODE=1 python3 -c 'import ams_companion, autopilot, bambu_camera, gcode_mapper, plate_guardian, printguard_client, vision_linemod, vision_temporal'
-  ./ams_vision_calibration --sheet >/dev/null
+  PYTHONDONTWRITEBYTECODE=1 python3 -c 'import ams_companion, autopilot, bambu_camera, gcode_mapper, plate_guardian, printguard_client, vision_linemod'
 )
 
 codesign --force --deep --options runtime --sign "$SIGNING_IDENTITY" "$APP"

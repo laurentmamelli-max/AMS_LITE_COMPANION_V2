@@ -282,26 +282,18 @@ class CompanionTests(unittest.TestCase):
         self.assertIn('IA de détection PrintGuard', page)
         self.assertIn('Tester PrintGuard', page)
         self.assertIn('function classifyCurrentCapture()', page)
-        self.assertIn('Cartographie G-code (référence manuelle)', page)
-        self.assertIn('Légende des objets cartographiés', page)
+        self.assertIn('Légende des objets reconnus', page)
         self.assertIn('id="layerCounter"', page)
-        self.assertIn('id="calibrateCaptureButton"', page)
-        self.assertIn('Ce coin est hors champ', page)
-        self.assertIn('function skipCalibrationCorner()', page)
-        self.assertIn('function undoCalibrationPoint()', page)
-        self.assertIn('function lineIntersection(a,b,c,d)', page)
-        self.assertIn('deux clics sur les bords', page)
-        self.assertIn('function startAutoCalibration()', page)
         self.assertIn('function detectObjectShapes()', page)
         self.assertIn('/api/vision/shapes/detect', page)
-        self.assertIn('function compareTemporalViews()', page)
-        self.assertIn('/api/vision/temporal/compare', page)
         self.assertIn('item.contours', page)
         self.assertNotIn('b&&h?[[b.min_x', page)
         self.assertNotIn('Rechercher les formes 3MF', page)
         self.assertIn('id="objectLegend"', page)
         self.assertIn('function selectMappedObject(index)', page)
         self.assertNotIn('paint-order="stroke">${esc(object.label||object.id)}</text>', page)
+        self.assertNotIn('Réglage manuel', page)
+        self.assertNotIn('Comparer visuellement au départ', page)
 
     def test_shape_detector_accepts_only_canonical_3mf_objects(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -381,34 +373,6 @@ class CompanionTests(unittest.TestCase):
                 result = app.detect_vision_object_shapes("frame.jpg")
             self.assertTrue(result["detected"])
             self.assertEqual(5, len(result["objects"][0]["contours"][0]))
-
-    def test_temporal_vision_compares_initial_and_current_images_of_same_print(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            app = ac.Companion(root / "state.json")
-            reference, candidate = "layer-00005-20260802-010101.jpg", "layer-00005-20260802-010108.jpg"
-            app.state["camera"]["captures"] = [
-                {"file": reference, "layer": 5, "folder": "print-20260802-demo"},
-                {"file": candidate, "layer": 5, "folder": "print-20260802-demo"},
-            ]
-            app._vision_capture_path = lambda filename: root / filename  # type: ignore[method-assign]
-            engine = SimpleNamespace(compare=lambda first, second: {
-                "aligned": True, "matches": 40, "inliers": 25, "regions": [],
-                "preview_data_url": "data:image/jpeg;base64,AA==",
-            })
-            with mock.patch.dict(sys.modules, {"vision_temporal": engine}):
-                result = app.compare_vision_captures(reference, candidate)
-            self.assertTrue(result["aligned"])
-            self.assertEqual(reference, result["reference"])
-            self.assertEqual(candidate, result["candidate"])
-            app.state["camera"]["captures"][1]["layer"] = 10
-            with mock.patch.dict(sys.modules, {"vision_temporal": engine}):
-                result = app.compare_vision_captures(reference, candidate)
-            self.assertEqual(5, result["reference_layer"])
-            self.assertEqual(10, result["candidate_layer"])
-            app.state["camera"]["captures"][1]["folder"] = "print-other"
-            with self.assertRaises(ValueError):
-                app.compare_vision_captures(reference, candidate)
 
     def test_camera_capture_lock_is_cleared_after_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -504,7 +468,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("3.8.2", report["application"]["version"])
+            self.assertEqual("3.8.3", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -1500,11 +1464,11 @@ class CompanionTests(unittest.TestCase):
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("3.8.2", report["application"]["version"])
+                self.assertEqual("3.8.3", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
                 self.assertIn("Poste de supervision", html)
                 self.assertIn("Historique Vision et rapports", html)
-                self.assertIn("Compteur local v3.8.2", html)
+                self.assertIn("Compteur local v3.8.3", html)
                 self.assertIn("shutdownCard.after(auditCard)", html)
                 self.assertIn("auditCard.after(reportsCard)", html)
                 snapshot_request = urllib.request.Request(

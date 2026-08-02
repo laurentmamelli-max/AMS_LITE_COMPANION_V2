@@ -63,7 +63,7 @@ EVENTS_FILE = APP_DIR / "events.sqlite3"
 AUTOPILOT_FILE = APP_DIR / "autopilot.sqlite3"
 REPORTS_FILE = APP_DIR / "reports.sqlite3"
 HOST, PORT = "127.0.0.1", 8766
-__version__ = "3.8.2"
+__version__ = "3.8.3"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -2475,61 +2475,6 @@ class Companion:
             raise FileNotFoundError("Fichier de capture introuvable")
         return path
 
-    @staticmethod
-    def _vision_calibration_helper() -> Path:
-        helper = Path(__file__).resolve().with_name("ams_vision_calibration")
-        if not helper.is_file() or not os.access(helper, os.X_OK):
-            raise RuntimeError("Module de calibration Vision indisponible : réinstalle Companion V3.2 ou utilise le réglage manuel")
-        return helper
-
-    def vision_calibration_sheet(self) -> bytes:
-        """Generate the local 180 mm ArUco-like QR calibration sheet on demand."""
-        try:
-            result = subprocess.run(
-                [str(self._vision_calibration_helper()), "--sheet"],
-                check=True, capture_output=True, timeout=15,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("Génération de la planche de calibration expirée") from exc
-        except subprocess.CalledProcessError as exc:
-            raise RuntimeError("Impossible de générer la planche de calibration") from exc
-        if not result.stdout.startswith(b"%PDF") or len(result.stdout) < 1024:
-            raise RuntimeError("Planche de calibration invalide")
-        return result.stdout
-
-    def detect_vision_calibration_markers(self, filename: str) -> dict[str, Any]:
-        """Ask the bundled macOS Vision helper for QR marker centres only."""
-        image_path = self._vision_capture_path(filename)
-        try:
-            result = subprocess.run(
-                [str(self._vision_calibration_helper()), "--detect", str(image_path)],
-                check=True, capture_output=True, timeout=15, text=True,
-            )
-            payload = json.loads(result.stdout)
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("Détection automatique expirée") from exc
-        except (subprocess.CalledProcessError, json.JSONDecodeError) as exc:
-            raise RuntimeError("Détection automatique impossible sur cette capture") from exc
-        markers = payload.get("markers") if isinstance(payload, dict) else None
-        if not isinstance(markers, list):
-            raise RuntimeError("Réponse de calibration invalide")
-        clean: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for marker in markers:
-            if not isinstance(marker, dict):
-                continue
-            identifier = str(marker.get("id") or "")
-            x, y = marker.get("x"), marker.get("y")
-            if identifier not in {"TL", "TR", "BR", "BL"} or identifier in seen:
-                continue
-            if not isinstance(x, (float, int)) or not isinstance(y, (float, int)):
-                continue
-            if not 0.0 <= float(x) <= 1.0 or not 0.0 <= float(y) <= 1.0:
-                continue
-            seen.add(identifier)
-            clean.append({"id": identifier, "x": float(x), "y": float(y)})
-        return {"markers": clean, "required": 4, "detected": len(clean)}
-
     def detect_vision_object_shapes(self, filename: str) -> dict[str, Any]:
         """Locate the sliced 3MF object silhouettes in one RGB capture.
 
@@ -2636,44 +2581,6 @@ class Companion:
         if not clean:
             return {"detected": False, "message": "Aucune forme reconnue ne correspond aux objets G-code"}
         return {"detected": True, "similarity": float(result.get("similarity") or 0), "objects": clean}
-
-    def compare_vision_captures(self, reference_filename: str, candidate_filename: str) -> dict[str, Any]:
-        """Compare the initial frame of one print with its current frame.
-
-        The moving camera has no stable plate pose, so this deliberately keeps
-        the two authentic images side by side. It answers the useful review
-        question "what has appeared since the beginning of this print?".
-        """
-        if reference_filename == candidate_filename:
-            raise ValueError("Choisissez deux captures différentes à comparer")
-        reference_path = self._vision_capture_path(reference_filename)
-        candidate_path = self._vision_capture_path(candidate_filename)
-        with self.lock:
-            captures = self.state.get("camera", {}).get("captures", [])
-            reference = next((item for item in captures if isinstance(item, dict) and item.get("file") == reference_filename), None)
-            candidate = next((item for item in captures if isinstance(item, dict) and item.get("file") == candidate_filename), None)
-            if not isinstance(reference, dict) or not isinstance(candidate, dict):
-                raise FileNotFoundError("Capture Vision introuvable")
-            same_print = (
-                (reference.get("folder") and reference.get("folder") == candidate.get("folder"))
-                or (reference.get("print_id") and reference.get("print_id") == candidate.get("print_id"))
-            )
-            if not same_print:
-                raise ValueError("Les comparaisons sont limitées aux images d’une même impression")
-        runtime = self.state_path.parent / "vision-runtime"
-        if runtime.is_dir() and str(runtime) not in sys.path:
-            sys.path.insert(0, str(runtime))
-        try:
-            import vision_temporal
-        except ImportError as exc:
-            raise RuntimeError("Module de comparaison Vision indisponible") from exc
-        result = vision_temporal.compare(reference_path, candidate_path)
-        result.update({
-            "reference": reference_filename, "candidate": candidate_filename,
-            "reference_layer": int(reference.get("layer", 0) or 0),
-            "candidate_layer": int(candidate.get("layer", 0) or 0),
-        })
-        return result
 
     def observe_plate_guardian(self, data: dict[str, Any]) -> dict[str, Any]:
         """Accept detector evidence; the guardian has no printer-control path."""
@@ -4075,52 +3982,6 @@ class Companion:
                 camera["capture_in_progress"] = False
                 self.save()
 
-    def capture_calibration_frame(self) -> dict[str, Any]:
-        """Read one idle-camera frame for calibration; never sends printer control."""
-        with self.lock:
-            camera = self.state.setdefault("camera", {})
-            if str((self.state.get("printer") or {}).get("state") or "").upper() in RUNNING:
-                raise ValueError("La capture de calibration est réservée au plateau au repos")
-            if camera.get("capture_in_progress"):
-                raise RuntimeError("Une capture caméra est déjà en cours")
-            host = str(self.state["config"].get("ip") or "")
-            code = str(self.state["config"].get("access_code") or "")
-            fingerprint = str(camera.get("certificate_sha256") or "")
-            if not host or not code or not fingerprint:
-                raise ValueError("Configure d’abord la caméra et son empreinte TLS approuvée")
-            camera["capture_in_progress"] = True
-            camera["status"] = "Capture de calibration en cours…"
-            self.save()
-        try:
-            frame = capture_jpeg(host, code, fingerprint)
-            root = self.state_path.parent / "captures"
-            secure_directory(root)
-            filename = f"layer-00000-{time.strftime('%Y%m%d-%H%M%S')}.jpg"
-            path = root / filename
-            path.write_bytes(frame.jpeg)
-            os.chmod(path, 0o600)
-            result = {
-                "layer": 0, "captured_at": now_iso(), "file": filename,
-                "sha256": frame.sha256, "size_bytes": len(frame.jpeg),
-                "print_name": "Calibration Vision", "calibration": True,
-            }
-            with self.lock:
-                camera = self.state["camera"]
-                camera.setdefault("captures", []).insert(0, result)
-                camera["status"] = "Capture de calibration enregistrée"
-                self.save()
-            return result
-        except CameraError as exc:
-            with self.lock:
-                self.state["camera"]["status"] = f"Capture de calibration impossible : {exc}"
-                self.save()
-            raise RuntimeError(str(exc)) from exc
-        finally:
-            with self.lock:
-                self.state["camera"]["capture_in_progress"] = False
-                self.save()
-
-
 class Handler(BaseHTTPRequestHandler):
     server_version = f"AMSLiteCompanion/{__version__}"
 
@@ -4261,15 +4122,6 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_jpeg(image_path.read_bytes())
             except OSError:
                 self.send_error(404)
-        elif path == "/api/vision/calibration-sheet.pdf":
-            query = urllib.parse.parse_qs(request_url.query)
-            if not self._local_capture_request_is_valid(query):
-                self.send_json({"error": "Accès local non autorisé"}, 403)
-                return
-            try:
-                self.send_pdf(self.app.vision_calibration_sheet(), "ams-companion-calibration-180mm.pdf")
-            except (RuntimeError, OSError) as exc:
-                self.send_json({"error": str(exc)}, 503)
         elif not self._require_api_access():
             return
         elif path == "/api/state":
@@ -4303,9 +4155,6 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/camera/discover":
                 self.json_body()
                 self.send_json(self.app.discover_camera_certificate())
-            elif path == "/api/vision/calibration/detect":
-                body = self.json_body()
-                self.send_json(self.app.detect_vision_calibration_markers(str(body.get("file") or "")))
             elif path == "/api/vision/shapes/detect":
                 body = self.json_body()
                 try:
@@ -4315,11 +4164,6 @@ class Handler(BaseHTTPRequestHandler):
                     # expected Vision outcome, not an invalid browser request.
                     result = {"detected": False, "message": str(exc)}
                 self.send_json(result)
-            elif path == "/api/vision/temporal/compare":
-                body = self.json_body()
-                self.send_json(self.app.compare_vision_captures(
-                    str(body.get("reference") or ""), str(body.get("candidate") or ""),
-                ))
             elif path == "/api/vision/printguard/test":
                 self.json_body()
                 result = self.app.test_printguard()
@@ -4327,9 +4171,6 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/vision/printguard/classify":
                 body = self.json_body()
                 self.send_json(self.app.classify_capture_with_printguard(str(body.get("file") or "")))
-            elif path == "/api/vision/calibration/capture":
-                self.json_body()
-                self.send_json(self.app.capture_calibration_frame())
             elif match := re.fullmatch(r"/api/captures/(print-[a-zA-Z0-9._-]+)/delete", path):
                 self.json_body()
                 self.send_json(self.app.delete_capture_print(match.group(1)))
@@ -4514,7 +4355,7 @@ def render_vision_html_legacy(api_token: str) -> str:
 <script>const token={api_token!r};async function api(p,o={{}}){{let r=await fetch(p,{{...o,headers:{{'X-AMS-Token':token,'Content-Type':'application/json'}}}}),j=await r.json();if(!r.ok)throw Error(j.error||'Erreur');return j}}function captureURL(file){{return `/api/captures/${{encodeURIComponent(file)}}?token=${{encodeURIComponent(token)}}`}}function esc(v){{return String(v??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}function show(s){{let c=s.camera||{{}},x=Array.isArray(c.captures)?c.captures:[],storage=s.vision_storage||{{}},size=(Number(storage.bytes||0)/1048576).toFixed(1);visionStatus.textContent=c.status||'Caméra non configurée';visionEnabled.checked=!!c.enabled;visionFingerprint.value=c.certificate_sha256||'';visionMeta.textContent=`Cadence : 5 couches · dernière couche : ${{c.last_seen_layer||'—'}} · ${{storage.count||0}} image(s) · ${{size}} Mo`;window.visionCaptures=x;let groups=new Map();x.forEach((i,index)=>{{let key=i.folder||'en-cours';if(!groups.has(key))groups.set(key,{{name:i.print_name||(i.folder?'Impression terminée':'Impression en cours'),folder:i.folder||'',id:i.print_id||'',items:[]}});groups.get(key).items.push({{i,index}})}});visionGallery.innerHTML=x.length?[...groups.values()].map(g=>`<div class="capture-group"><div class="capture-group-head"><div><h3>${{esc(g.name)}}</h3><span>${{g.items.length}} image(s)</span></div>${{g.folder?`<button onclick="deletePrint('${{esc(g.folder)}}')">Supprimer</button>`:g.id?`<button onclick="deleteCurrentPrint('${{esc(g.id)}}')">Supprimer</button>`:''}}</div><div class="capture-grid">${{g.items.map(({{i,index}})=>`<article><button class="capture-card" onclick="openCapture(${{index}})"><b>Couche ${{i.layer}}</b><br>${{i.captured_at}}<img src="${{captureURL(i.file)}}" alt="Capture de la couche ${{i.layer}}"></button></article>`).join('')}}</div></div>`).join(''):'Aucune capture.'}}function openCapture(index){{let i=(window.visionCaptures||[])[index];if(!i)return;captureTitle.textContent=`Capture · couche ${{i.layer}}`;captureLarge.src=captureURL(i.file);captureLarge.alt=`Capture agrandie de la couche ${{i.layer}}`;captureInfo.innerHTML=`<div><b>Impression</b>${{esc(i.print_name||'En cours')}}</div><div><b>Couche</b>${{i.layer}}</div><div><b>Date</b>${{i.captured_at}}</div><div><b>Fichier</b>${{i.file}}</div><div><b>Empreinte SHA-256</b>${{i.sha256||'—'}}</div>`;captureModal.hidden=false}}function closeCapture(){{captureModal.hidden=true;captureLarge.removeAttribute('src')}}async function deletePrint(folder){{if(!confirm('Supprimer définitivement toutes les captures de cette impression ?'))return;try{{await api(`/api/captures/${{encodeURIComponent(folder)}}/delete`,{{method:'POST',body:'{{}}'}});closeCapture();await load()}}catch(e){{visionStatus.textContent=e.message}}}}async function deleteCurrentPrint(id){{if(!confirm('Supprimer les captures déjà prises pour cette impression ? Les prochaines captures continueront normalement.'))return;try{{await api(`/api/captures/session/${{encodeURIComponent(id)}}/delete`,{{method:'POST',body:'{{}}'}});closeCapture();await load()}}catch(e){{visionStatus.textContent=e.message}}}}async function load(){{try{{show(await api('/api/state'))}}catch(e){{visionStatus.textContent=e.message}}}}async function importBambuStudio(){{try{{let r=await api('/api/config/import-bambu-studio',{{method:'POST',body:JSON.stringify({{ip:'192.168.1.24'}})}});visionStatus.textContent=`Configuration importée pour ${{r.serial}}. Active ensuite le mode LAN de l’imprimante.`;load()}}catch(e){{visionStatus.textContent=e.message}}}}async function discover(){{try{{visionFingerprint.value=(await api('/api/camera/discover',{{method:'POST',body:'{{}}'}})).fingerprint;visionStatus.textContent='Empreinte détectée : approuve-la.'}}catch(e){{visionStatus.textContent=e.message}}}}async function save(){{try{{await api('/api/config',{{method:'POST',body:JSON.stringify({{camera_enabled:visionEnabled.checked,camera_certificate_sha256:visionFingerprint.value}})}});load()}}catch(e){{visionStatus.textContent=e.message}}}}document.addEventListener('keydown',e=>{{if(e.key==='Escape')closeCapture()}});load();setInterval(load,3000);</script>'''
 
 
-def render_vision_html(api_token: str) -> str:
+def _render_vision_html_retired(api_token: str) -> str:
     """Render the Vision window with explicit capture and map-overlay controls."""
     return '''<!doctype html><html lang="fr"><meta charset="utf-8"><title>Centre Vision</title>
 <style>
@@ -4569,6 +4410,41 @@ async function deleteCapturePrint(folder){if(!confirm('Supprimer définitivement
 async function deleteActiveCaptureSession(sessionId){if(!confirm('Supprimer les images déjà prises de cette impression ? Les prochaines captures resteront actives.'))return;try{await api(`/api/captures/session/${encodeURIComponent(sessionId)}/delete`,{method:'POST',body:'{}'});closeCapture();await load()}catch(error){statusEl.textContent=error.message||'Suppression impossible.'}}
 function showMoreCaptures(){visionGalleryLimit+=180;if(visionState)render(visionState)}
 function render(state){visionState=state;const printer=state.printer||{},camera=state.camera||{},printguard=state.printguard||{},captures=Array.isArray(camera.captures)?camera.captures:[],storage=state.vision_storage||{};const views=camera.capture_views_per_layer||3,delayMin=camera.capture_view_delay_min_seconds||4,delayMax=camera.capture_view_delay_max_seconds||24;layerCounterEl.textContent=Number(printer.layer)>0?`Couche ${Number(printer.layer)}`:'Couche —';statusEl.textContent=camera.status||'Caméra non configurée';enabledEl.checked=!!camera.enabled;fingerprintEl.value=camera.certificate_sha256||'';printguardEnabledEl.checked=!!printguard.enabled;printguardURLEl.value=printguard.base_url||'http://127.0.0.1:8000';printguardSensitivityEl.value=printguard.sensitivity||1;printguardStatusEl.textContent=printguard.status||'PrintGuard non configuré';metaEl.textContent=`Captures, pas vidéo : ${views} vues avec pauses aléatoires de ${delayMin} à ${delayMax} s toutes les ${camera.capture_every_layers||5} couches · dernière couche reçue : ${camera.last_seen_layer||'—'} · ${storage.count||0} image(s) conservée(s) localement. ${camera.verification_status||''}`;window.visionCaptures=captures;const visibleCaptures=captures.slice(0,visionGalleryLimit),groups=new Map();visibleCaptures.forEach((item,index)=>{const key=item.folder||'en-cours';if(!groups.has(key))groups.set(key,{name:item.print_name||(item.folder?'Impression terminée':'Impression en cours'),folder:item.folder||'',sessionId:item.print_id||'',items:[]});groups.get(key).items.push({item,index})});const gallery=visibleCaptures.length?[...groups.values()].map(group=>{const deletion=group.folder?`<button class="danger" onclick="deleteCapturePrint('${esc(group.folder)}')">Supprimer</button>`:/^[a-f0-9]{16}$/.test(group.sessionId)?`<button class="danger" onclick="deleteActiveCaptureSession('${esc(group.sessionId)}')">Supprimer</button>`:'';return `<div class="capture-group"><div class="capture-group-head"><div><h3>${esc(group.name)}</h3><span>${group.items.length} image(s)</span></div>${deletion}</div><div class="capture-grid">${group.items.map(({item,index})=>{const objectCount=objectsFor(item).length,pg=item.printguard||{},aiBadge=pg.prediction?`<br><span class="map-badge">PrintGuard : ${pg.prediction==='failure'?'risque signalé':'aucun défaut'} (${Math.round(100*Number(pg.defect_score||0))} %)</span>`:'',verification=item.visual_verification||{},verificationBadge=verification.status==='unverified'||verification.status==='unavailable'?`<br><span class="map-badge">Garde-fou Vision : contrôle requis</span>`:'';return `<button class="capture-card" onclick="openCapture(${index})"><img src="${captureURL(item.file)}" alt="Capture couche ${item.layer}, vue ${item.capture_view||1}"><div><b>Couche ${item.layer} · vue ${item.capture_view||1}/${item.capture_views_total||1}</b><br><span class="muted">${esc(item.captured_at)}</span>${aiBadge}${verificationBadge}${objectCount?`<br><span class="map-badge">${objectCount} objet(s) cartographié(s)</span>`:''}</div></button>`}).join('')}</div></div>`}).join(''):'<p>Aucune capture : la première séquence sera prise à la couche 5, pas immédiatement au lancement.</p>';const remaining=captures.length-visibleCaptures.length;galleryEl.innerHTML=gallery+(remaining>0?`<p class="muted">${remaining} image(s) plus ancienne(s) restent dans l’historique local.<br><button class="secondary" onclick="showMoreCaptures()">Afficher 180 images supplémentaires</button></p>`:'');calibration();}
+async function load(){try{render(await api('/api/state'))}catch(error){statusEl.textContent=error.message}}async function saveCamera(){try{await api('/api/config',{method:'POST',body:JSON.stringify({camera_enabled:enabledEl.checked,camera_certificate_sha256:fingerprintEl.value})});await load()}catch(error){statusEl.textContent=error.message}}async function discover(){try{fingerprintEl.value=(await api('/api/camera/discover',{method:'POST',body:'{}'})).fingerprint;statusEl.textContent='Empreinte détectée : enregistre-la pour l’approuver.'}catch(error){statusEl.textContent=error.message}}document.addEventListener('keydown',event=>{if(event.key==='Escape')closeCapture()});load();setInterval(load,3000);
+</script></html>'''.replace("__API_TOKEN__", json.dumps(api_token))
+
+
+def render_vision_html(api_token: str) -> str:
+    """Render the streamlined Vision window without retired manual tooling."""
+    return '''<!doctype html><html lang="fr"><meta charset="utf-8"><title>Centre Vision</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f4f5f6;color:#20242a;margin:0}main{max-width:1100px;margin:auto;padding:28px}section{background:#fff;border:1px solid #dfe3e7;border-radius:10px;padding:18px;margin-top:16px}button,input{font:inherit;box-sizing:border-box}button{padding:9px 13px;background:#00a23d;border:0;border-radius:7px;color:#fff;font-weight:600;cursor:pointer;margin:4px}.secondary{background:#59636e}.danger{background:#b5392e}.notice{padding:12px;border-radius:8px;background:#fff1e7;color:#934210;font-weight:600}.muted{color:#69717b}.fields{display:grid;grid-template-columns:repeat(2,minmax(120px,220px));gap:10px;align-items:end}.fields label{display:grid;gap:5px;font-size:13px}.fields input{padding:8px;border:1px solid #cbd1d7;border-radius:7px}#gallery{display:grid;gap:24px}.capture-group{border-top:1px solid #dfe3e7;padding-top:14px}.capture-group:first-child{border-top:0;padding-top:0}.capture-group-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.capture-group-head h3{margin:0}.capture-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin-top:10px}.capture-card{display:block;width:100%;padding:0;background:#fff;color:#20242a;text-align:left;border:1px solid #dfe3e7;overflow:hidden}.capture-card img{display:block;width:100%;aspect-ratio:4/3;object-fit:cover;background:#e9edf0}.capture-card div{padding:9px}.map-badge{display:inline-block;margin-top:5px;padding:2px 6px;border-radius:99px;background:#fff0ed;color:#a13228;font-size:11px}.capture-modal{position:fixed;inset:0;z-index:10;background:#000b;display:grid;place-items:center;padding:24px;box-sizing:border-box}.capture-modal[hidden]{display:none}.capture-dialog{position:relative;box-sizing:border-box;width:min(1120px,calc(100vw - 32px));max-height:calc(100vh - 32px);overflow:auto;background:#fff;border-radius:12px;padding:20px;box-shadow:0 12px 50px #0008}.capture-close{position:absolute;right:14px;top:8px;margin:0}.capture-stage{position:relative;display:inline-block;max-width:100%;margin-top:12px}.capture-stage img{display:block;max-width:100%;max-height:66vh;border-radius:8px;background:#e9edf0}.capture-stage svg{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}.object-legend{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:7px;margin-top:12px}.object-legend:empty{display:none}.legend-item{display:flex;align-items:flex-start;gap:8px;width:100%;margin:0;padding:8px 10px;border:1px solid #dfe3e7;border-radius:8px;background:#fff;color:#20242a;text-align:left}.legend-item.selected{border-color:#087535;background:#f2fbf5}.legend-swatch{flex:0 0 auto;width:22px;height:22px;border-radius:50%;display:grid;place-items:center;color:#fff;font-size:11px;font-weight:800}.legend-item b{display:block;font-size:12px;line-height:1.25}.legend-item small{display:block;margin-top:2px;color:#69717b;font-size:11px}.capture-info{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:14px}.capture-info div{background:#f5f7f8;border-radius:7px;padding:9px;overflow-wrap:anywhere}.capture-info b{display:block;font-size:12px;color:#66707a;margin-bottom:3px}@media(max-width:650px){main{padding:12px}.fields{grid-template-columns:1fr}.capture-dialog{padding:16px}}
+</style><main>
+<h1>Centre Vision</h1>
+<p class="notice">Captures automatiques périodiques : <strong>ce n’est pas une vidéo en direct</strong>. Trois vues avec des pauses aléatoires sont prises à la couche 5, puis toutes les 5 couches, afin de voir les objets masqués par la tête.</p>
+<section><h2>Impression en cours</h2><p id="layerCounter" style="font-size:42px;font-weight:800;margin:4px 0;color:#087535">Couche —</p><p class="muted">Compteur reçu directement de l’imprimante.</p></section>
+<section><h2>Caméra</h2><p id="status">Chargement…</p><label><input id="enabled" type="checkbox"> Activer les captures automatiques (pas de flux vidéo)</label><p class="muted">Le Centre Vision se met à jour toutes les trois secondes après chaque nouvelle capture.</p><label>Empreinte TLS</label><input id="fingerprint" placeholder="Détecte-la automatiquement"><button class="secondary" onclick="discover()">Détecter la caméra</button><button onclick="saveCamera()">Enregistrer</button><p id="meta" class="muted"></p></section>
+<section><h2>IA de détection PrintGuard</h2><p>Détecteur local séparé de Companion. Les JPEG restent sur ce Mac et l’IA ne reçoit ni le code LAN Bambu ni aucun droit de pause ou d’annulation.</p><label><input id="printguardEnabled" type="checkbox"> Analyser automatiquement chaque nouvelle capture</label><div class="fields"><label>Adresse locale<input id="printguardURL" value="http://127.0.0.1:8000" inputmode="url"></label><label>Sensibilité (0,1 à 4)<input id="printguardSensitivity" type="number" min="0.1" max="4" step="0.1" value="1"></label></div><label>Jeton API optionnel<input id="printguardToken" type="password" placeholder="Seulement si PrintGuard exige un jeton"></label><button class="secondary" onclick="testPrintGuard()">Tester PrintGuard</button><button onclick="savePrintGuard()">Enregistrer l’IA</button><p id="printguardStatus" class="muted">Installe et lance PrintGuard, puis teste la connexion locale.</p></section>
+<section><h2>Captures par impression</h2><div id="gallery"></div></section></main>
+<div id="captureModal" class="capture-modal" hidden onclick="if(event.target===this)closeCapture()"><section class="capture-dialog"><button class="secondary capture-close" onclick="closeCapture()">Fermer</button><h2 id="captureTitle">Capture</h2><button onclick="classifyCurrentCapture()">Analyser avec PrintGuard</button><p id="overlayNotice" class="muted"></p><div id="captureStage" class="capture-stage"><img id="captureLarge" alt="Capture agrandie"><svg id="captureOverlay" viewBox="0 0 1 1" preserveAspectRatio="none"></svg></div><div id="objectLegend" class="object-legend" aria-label="Légende des objets reconnus"></div><div id="captureInfo" class="capture-info"></div></section></div>
+<script>
+const token=__API_TOKEN__,statusEl=document.getElementById('status'),enabledEl=document.getElementById('enabled'),fingerprintEl=document.getElementById('fingerprint'),metaEl=document.getElementById('meta'),galleryEl=document.getElementById('gallery'),modalEl=document.getElementById('captureModal'),titleEl=document.getElementById('captureTitle'),largeEl=document.getElementById('captureLarge'),overlayEl=document.getElementById('captureOverlay'),overlayNoticeEl=document.getElementById('overlayNotice'),legendEl=document.getElementById('objectLegend'),infoEl=document.getElementById('captureInfo'),layerCounterEl=document.getElementById('layerCounter'),printguardEnabledEl=document.getElementById('printguardEnabled'),printguardURLEl=document.getElementById('printguardURL'),printguardTokenEl=document.getElementById('printguardToken'),printguardSensitivityEl=document.getElementById('printguardSensitivity'),printguardStatusEl=document.getElementById('printguardStatus');
+let visionState=null,currentCapture=null,currentShapeObjects=[],currentPlateMessage='',selectedObjectIndex=-1,visionGalleryLimit=180;
+async function api(path,opt={}){const response=await fetch(path,{...opt,headers:{'X-AMS-Token':token,'Content-Type':'application/json'}}),body=await response.json();if(!response.ok)throw Error(body.error||'Erreur');return body}
+function esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function captureURL(file){return `/api/captures/${encodeURIComponent(file)}?token=${encodeURIComponent(token)}`}
+async function savePrintGuard(){try{await api('/api/config',{method:'POST',body:JSON.stringify({printguard_enabled:printguardEnabledEl.checked,printguard_base_url:printguardURLEl.value,printguard_token:printguardTokenEl.value,printguard_sensitivity:printguardSensitivityEl.value})});printguardTokenEl.value='';await load()}catch(error){printguardStatusEl.textContent=error.message||'Configuration PrintGuard impossible.'}}
+async function testPrintGuard(){try{printguardStatusEl.textContent='Connexion locale à PrintGuard…';const result=await api('/api/vision/printguard/test',{method:'POST',body:'{}'});printguardStatusEl.textContent=result.message||'PrintGuard connecté.';await load()}catch(error){printguardStatusEl.textContent=error.message||'PrintGuard indisponible.'}}
+async function classifyCurrentCapture(){if(!currentCapture)return;try{overlayNoticeEl.textContent='Analyse locale PrintGuard en cours…';const result=await api('/api/vision/printguard/classify',{method:'POST',body:JSON.stringify({file:currentCapture.file})});currentCapture.printguard=result;overlayNoticeEl.textContent=result.prediction==='failure'?`PrintGuard signale un risque de défaut (${Math.round(100*Number(result.defect_score||0))} %). Vérifie l’impression : aucune action n’a été envoyée.`:`PrintGuard ne signale pas de défaut sur cette capture (${Math.round(100*Number(result.defect_score||0))} %).`;await load()}catch(error){overlayNoticeEl.textContent=error.message||'Analyse PrintGuard impossible.'}}
+function objectsFor(capture){const embedded=capture?.object_map?.objects;if(Array.isArray(embedded)&&embedded.length)return embedded;const active=visionState?.camera?.active_print;if(active&&capture?.print_id===active.id){const mapped=visionState?.active_job?.object_map?.objects;return Array.isArray(mapped)?mapped:[]}return []}
+const outlineColors=['#d92d20','#b42318','#c11574','#7a5af8','#444ce7','#175cd3','#027a48','#039855','#b54708','#93370d','#a15c07','#6941c6'];function selectMappedObject(index){selectedObjectIndex=selectedObjectIndex===index?-1:index;drawOverlay()}
+function drawOverlay(){overlayEl.innerHTML='';legendEl.innerHTML='';if(!currentCapture)return;const shapes=new Map(currentShapeObjects.map(item=>[String(item.object_id),Array.isArray(item.contours)?item.contours:[]]));if(!shapes.size){overlayNoticeEl.textContent=currentPlateMessage||'Aucune silhouette 3MF exploitable n’est affichée.';return}let count=0,svg='',legend='';objectsFor(currentCapture).forEach((object,index)=>{const contours=shapes.get(String(object?.id));if(!Array.isArray(contours))return;const valid=contours.filter(contour=>Array.isArray(contour)&&contour.length>=3);if(!valid.length)return;const color=outlineColors[index%outlineColors.length],selected=selectedObjectIndex===index;svg+=valid.map(contour=>`<polygon points="${contour.map(point=>`${point[0]},${point[1]}`).join(' ')}" fill="${selected?color+'33':'none'}" stroke="${selected?'#ef1f18':color}" stroke-width="${selected?'0.010':'0.005'}" vector-effect="non-scaling-stroke"/>`).join('');legend+=`<button class="legend-item ${selected?'selected':''}" onclick="selectMappedObject(${index})"><span class="legend-swatch" style="background:${color}">${index+1}</span><span><b>${esc(object.label||('Objet '+object.id))}</b><small>silhouette 3MF reconnue dans cette image${selected?' · contour sélectionné':''}</small></span></button>`;count++});overlayEl.innerHTML=svg;legendEl.innerHTML=legend;overlayNoticeEl.textContent=count?`${count} silhouette(s) 3MF reconnue(s) dans cette image.`:'Aucune silhouette 3MF exploitable n’est affichée.'}
+async function detectObjectShapes(){if(!currentCapture||modalEl.hidden)return;const file=currentCapture.file;try{const result=await api('/api/vision/shapes/detect',{method:'POST',body:JSON.stringify({file})});if(!currentCapture||currentCapture.file!==file)return;currentShapeObjects=result.detected&&Array.isArray(result.objects)?result.objects:[];currentPlateMessage=result.message||'Aucune forme du 3MF reconnue : aucun contour affiché.';drawOverlay()}catch(error){currentShapeObjects=[];currentPlateMessage=error.message||'Détection de formes impossible.';drawOverlay()}}
+function openCapture(index){currentCapture=(window.visionCaptures||[])[index];if(!currentCapture)return;currentShapeObjects=[];currentPlateMessage='Recherche automatique des silhouettes 3MF…';selectedObjectIndex=-1;titleEl.textContent=`Capture · couche ${currentCapture.layer} · vue ${currentCapture.capture_view||1}/${currentCapture.capture_views_total||1}`;largeEl.src=captureURL(currentCapture.file);largeEl.alt=`Capture de la couche ${currentCapture.layer}, vue ${currentCapture.capture_view||1}`;const pg=currentCapture.printguard||{},pgText=pg.prediction?`${pg.prediction==='failure'?'Risque signalé':'Aucun défaut signalé'} · ${Math.round(100*Number(pg.defect_score||0))} %`:'Pas encore analysée',verification=currentCapture.visual_verification||{},verificationText=verification.status?verification.message||'Pas encore contrôlée';infoEl.innerHTML=`<div><b>Impression</b>${esc(currentCapture.print_name||'Impression en cours')}</div><div><b>Couche</b>${currentCapture.layer}</div><div><b>Vue de la séquence</b>${currentCapture.capture_view||1}/${currentCapture.capture_views_total||1}</div><div><b>Analyse PrintGuard</b>${esc(pgText)}</div><div><b>Garde-fou Vision</b>${esc(verificationText)}</div><div><b>Date</b>${esc(currentCapture.captured_at)}</div><div><b>Fichier</b>${esc(currentCapture.file)}</div>`;modalEl.hidden=false;largeEl.onload=drawOverlay;drawOverlay();detectObjectShapes()}
+function closeCapture(){modalEl.hidden=true;currentShapeObjects=[];selectedObjectIndex=-1;largeEl.removeAttribute('src');overlayEl.innerHTML='';legendEl.innerHTML=''}
+async function deleteCapturePrint(folder){if(!confirm('Supprimer définitivement toutes les images de cette impression ?'))return;try{await api(`/api/captures/${encodeURIComponent(folder)}/delete`,{method:'POST',body:'{}'});closeCapture();await load()}catch(error){statusEl.textContent=error.message||'Suppression impossible.'}}
+async function deleteActiveCaptureSession(sessionId){if(!confirm('Supprimer les images déjà prises de cette impression ? Les prochaines captures resteront actives.'))return;try{await api(`/api/captures/session/${encodeURIComponent(sessionId)}/delete`,{method:'POST',body:'{}'});closeCapture();await load()}catch(error){statusEl.textContent=error.message||'Suppression impossible.'}}
+function showMoreCaptures(){visionGalleryLimit+=180;if(visionState)render(visionState)}
+function render(state){visionState=state;const printer=state.printer||{},camera=state.camera||{},printguard=state.printguard||{},captures=Array.isArray(camera.captures)?camera.captures:[],storage=state.vision_storage||{};const views=camera.capture_views_per_layer||3,delayMin=camera.capture_view_delay_min_seconds||4,delayMax=camera.capture_view_delay_max_seconds||24;layerCounterEl.textContent=Number(printer.layer)>0?`Couche ${Number(printer.layer)}`:'Couche —';statusEl.textContent=camera.status||'Caméra non configurée';enabledEl.checked=!!camera.enabled;fingerprintEl.value=camera.certificate_sha256||'';printguardEnabledEl.checked=!!printguard.enabled;printguardURLEl.value=printguard.base_url||'http://127.0.0.1:8000';printguardSensitivityEl.value=printguard.sensitivity||1;printguardStatusEl.textContent=printguard.status||'PrintGuard non configuré';metaEl.textContent=`Captures, pas vidéo : ${views} vues avec pauses aléatoires de ${delayMin} à ${delayMax} s toutes les ${camera.capture_every_layers||5} couches · dernière couche reçue : ${camera.last_seen_layer||'—'} · ${storage.count||0} image(s) conservée(s) localement. ${camera.verification_status||''}`;window.visionCaptures=captures;const visible=captures.slice(0,visionGalleryLimit),groups=new Map();visible.forEach((item,index)=>{const key=item.folder||'en-cours';if(!groups.has(key))groups.set(key,{name:item.print_name||(item.folder?'Impression terminée':'Impression en cours'),folder:item.folder||'',sessionId:item.print_id||'',items:[]});groups.get(key).items.push({item,index})});galleryEl.innerHTML=visible.length?[...groups.values()].map(group=>{const deletion=group.folder?`<button class="danger" onclick="deleteCapturePrint('${esc(group.folder)}')">Supprimer</button>`:/^[a-f0-9]{16}$/.test(group.sessionId)?`<button class="danger" onclick="deleteActiveCaptureSession('${esc(group.sessionId)}')">Supprimer</button>`:'';return `<div class="capture-group"><div class="capture-group-head"><div><h3>${esc(group.name)}</h3><span>${group.items.length} image(s)</span></div>${deletion}</div><div class="capture-grid">${group.items.map(({item,index})=>{const pg=item.printguard||{},ai=pg.prediction?`<br><span class="map-badge">PrintGuard : ${pg.prediction==='failure'?'risque signalé':'aucun défaut'} (${Math.round(100*Number(pg.defect_score||0))} %)</span>`:'',guard=item.visual_verification||{},guardBadge=['unverified','unavailable'].includes(guard.status)?`<br><span class="map-badge">Garde-fou Vision : contrôle requis</span>`:'';return `<button class="capture-card" onclick="openCapture(${index})"><img src="${captureURL(item.file)}" alt="Capture couche ${item.layer}, vue ${item.capture_view||1}"><div><b>Couche ${item.layer} · vue ${item.capture_view||1}/${item.capture_views_total||1}</b><br><span class="muted">${esc(item.captured_at)}</span>${ai}${guardBadge}</div></button>`}).join('')}</div></div>`}).join(''):'<p>Aucune capture : la première séquence sera prise à la couche 5, pas immédiatement au lancement.</p>';const remaining=captures.length-visible.length;if(remaining)galleryEl.innerHTML+=`<p class="muted">${remaining} image(s) plus ancienne(s) restent dans l’historique local.<br><button class="secondary" onclick="showMoreCaptures()">Afficher 180 images supplémentaires</button></p>`}
 async function load(){try{render(await api('/api/state'))}catch(error){statusEl.textContent=error.message}}async function saveCamera(){try{await api('/api/config',{method:'POST',body:JSON.stringify({camera_enabled:enabledEl.checked,camera_certificate_sha256:fingerprintEl.value})});await load()}catch(error){statusEl.textContent=error.message}}async function discover(){try{fingerprintEl.value=(await api('/api/camera/discover',{method:'POST',body:'{}'})).fingerprint;statusEl.textContent='Empreinte détectée : enregistre-la pour l’approuver.'}catch(error){statusEl.textContent=error.message}}document.addEventListener('keydown',event=>{if(event.key==='Escape')closeCapture()});load();setInterval(load,3000);
 </script></html>'''.replace("__API_TOKEN__", json.dumps(api_token))
 
