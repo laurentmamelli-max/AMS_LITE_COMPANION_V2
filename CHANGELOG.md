@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.6.1 — 2026-08-02
+
+- Correctif Centre Vision : deux captures de la même couche sont désormais
+  présentées côte à côte, sans zones rouges ni projection inventée. La caméra
+  mobile ne fournit pas une pose de plaque assez stable pour un recalage
+  automatique fiable ; la comparaison reste donc une preuve visuelle honnête.
+
 ## 3.6.0 — 2026-08-02
 
 - Le Centre Vision compare maintenant deux vues d’une même couche. Il recale
