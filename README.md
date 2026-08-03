@@ -63,9 +63,12 @@ estimations et peuvent être corrigés manuellement après une pesée.
 ## Détection locale
 
 PrintGuard a été entièrement retiré. Companion conserve le garde-fou Vision
-local et prépare son propre détecteur léger, isolé du protocole Bambu. Les
-captures restent sur le Mac ; toute future détection ne créera qu’une alerte
-à vérifier. L’exclusion manuelle Bambu reste un choix séparé, explicitement
+local et intègre son propre détecteur IA, isolé du protocole Bambu. Le modèle
+MIT analyse localement les captures pour distinguer une impression saine, le
+spaghetti, le stringing et une anomalie d’extrusion. Active-le dans le Centre
+Vision après son installation guidée. Trois captures distinctes et
+concordantes sont exigées avant toute alerte ; aucune commande n’est envoyée à
+l’imprimante. L’exclusion manuelle Bambu reste un choix séparé, explicitement
 confirmé.
 
 ## Compatibilité

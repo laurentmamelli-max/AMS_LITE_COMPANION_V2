@@ -282,7 +282,8 @@ class CompanionTests(unittest.TestCase):
         self.assertIn('ce n’est pas une vidéo en direct', page)
         self.assertNotIn('IA de détection PrintGuard', page)
         self.assertNotIn('Analyser avec PrintGuard', page)
-        self.assertNotIn('function classifyCurrentCapture()', page)
+        self.assertIn('function classifyCurrentCapture()', page)
+        self.assertIn('Détecteur IA local', page)
         self.assertIn('Légende des objets reconnus', page)
         self.assertIn('id="layerCounter"', page)
         self.assertIn('function detectObjectShapes()', page)
@@ -481,7 +482,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("3.8.13", report["application"]["version"])
+            self.assertEqual("4.0.0", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -1594,11 +1595,11 @@ class CompanionTests(unittest.TestCase):
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("3.8.13", report["application"]["version"])
+                self.assertEqual("4.0.0", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
                 self.assertIn("Poste de supervision", html)
                 self.assertIn("Historique Vision et rapports", html)
-                self.assertIn("Compteur local v3.8.13", html)
+                self.assertIn("Compteur local v4.0.0", html)
                 self.assertIn("shutdownCard.after(auditCard)", html)
                 self.assertIn("auditCard.after(reportsCard)", html)
                 snapshot_request = urllib.request.Request(
@@ -1700,8 +1701,30 @@ class CompanionTests(unittest.TestCase):
             ac.atomic_save(state, path)
             app = ac.Companion(path)
             self.assertNotIn("printguard", app.state)
-            self.assertEqual("Détecteur IA local en préparation", app.state["detector"]["status"])
+            self.assertIn("Détecteur IA", app.state["detector"]["status"])
             self.assertNotIn("printguard", app.state["camera"]["captures"][0])
+
+    def test_local_detector_requires_three_distinct_frames_before_alert(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            app = ac.Companion(path)
+            captures = []
+            capture_dir = Path(tmp) / "captures"
+            capture_dir.mkdir()
+            for second in range(1, 4):
+                filename = f"layer-00005-20260803-01010{second}.jpg"
+                (capture_dir / filename).write_bytes(f"frame-{second}".encode())
+                captures.append({"file": filename, "captured_at": f"2026-08-03T01:01:0{second}+0200"})
+            app.state["camera"]["captures"] = captures
+            app.state["detector"].update({"enabled": True, "threshold": 0.78})
+            with mock.patch.object(ac.local_detector, "classify", side_effect=lambda *_: {
+                "label": "spaghetti", "confidence": 0.91, "scores": {"spaghetti": 0.91},
+            }):
+                results = [app.classify_capture_with_local_detector(item["file"]) for item in captures]
+            self.assertTrue(all(result["review_required"] for result in results))
+            self.assertEqual("", results[0]["proposal_id"])
+            self.assertTrue(results[-1]["proposal_id"])
+            self.assertEqual(1, len(app.guardian.state()["pending_proposals"]))
 
 
 if __name__ == "__main__":

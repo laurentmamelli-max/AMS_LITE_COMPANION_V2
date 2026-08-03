@@ -1,5 +1,15 @@
 # Changelog
 
+## 4.0.0 — 2026-08-03
+
+- Nouveau détecteur IA local intégré : le modèle MIT spécialisé identifie les
+  états sain, spaghetti, stringing et anomalie d’extrusion directement depuis
+  les JPEG du Centre Vision.
+- Une alerte exige trois captures distinctes et concordantes. Le détecteur ne
+  possède aucune commande Bambu : ni pause, ni annulation, ni exclusion.
+- Installation guidée dans Companion ; le runtime et le modèle restent dans
+  les données privées de l’application, jamais exposés au réseau local.
+
 ## 3.8.13 — 2026-08-03
 
 - Nettoyage complet de l’intégration PrintGuard : client, installateur,

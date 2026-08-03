@@ -248,6 +248,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         Bundle.main.path(forResource: "ams_companion", ofType: "py")
     }
 
+    private func installLocalDetector() {
+        guard let script = Bundle.main.path(forResource: "Installer_Detecteur_IA", ofType: "command"),
+              let python = pythonExecutable() else {
+            showAlert(title: "Installation impossible", message: "Le script ou Python 3 est introuvable.")
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/bash")
+            process.arguments = [script, python]
+            let output = Pipe()
+            process.standardOutput = output
+            process.standardError = output
+            do {
+                try process.run()
+                process.waitUntilExit()
+                let text = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                DispatchQueue.main.async {
+                    if process.terminationStatus == 0 {
+                        self?.showAlert(title: "Détecteur IA installé", message: "Le moteur local est prêt. Redémarre Companion puis active-le dans le Centre Vision.")
+                    } else {
+                        self?.showAlert(title: "Installation du détecteur échouée", message: text.isEmpty ? "Consulte le journal et réessaie." : text)
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self?.showAlert(title: "Installation du détecteur échouée", message: error.localizedDescription)
+                }
+            }
+        }
+    }
+
     private func engineIsReachable(completion: @escaping (Bool) -> Void) {
         var request = URLRequest(url: healthURL)
         request.timeoutInterval = 1.0
@@ -746,6 +778,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         guard message.name == "companion", let command = message.body as? String else { return }
         if command == "openCatalog" { showCatalog() }
         if command == "openVision" { showVision() }
+        if command == "installDetector" { installLocalDetector() }
     }
 
     private func showAlert(title: String, message: String) {

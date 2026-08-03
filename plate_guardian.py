@@ -38,7 +38,7 @@ class PlateGuardian:
             "n'est validée dans V2."
         ),
     }
-    defect_types = {"spaghetti", "detachment", "warping", "extrusion_anomaly", "anomaly"}
+    defect_types = {"spaghetti", "stringing", "detachment", "warping", "extrusion_anomaly", "anomaly"}
 
     def __init__(
         self,

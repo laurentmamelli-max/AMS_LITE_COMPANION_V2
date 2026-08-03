@@ -46,6 +46,7 @@ from plate_guardian import PlateGuardian
 from bambu_camera import CameraError, capture_jpeg, discover_certificate_sha256
 from autopilot import AutoPilotPlanner
 from gcode_mapper import map_gcode_objects, object_map_summary
+import local_detector
 
 
 APP_DIR = Path.home() / "Library" / "Application Support" / "AMS Lite Companion V2"
@@ -62,7 +63,7 @@ EVENTS_FILE = APP_DIR / "events.sqlite3"
 AUTOPILOT_FILE = APP_DIR / "autopilot.sqlite3"
 REPORTS_FILE = APP_DIR / "reports.sqlite3"
 HOST, PORT = "127.0.0.1", 8766
-__version__ = "3.8.13"
+__version__ = "4.0.0"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -402,7 +403,8 @@ def default_state() -> dict[str, Any]:
         },
         "detector": {
             "enabled": False,
-            "status": "Détecteur IA local en préparation",
+            "threshold": 0.78,
+            "status": "Détecteur IA local non installé",
             "last_result": {},
         },
         "spools": {
@@ -446,7 +448,7 @@ def load_state(path: Path = STATE_FILE) -> dict[str, Any]:
                     continue
                 if key == "printguard":
                     continue
-                if key == "bridge" and isinstance(loaded[key], dict):
+                if key in {"bridge", "detector"} and isinstance(loaded[key], dict):
                     state[key].update(loaded[key])
                     if key == "bridge":
                         defaults = default_state()["bridge"]["default_mapping"]
@@ -2178,6 +2180,10 @@ class Companion:
         # preserving every original JPEG and all Vision guard evidence.
         if self._clear_uninstalled_printguard_state():
             atomic_save(self.state, state_path)
+        detector_before = json.dumps(self.state.get("detector", {}), sort_keys=True)
+        self._refresh_detector_status()
+        if detector_before != json.dumps(self.state.get("detector", {}), sort_keys=True):
+            atomic_save(self.state, state_path)
         # A camera read runs in a daemon thread.  If the app is stopped while
         # that read is active, its transient lock must never survive into the
         # next launch and block every later scheduled capture.
@@ -2251,6 +2257,76 @@ class Companion:
         if changed:
             log("PrintGuard: réglages et résultats supprimés de Companion")
         return changed
+
+    def _refresh_detector_status(self) -> dict[str, Any]:
+        """Update the local detector availability without loading its model."""
+        details = local_detector.status(self.state_path.parent)
+        detector = self.state.setdefault("detector", {})
+        detector.setdefault("enabled", False)
+        detector.setdefault("threshold", 0.78)
+        detector.setdefault("last_result", {})
+        detector["status"] = str(details["message"])
+        detector["runtime_ready"] = bool(details["runtime_ready"])
+        detector["model_ready"] = bool(details["model_ready"])
+        return details
+
+    def classify_capture_with_local_detector(self, filename: str) -> dict[str, Any]:
+        """Analyse one capture locally and submit only strong human-review evidence."""
+        image_path = self._vision_capture_path(filename)
+        with self.lock:
+            detector = self.state.setdefault("detector", {})
+            enabled = bool(detector.get("enabled"))
+            threshold = max(0.50, min(0.98, _float(detector.get("threshold") or 0.78)))
+        if not enabled:
+            raise ValueError("Active d’abord le détecteur IA local")
+        result = local_detector.classify(image_path, self.state_path.parent)
+        result.update({"frame_sha256": hashlib.sha256(image_path.read_bytes()).hexdigest(), "classified_at": now_iso()})
+        label = str(result.get("label") or "healthy")
+        confidence = _float(result.get("confidence"))
+        result["review_required"] = label != "healthy" and confidence >= threshold
+        proposal: dict[str, Any] | None = None
+        if result["review_required"]:
+            observed = self.guardian.observe({
+                "object_id": "plate", "object_label": "Plateau / buse", "defect_type": label,
+                "confidence": confidence, "source": "local_detector", "frame_sha256": result["frame_sha256"],
+            })
+            proposal = observed.get("proposal") if isinstance(observed, dict) else None
+            result["evidence_accepted"] = bool(isinstance(observed, dict) and observed.get("accepted"))
+            result["proposal_id"] = str(proposal.get("id") or "") if isinstance(proposal, dict) else ""
+        with self.lock:
+            captures = self.state.get("camera", {}).get("captures", [])
+            capture = next((item for item in captures if isinstance(item, dict) and item.get("file") == filename), None)
+            if isinstance(capture, dict):
+                capture["detector"] = result
+            detector = self.state.setdefault("detector", {})
+            detector["last_result"] = result
+            detector["status"] = (
+                f"Alerte IA à vérifier : {label} ({round(100 * confidence)} %)" if result["review_required"]
+                else f"Dernière capture analysée : {label} ({round(100 * confidence)} %)"
+            )
+            self.save()
+        if proposal:
+            log(f"Détecteur IA: alerte confirmée par 3 captures ({label})")
+        return result
+
+    def _schedule_local_detector(self, capture: dict[str, Any]) -> None:
+        filename = str(capture.get("file") or "")
+        with self.lock:
+            enabled = bool(self.state.get("detector", {}).get("enabled"))
+        if not enabled or not filename:
+            return
+
+        def run() -> None:
+            try:
+                self.classify_capture_with_local_detector(filename)
+            except (OSError, ValueError, RuntimeError, local_detector.DetectorUnavailable) as exc:
+                with self.lock:
+                    detector = self.state.setdefault("detector", {})
+                    detector["status"] = f"Détecteur IA indisponible : {exc}"
+                    self.save()
+                log(f"Détecteur IA: analyse impossible pour {filename}: {exc}")
+
+        threading.Thread(target=run, name="ams-local-detector", daemon=True).start()
 
     def _restore_recent_auto_import(self) -> None:
         """Resume a recently prepared Bambu file after a Companion restart."""
@@ -3039,6 +3115,22 @@ class Companion:
                 )
             elif not camera.get("enabled"):
                 camera["status"] = "Captures automatiques désactivées"
+            detector = self.state.setdefault("detector", {})
+            if "detector_threshold" in data:
+                try:
+                    detector["threshold"] = max(0.50, min(0.98, float(data["detector_threshold"])))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("Seuil du détecteur IA invalide") from exc
+            if "detector_enabled" in data:
+                requested = bool(data["detector_enabled"])
+                details = self._refresh_detector_status()
+                if requested and not details["ready"]:
+                    raise ValueError(str(details["message"]))
+                detector["enabled"] = requested
+                detector["status"] = (
+                    "Détecteur local actif : alerte après 3 captures concordantes" if requested
+                    else str(details["message"])
+                )
             self.save()
         self.mqtt.restart()
 
@@ -4074,6 +4166,7 @@ class Companion:
                         camera["status"] = f"Vue {view}/{views} enregistrée — couche {layer}"
                         self.save()
                     self._schedule_capture_visual_verification(result)
+                    self._schedule_local_detector(result)
                 except (CameraError, OSError) as exc:
                     with self.lock:
                         camera = self.state["camera"]
@@ -4310,6 +4403,9 @@ class Handler(BaseHTTPRequestHandler):
                     # expected Vision outcome, not an invalid browser request.
                     result = {"detected": False, "message": str(exc)}
                 self.send_json(result)
+            elif path == "/api/vision/detector/classify":
+                body = self.json_body()
+                self.send_json(self.app.classify_capture_with_local_detector(str(body.get("file") or "")))
             elif match := re.fullmatch(r"/api/captures/(print-[a-zA-Z0-9._-]+)/delete", path):
                 self.json_body()
                 self.send_json(self.app.delete_capture_print(match.group(1)))
@@ -4550,7 +4646,7 @@ async function deleteCapturePrint(folder){if(!confirm('Supprimer définitivement
 async function deleteActiveCaptureSession(sessionId){if(!confirm('Supprimer les images déjà prises de cette impression ? Les prochaines captures resteront actives.'))return;try{await api(`/api/captures/session/${encodeURIComponent(sessionId)}/delete`,{method:'POST',body:'{}'});closeCapture();await load()}catch(error){statusEl.textContent=error.message||'Suppression impossible.'}}
 function showMoreCaptures(){visionGalleryLimit+=180;if(visionState)render(visionState)}
 function render(state){visionState=state;const printer=state.printer||{},camera=state.camera||{},printguard=state.printguard||{},captures=Array.isArray(camera.captures)?camera.captures:[],storage=state.vision_storage||{};const views=camera.capture_views_per_layer||3,delayMin=camera.capture_view_delay_min_seconds||4,delayMax=camera.capture_view_delay_max_seconds||24;layerCounterEl.textContent=Number(printer.layer)>0?`Couche ${Number(printer.layer)}`:'Couche —';statusEl.textContent=camera.status||'Caméra non configurée';enabledEl.checked=!!camera.enabled;fingerprintEl.value=camera.certificate_sha256||'';printguardEnabledEl.checked=!!printguard.enabled;printguardURLEl.value=printguard.base_url||'http://127.0.0.1:8000';printguardSensitivityEl.value=printguard.sensitivity||1;printguardStatusEl.textContent=printguard.status||'PrintGuard non configuré';metaEl.textContent=`Captures, pas vidéo : ${views} vues avec pauses aléatoires de ${delayMin} à ${delayMax} s toutes les ${camera.capture_every_layers||5} couches · dernière couche reçue : ${camera.last_seen_layer||'—'} · ${storage.count||0} image(s) conservée(s) localement. ${camera.verification_status||''}`;window.visionCaptures=captures;const visibleCaptures=captures.slice(0,visionGalleryLimit),groups=new Map();visibleCaptures.forEach((item,index)=>{const key=item.folder||'en-cours';if(!groups.has(key))groups.set(key,{name:item.print_name||(item.folder?'Impression terminée':'Impression en cours'),folder:item.folder||'',sessionId:item.print_id||'',items:[]});groups.get(key).items.push({item,index})});const gallery=visibleCaptures.length?[...groups.values()].map(group=>{const deletion=group.folder?`<button class="danger" onclick="deleteCapturePrint('${esc(group.folder)}')">Supprimer</button>`:/^[a-f0-9]{16}$/.test(group.sessionId)?`<button class="danger" onclick="deleteActiveCaptureSession('${esc(group.sessionId)}')">Supprimer</button>`:'';return `<div class="capture-group"><div class="capture-group-head"><div><h3>${esc(group.name)}</h3><span>${group.items.length} image(s)</span></div>${deletion}</div><div class="capture-grid">${group.items.map(({item,index})=>{const objectCount=objectsFor(item).length,pg=item.printguard||{},aiBadge=pg.prediction?`<br><span class="map-badge">PrintGuard : ${pg.prediction==='failure'?'risque signalé':'aucun défaut'} (${Math.round(100*Number(pg.defect_score||0))} %)</span>`:'',verification=item.visual_verification||{},verificationBadge=verification.status==='unverified'||verification.status==='unavailable'?`<br><span class="map-badge">Garde-fou Vision : contrôle requis</span>`:'';return `<button class="capture-card" onclick="openCapture(${index})"><img src="${captureURL(item.file)}" alt="Capture couche ${item.layer}, vue ${item.capture_view||1}"><div><b>Couche ${item.layer} · vue ${item.capture_view||1}/${item.capture_views_total||1}</b><br><span class="muted">${esc(item.captured_at)}</span>${aiBadge}${verificationBadge}${objectCount?`<br><span class="map-badge">${objectCount} objet(s) cartographié(s)</span>`:''}</div></button>`}).join('')}</div></div>`}).join(''):'<p>Aucune capture : la première séquence sera prise à la couche 5, pas immédiatement au lancement.</p>';const remaining=captures.length-visibleCaptures.length;galleryEl.innerHTML=gallery+(remaining>0?`<p class="muted">${remaining} image(s) plus ancienne(s) restent dans l’historique local.<br><button class="secondary" onclick="showMoreCaptures()">Afficher 180 images supplémentaires</button></p>`:'');calibration();}
-async function load(){try{render(await api('/api/state'))}catch(error){statusEl.textContent=error.message}}async function saveCamera(){try{await api('/api/config',{method:'POST',body:JSON.stringify({camera_enabled:enabledEl.checked,camera_certificate_sha256:fingerprintEl.value})});await load()}catch(error){statusEl.textContent=error.message}}async function discover(){try{fingerprintEl.value=(await api('/api/camera/discover',{method:'POST',body:'{}'})).fingerprint;statusEl.textContent='Empreinte détectée : enregistre-la pour l’approuver.'}catch(error){statusEl.textContent=error.message}}document.addEventListener('keydown',event=>{if(event.key==='Escape')closeCapture()});load();setInterval(load,3000);
+const renderVision=render;render=function(state){renderVision(state);galleryEl.querySelectorAll('.capture-group-head button.danger').forEach(button=>{const session=(button.getAttribute('onclick')||'').match(/[a-f0-9]{16}/)?.[0];if(session)button.onclick=()=>deleteActiveCaptureSession(session)})};async function load(){try{render(await api('/api/state'))}catch(error){statusEl.textContent=error.message}}async function saveCamera(){try{await api('/api/config',{method:'POST',body:JSON.stringify({camera_enabled:enabledEl.checked,camera_certificate_sha256:fingerprintEl.value})});await load()}catch(error){statusEl.textContent=error.message}}async function discover(){try{fingerprintEl.value=(await api('/api/camera/discover',{method:'POST',body:'{}'})).fingerprint;statusEl.textContent='Empreinte détectée : enregistre-la pour l’approuver.'}catch(error){statusEl.textContent=error.message}}document.addEventListener('keydown',event=>{if(event.key==='Escape')closeCapture()});load();setInterval(load,3000);
 </script></html>'''.replace("__API_TOKEN__", json.dumps(api_token))
 
 
@@ -4565,23 +4661,27 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 <section id="visionAlert" class="notice" hidden><strong>Contrôle Vision requis</strong><p id="visionAlertText" style="margin:8px 0 0"></p></section>
 <section><h2>Impression en cours</h2><p id="layerCounter" style="font-size:42px;font-weight:800;margin:4px 0;color:#087535">Couche —</p><p class="muted">Compteur reçu directement de l’imprimante.</p></section>
 <section><h2>Caméra</h2><p id="status">Chargement…</p><label><input id="enabled" type="checkbox"> Activer les captures automatiques (pas de flux vidéo)</label><p class="muted">Le Centre Vision se met à jour toutes les trois secondes après chaque nouvelle capture.</p><label>Empreinte TLS</label><input id="fingerprint" placeholder="Détecte-la automatiquement"><button class="secondary" onclick="discover()">Détecter la caméra</button><button onclick="saveCamera()">Enregistrer</button><p id="meta" class="muted"></p></section>
+<section><h2>Détecteur IA local</h2><p>Analyse les JPEG sur ce Mac avec un modèle libre spécialisé. Une alerte exige trois captures concordantes ; elle ne commande jamais l’imprimante.</p><label><input id="detectorEnabled" type="checkbox"> Analyser automatiquement les nouvelles captures</label><div class="fields"><label>Seuil d’alerte (50 à 98 %)<input id="detectorThreshold" type="number" min="0.5" max="0.98" step="0.01" value="0.78"></label></div><button class="secondary" onclick="installDetector()">Installer le détecteur local</button><button onclick="saveDetector()">Enregistrer le détecteur</button><p id="detectorStatus" class="muted">Vérification du détecteur…</p></section>
 <section><h2>Captures par impression</h2><div id="gallery"></div></section></main>
-<div id="captureModal" class="capture-modal" hidden onclick="if(event.target===this)closeCapture()"><section class="capture-dialog"><button class="secondary capture-close" onclick="closeCapture()">Fermer</button><h2 id="captureTitle">Capture</h2><p id="overlayNotice" class="muted"></p><div id="captureStage" class="capture-stage"><img id="captureLarge" alt="Capture agrandie"><svg id="captureOverlay" viewBox="0 0 1 1" preserveAspectRatio="none"></svg></div><div id="objectLegend" class="object-legend" aria-label="Légende des objets reconnus"></div><div id="captureInfo" class="capture-info"></div></section></div>
+<div id="captureModal" class="capture-modal" hidden onclick="if(event.target===this)closeCapture()"><section class="capture-dialog"><button class="secondary capture-close" onclick="closeCapture()">Fermer</button><h2 id="captureTitle">Capture</h2><button id="detectorCaptureButton" class="secondary" onclick="classifyCurrentCapture()">Analyser avec le détecteur local</button><p id="overlayNotice" class="muted"></p><div id="captureStage" class="capture-stage"><img id="captureLarge" alt="Capture agrandie"><svg id="captureOverlay" viewBox="0 0 1 1" preserveAspectRatio="none"></svg></div><div id="objectLegend" class="object-legend" aria-label="Légende des objets reconnus"></div><div id="captureInfo" class="capture-info"></div></section></div>
 <script>
-const token=__API_TOKEN__,statusEl=document.getElementById('status'),enabledEl=document.getElementById('enabled'),fingerprintEl=document.getElementById('fingerprint'),metaEl=document.getElementById('meta'),galleryEl=document.getElementById('gallery'),modalEl=document.getElementById('captureModal'),titleEl=document.getElementById('captureTitle'),largeEl=document.getElementById('captureLarge'),overlayEl=document.getElementById('captureOverlay'),overlayNoticeEl=document.getElementById('overlayNotice'),legendEl=document.getElementById('objectLegend'),infoEl=document.getElementById('captureInfo'),layerCounterEl=document.getElementById('layerCounter'),visionAlertEl=document.getElementById('visionAlert'),visionAlertTextEl=document.getElementById('visionAlertText');
+const token=__API_TOKEN__,statusEl=document.getElementById('status'),enabledEl=document.getElementById('enabled'),fingerprintEl=document.getElementById('fingerprint'),metaEl=document.getElementById('meta'),galleryEl=document.getElementById('gallery'),modalEl=document.getElementById('captureModal'),titleEl=document.getElementById('captureTitle'),largeEl=document.getElementById('captureLarge'),overlayEl=document.getElementById('captureOverlay'),overlayNoticeEl=document.getElementById('overlayNotice'),legendEl=document.getElementById('objectLegend'),infoEl=document.getElementById('captureInfo'),layerCounterEl=document.getElementById('layerCounter'),visionAlertEl=document.getElementById('visionAlert'),visionAlertTextEl=document.getElementById('visionAlertText'),detectorEnabledEl=document.getElementById('detectorEnabled'),detectorThresholdEl=document.getElementById('detectorThreshold'),detectorStatusEl=document.getElementById('detectorStatus'),detectorCaptureButton=document.getElementById('detectorCaptureButton');
 let visionState=null,currentCapture=null,currentShapeObjects=[],currentPlateMessage='',selectedObjectIndex=-1,visionGalleryLimit=180;
 async function api(path,opt={}){const response=await fetch(path,{...opt,headers:{'X-AMS-Token':token,'Content-Type':'application/json'}}),body=await response.json();if(!response.ok)throw Error(body.error||'Erreur');return body}
 function esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function captureURL(file){return `/api/captures/${encodeURIComponent(file)}?token=${encodeURIComponent(token)}`}
+function installDetector(){if(window.webkit?.messageHandlers?.companion){window.webkit.messageHandlers.companion.postMessage('installDetector');detectorStatusEl.textContent='Installation locale lancée. Attends la confirmation, puis relance Companion.';return}detectorStatusEl.textContent='Dans l’application macOS, utilise « Installer le détecteur local » puis relance Companion.'}
+async function saveDetector(){try{await api('/api/config',{method:'POST',body:JSON.stringify({detector_enabled:detectorEnabledEl.checked,detector_threshold:detectorThresholdEl.value})});await load()}catch(error){detectorStatusEl.textContent=error.message||'Configuration du détecteur impossible.'}}
+async function classifyCurrentCapture(){if(!currentCapture)return;try{overlayNoticeEl.textContent='Analyse locale en cours…';const result=await api('/api/vision/detector/classify',{method:'POST',body:JSON.stringify({file:currentCapture.file})});currentCapture.detector=result;overlayNoticeEl.textContent=result.review_required?`Risque ${esc(result.label)} détecté (${Math.round(100*Number(result.confidence||0))} %). Trois vues concordantes sont nécessaires pour une alerte.`:`Analyse : ${esc(result.label)} (${Math.round(100*Number(result.confidence||0))} %).`;await load()}catch(error){overlayNoticeEl.textContent=error.message||'Analyse locale impossible.'}}
 function objectsFor(capture){const embedded=capture?.object_map?.objects;if(Array.isArray(embedded)&&embedded.length)return embedded;const active=visionState?.camera?.active_print;if(active&&capture?.print_id===active.id){const mapped=visionState?.active_job?.object_map?.objects;return Array.isArray(mapped)?mapped:[]}return []}
 const outlineColors=['#d92d20','#b42318','#c11574','#7a5af8','#444ce7','#175cd3','#027a48','#039855','#b54708','#93370d','#a15c07','#6941c6'];function selectMappedObject(index){selectedObjectIndex=selectedObjectIndex===index?-1:index;drawOverlay()}
 function drawOverlay(){overlayEl.innerHTML='';legendEl.innerHTML='';if(!currentCapture)return;const shapes=new Map(currentShapeObjects.map(item=>[String(item.object_id),Array.isArray(item.contours)?item.contours:[]]));if(!shapes.size){overlayNoticeEl.textContent=currentPlateMessage||'Aucune silhouette 3MF exploitable n’est affichée.';return}let count=0,svg='',legend='';objectsFor(currentCapture).forEach((object,index)=>{const contours=shapes.get(String(object?.id));if(!Array.isArray(contours))return;const valid=contours.filter(contour=>Array.isArray(contour)&&contour.length>=3);if(!valid.length)return;const color=outlineColors[index%outlineColors.length],selected=selectedObjectIndex===index;svg+=valid.map(contour=>`<polygon points="${contour.map(point=>`${point[0]},${point[1]}`).join(' ')}" fill="${selected?color+'33':'none'}" stroke="${selected?'#ef1f18':color}" stroke-width="${selected?'0.010':'0.005'}" vector-effect="non-scaling-stroke"/>`).join('');legend+=`<button class="legend-item ${selected?'selected':''}" onclick="selectMappedObject(${index})"><span class="legend-swatch" style="background:${color}">${index+1}</span><span><b>${esc(object.label||('Objet '+object.id))}</b><small>silhouette 3MF reconnue dans cette image${selected?' · contour sélectionné':''}</small></span></button>`;count++});overlayEl.innerHTML=svg;legendEl.innerHTML=legend;overlayNoticeEl.textContent=count?`${count} silhouette(s) 3MF reconnue(s) dans cette image.`:'Aucune silhouette 3MF exploitable n’est affichée.'}
 async function detectObjectShapes(){if(!currentCapture||modalEl.hidden)return;const file=currentCapture.file;try{const result=await api('/api/vision/shapes/detect',{method:'POST',body:JSON.stringify({file})});if(!currentCapture||currentCapture.file!==file)return;currentShapeObjects=result.detected&&Array.isArray(result.objects)?result.objects:[];currentPlateMessage=result.message||'Aucune forme du 3MF reconnue : aucun contour affiché.';drawOverlay()}catch(error){currentShapeObjects=[];currentPlateMessage=error.message||'Détection de formes impossible.';drawOverlay()}}
-function openCapture(index){currentCapture=(window.visionCaptures||[])[index];if(!currentCapture)return;currentShapeObjects=[];currentPlateMessage='Recherche automatique des silhouettes 3MF…';selectedObjectIndex=-1;titleEl.textContent=`Capture · couche ${currentCapture.layer} · vue ${currentCapture.capture_view||1}/${currentCapture.capture_views_total||1}`;largeEl.src=captureURL(currentCapture.file);largeEl.alt=`Capture de la couche ${currentCapture.layer}, vue ${currentCapture.capture_view||1}`;const verification=currentCapture.visual_verification||{},verificationText=verification.status?(verification.message||'Contrôle Vision effectué'):'Pas encore contrôlée';infoEl.innerHTML=`<div><b>Impression</b>${esc(currentCapture.print_name||'Impression en cours')}</div><div><b>Couche</b>${currentCapture.layer}</div><div><b>Vue de la séquence</b>${currentCapture.capture_view||1}/${currentCapture.capture_views_total||1}</div><div><b>Garde-fou Vision</b>${esc(verificationText)}</div><div><b>Date</b>${esc(currentCapture.captured_at)}</div><div><b>Fichier</b>${esc(currentCapture.file)}</div>`;modalEl.hidden=false;largeEl.onload=drawOverlay;drawOverlay();detectObjectShapes()}
+function openCapture(index){currentCapture=(window.visionCaptures||[])[index];if(!currentCapture)return;currentShapeObjects=[];currentPlateMessage='Recherche automatique des silhouettes 3MF…';selectedObjectIndex=-1;titleEl.textContent=`Capture · couche ${currentCapture.layer} · vue ${currentCapture.capture_view||1}/${currentCapture.capture_views_total||1}`;largeEl.src=captureURL(currentCapture.file);largeEl.alt=`Capture de la couche ${currentCapture.layer}, vue ${currentCapture.capture_view||1}`;const verification=currentCapture.visual_verification||{},verificationText=verification.status?(verification.message||'Contrôle Vision effectué'):'Pas encore contrôlée',detector=currentCapture.detector||{},detectorText=detector.label?`${detector.label} · ${Math.round(100*Number(detector.confidence||0))} %`:'Pas encore analysée';infoEl.innerHTML=`<div><b>Impression</b>${esc(currentCapture.print_name||'Impression en cours')}</div><div><b>Couche</b>${currentCapture.layer}</div><div><b>Vue de la séquence</b>${currentCapture.capture_view||1}/${currentCapture.capture_views_total||1}</div><div><b>Détecteur IA</b>${esc(detectorText)}</div><div><b>Garde-fou Vision</b>${esc(verificationText)}</div><div><b>Date</b>${esc(currentCapture.captured_at)}</div><div><b>Fichier</b>${esc(currentCapture.file)}</div>`;detectorCaptureButton.hidden=!visionState?.detector?.enabled;modalEl.hidden=false;largeEl.onload=drawOverlay;drawOverlay();detectObjectShapes()}
 function closeCapture(){modalEl.hidden=true;currentShapeObjects=[];selectedObjectIndex=-1;largeEl.removeAttribute('src');overlayEl.innerHTML='';legendEl.innerHTML=''}
 async function deleteCapturePrint(folder){if(!confirm('Supprimer définitivement toutes les images de cette impression ?'))return;try{await api(`/api/captures/${encodeURIComponent(folder)}/delete`,{method:'POST',body:'{}'});closeCapture();await load()}catch(error){statusEl.textContent=error.message||'Suppression impossible.'}}
 async function deleteActiveCaptureSession(sessionId){if(!confirm('Supprimer les images déjà prises de cette impression ? Les prochaines captures resteront actives.'))return;try{await api(`/api/captures/session/${encodeURIComponent(sessionId)}/delete`,{method:'POST',body:'{}'});closeCapture();await load()}catch(error){statusEl.textContent=error.message||'Suppression impossible.'}}
 function showMoreCaptures(){visionGalleryLimit+=180;if(visionState)render(visionState)}
-function render(state){visionState=state;const printer=state.printer||{},camera=state.camera||{},captures=Array.isArray(camera.captures)?camera.captures:[],storage=state.vision_storage||{};const views=camera.capture_views_per_layer||3,delayMin=camera.capture_view_delay_min_seconds||4,delayMax=camera.capture_view_delay_max_seconds||24;const openAlerts=(camera.verification_alerts||[]).filter(item=>item&&item.status==='open'),activeAlert=openAlerts.find(item=>item.kind==='repeated_unverified')||openAlerts[0];visionAlertEl.hidden=!activeAlert;if(activeAlert){const checkpoints=Array.isArray(activeAlert.checkpoints)?activeAlert.checkpoints.length:1;visionAlertTextEl.textContent=activeAlert.kind==='repeated_unverified'?`${checkpoints} séquences sans objet 3MF confirmé jusqu’à la couche ${activeAlert.layer||'—'}. Vérifie la buse et le plateau : le cadre peut être masqué ou l’impression en défaut.`:`Les ${activeAlert.views||views} vues de la couche ${activeAlert.layer||'—'} ne confirment pas les objets 3MF attendus. Ouvre les captures et contrôle l’impression.`}layerCounterEl.textContent=Number(printer.layer)>0?`Couche ${Number(printer.layer)}`:'Couche —';statusEl.textContent=camera.status||'Caméra non configurée';enabledEl.checked=!!camera.enabled;fingerprintEl.value=camera.certificate_sha256||'';metaEl.textContent=`Captures, pas vidéo : ${views} vues avec pauses aléatoires de ${delayMin} à ${delayMax} s toutes les ${camera.capture_every_layers||5} couches · dernière couche reçue : ${camera.last_seen_layer||'—'} · ${storage.count||0} image(s) conservée(s) localement. ${camera.verification_status||''}`;window.visionCaptures=captures;const visible=captures.slice(0,visionGalleryLimit),groups=new Map();visible.forEach((item,index)=>{const key=item.folder||'en-cours';if(!groups.has(key))groups.set(key,{name:item.print_name||(item.folder?'Impression terminée':'Impression en cours'),folder:item.folder||'',sessionId:item.print_id||'',items:[]});groups.get(key).items.push({item,index})});galleryEl.innerHTML=visible.length?[...groups.values()].map(group=>{const deletion=group.folder?`<button class="danger" onclick="deleteCapturePrint('${esc(group.folder)}')">Supprimer</button>`:/^[a-f0-9]{16}$/.test(group.sessionId)?`<button class="danger" onclick="deleteActiveCaptureSession('${esc(group.sessionId)}')">Supprimer</button>`:'';return `<div class="capture-group"><div class="capture-group-head"><div><h3>${esc(group.name)}</h3><span>${group.items.length} image(s)</span></div>${deletion}</div><div class="capture-grid">${group.items.map(({item,index})=>{const guard=item.visual_verification||{},guardBadge=['unverified','unavailable'].includes(guard.status)?`<br><span class="map-badge">Garde-fou Vision : contrôle requis</span>`:'';return `<button class="capture-card" onclick="openCapture(${index})"><img src="${captureURL(item.file)}" alt="Capture couche ${item.layer}, vue ${item.capture_view||1}"><div><b>Couche ${item.layer} · vue ${item.capture_view||1}/${item.capture_views_total||1}</b><br><span class="muted">${esc(item.captured_at)}</span>${guardBadge}</div></button>`}).join('')}</div></div>`}).join(''):'<p>Aucune capture : la première séquence sera prise à la couche 5, pas immédiatement au lancement.</p>';const remaining=captures.length-visible.length;if(remaining)galleryEl.innerHTML+=`<p class="muted">${remaining} image(s) plus ancienne(s) restent dans l’historique local.<br><button class="secondary" onclick="showMoreCaptures()">Afficher 180 images supplémentaires</button></p>`}
+function render(state){visionState=state;const printer=state.printer||{},camera=state.camera||{},detector=state.detector||{},captures=Array.isArray(camera.captures)?camera.captures:[],storage=state.vision_storage||{};const views=camera.capture_views_per_layer||3,delayMin=camera.capture_view_delay_min_seconds||4,delayMax=camera.capture_view_delay_max_seconds||24;const openAlerts=(camera.verification_alerts||[]).filter(item=>item&&item.status==='open'),activeAlert=openAlerts.find(item=>item.kind==='repeated_unverified')||openAlerts[0];visionAlertEl.hidden=!activeAlert;if(activeAlert){const checkpoints=Array.isArray(activeAlert.checkpoints)?activeAlert.checkpoints.length:1;visionAlertTextEl.textContent=activeAlert.kind==='repeated_unverified'?`${checkpoints} séquences sans objet 3MF confirmé jusqu’à la couche ${activeAlert.layer||'—'}. Vérifie la buse et le plateau : le cadre peut être masqué ou l’impression en défaut.`:`Les ${activeAlert.views||views} vues de la couche ${activeAlert.layer||'—'} ne confirment pas les objets 3MF attendus. Ouvre les captures et contrôle l’impression.`}layerCounterEl.textContent=Number(printer.layer)>0?`Couche ${Number(printer.layer)}`:'Couche —';statusEl.textContent=camera.status||'Caméra non configurée';enabledEl.checked=!!camera.enabled;fingerprintEl.value=camera.certificate_sha256||'';detectorEnabledEl.checked=!!detector.enabled;detectorThresholdEl.value=detector.threshold||0.78;detectorStatusEl.textContent=detector.status||'Détecteur IA local non installé';metaEl.textContent=`Captures, pas vidéo : ${views} vues avec pauses aléatoires de ${delayMin} à ${delayMax} s toutes les ${camera.capture_every_layers||5} couches · dernière couche reçue : ${camera.last_seen_layer||'—'} · ${storage.count||0} image(s) conservée(s) localement. ${camera.verification_status||''}`;window.visionCaptures=captures;const visible=captures.slice(0,visionGalleryLimit),groups=new Map();visible.forEach((item,index)=>{const key=item.folder||'en-cours';if(!groups.has(key))groups.set(key,{name:item.print_name||(item.folder?'Impression terminée':'Impression en cours'),folder:item.folder||'',sessionId:item.print_id||'',items:[]});groups.get(key).items.push({item,index})});galleryEl.innerHTML=visible.length?[...groups.values()].map(group=>{const deletion=group.folder?`<button class="danger" onclick="deleteCapturePrint('${esc(group.folder)}')">Supprimer</button>`:/^[a-f0-9]{16}$/.test(group.sessionId)?`<button class="danger" onclick="deleteActiveCaptureSession('${esc(group.sessionId)}">Supprimer</button>`:'';return `<div class="capture-group"><div class="capture-group-head"><div><h3>${esc(group.name)}</h3><span>${group.items.length} image(s)</span></div>${deletion}</div><div class="capture-grid">${group.items.map(({item,index})=>{const detection=item.detector||{},detectorBadge=detection.label?`<br><span class="map-badge">IA : ${esc(detection.label)} (${Math.round(100*Number(detection.confidence||0))} %)</span>`:'',guard=item.visual_verification||{},guardBadge=['unverified','unavailable'].includes(guard.status)?`<br><span class="map-badge">Garde-fou Vision : contrôle requis</span>`:'';return `<button class="capture-card" onclick="openCapture(${index})"><img src="${captureURL(item.file)}" alt="Capture couche ${item.layer}, vue ${item.capture_view||1}"><div><b>Couche ${item.layer} · vue ${item.capture_view||1}/${item.capture_views_total||1}</b><br><span class="muted">${esc(item.captured_at)}</span>${detectorBadge}${guardBadge}</div></button>`}).join('')}</div></div>`}).join(''):'<p>Aucune capture : la première séquence sera prise à la couche 5, pas immédiatement au lancement.</p>';const remaining=captures.length-visible.length;if(remaining)galleryEl.innerHTML+=`<p class="muted">${remaining} image(s) plus ancienne(s) restent dans l’historique local.<br><button class="secondary" onclick="showMoreCaptures()">Afficher 180 images supplémentaires</button></p>`}
 async function load(){try{render(await api('/api/state'))}catch(error){statusEl.textContent=error.message}}async function saveCamera(){try{await api('/api/config',{method:'POST',body:JSON.stringify({camera_enabled:enabledEl.checked,camera_certificate_sha256:fingerprintEl.value})});await load()}catch(error){statusEl.textContent=error.message}}async function discover(){try{fingerprintEl.value=(await api('/api/camera/discover',{method:'POST',body:'{}'})).fingerprint;statusEl.textContent='Empreinte détectée : enregistre-la pour l’approuver.'}catch(error){statusEl.textContent=error.message}}document.addEventListener('keydown',event=>{if(event.key==='Escape')closeCapture()});load();setInterval(load,3000);
 </script></html>'''.replace("__API_TOKEN__", json.dumps(api_token))
 
