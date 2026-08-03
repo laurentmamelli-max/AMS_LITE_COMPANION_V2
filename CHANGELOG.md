@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.8.10 — 2026-08-03
+
+- Correction du Centre Vision : l’encart de contrôle Vision est à nouveau
+  présent dans la page, ce qui supprime l’erreur JavaScript affichée sous
+  « Caméra » pendant son actualisation.
+
 ## 3.8.9 — 2026-08-03
 
 - Le garde-fou de récupération Vision est borné à une migration globale : les

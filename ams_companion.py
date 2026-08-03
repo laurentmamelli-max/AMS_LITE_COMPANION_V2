@@ -63,7 +63,7 @@ EVENTS_FILE = APP_DIR / "events.sqlite3"
 AUTOPILOT_FILE = APP_DIR / "autopilot.sqlite3"
 REPORTS_FILE = APP_DIR / "reports.sqlite3"
 HOST, PORT = "127.0.0.1", 8766
-__version__ = "3.8.9"
+__version__ = "3.8.10"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -4648,6 +4648,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 </style><main>
 <h1>Centre Vision</h1>
 <p class="notice">Captures automatiques périodiques : <strong>ce n’est pas une vidéo en direct</strong>. Trois vues avec des pauses aléatoires sont prises à la couche 5, puis toutes les 5 couches, afin de voir les objets masqués par la tête.</p>
+<section id="visionAlert" class="notice" hidden><strong>Contrôle Vision requis</strong><p id="visionAlertText" style="margin:8px 0 0"></p></section>
 <section><h2>Impression en cours</h2><p id="layerCounter" style="font-size:42px;font-weight:800;margin:4px 0;color:#087535">Couche —</p><p class="muted">Compteur reçu directement de l’imprimante.</p></section>
 <section><h2>Caméra</h2><p id="status">Chargement…</p><label><input id="enabled" type="checkbox"> Activer les captures automatiques (pas de flux vidéo)</label><p class="muted">Le Centre Vision se met à jour toutes les trois secondes après chaque nouvelle capture.</p><label>Empreinte TLS</label><input id="fingerprint" placeholder="Détecte-la automatiquement"><button class="secondary" onclick="discover()">Détecter la caméra</button><button onclick="saveCamera()">Enregistrer</button><p id="meta" class="muted"></p></section>
 <section><h2>IA de détection PrintGuard</h2><p>Détecteur local séparé de Companion. Les JPEG restent sur ce Mac et l’IA ne reçoit ni le code LAN Bambu ni aucun droit de pause ou d’annulation.</p><label><input id="printguardEnabled" type="checkbox"> Analyser automatiquement chaque nouvelle capture</label><div class="fields"><label>Adresse locale<input id="printguardURL" value="http://127.0.0.1:8000" inputmode="url"></label><label>Sensibilité (0,1 à 4)<input id="printguardSensitivity" type="number" min="0.1" max="4" step="0.1" value="1"></label></div><label>Jeton API optionnel<input id="printguardToken" type="password" placeholder="Seulement si PrintGuard exige un jeton"></label><button class="secondary" onclick="testPrintGuard()">Tester PrintGuard</button><button onclick="savePrintGuard()">Enregistrer l’IA</button><p id="printguardStatus" class="muted">Installe et lance PrintGuard, puis teste la connexion locale.</p></section>
