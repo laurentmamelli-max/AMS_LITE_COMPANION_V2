@@ -481,7 +481,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("3.8.6", report["application"]["version"])
+            self.assertEqual("3.8.7", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -636,6 +636,30 @@ class CompanionTests(unittest.TestCase):
                 audit = app.audit_visual_verification(folder)
             self.assertEqual(6, audit["checked"])
             self.assertEqual([5, 10], app.state["camera"]["verification_alerts"][0]["checkpoints"])
+
+    def test_capture_history_compacts_gcode_ranges_but_keeps_shape_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            state = ac.default_state()
+            state["camera"]["captures"] = [{
+                "file": "layer-00005-20260803-010101.jpg",
+                "object_map": {
+                    "status": "mapped", "object_count": 1,
+                    "protocol": {"command": "skip_objects", "identity_source": "slice_info.config"},
+                    "objects": [{
+                        "id": "2565", "label": "Pièce · #2565", "plate": "13",
+                        "bounds_xy": {"min_x": 1, "min_y": 2, "max_x": 3, "max_y": 4},
+                        "line_ranges": [{"start_line": 1, "end_line": 99999}],
+                    }],
+                },
+            }]
+            ac.atomic_save(state, path)
+            app = ac.Companion(path)
+            stored = app.state["camera"]["captures"][0]["object_map"]
+            self.assertEqual("2565", stored["objects"][0]["id"])
+            self.assertEqual("13", stored["objects"][0]["plate"])
+            self.assertEqual({"min_x": 1.0, "min_y": 2.0, "max_x": 3.0, "max_y": 4.0}, stored["objects"][0]["bounds_xy"])
+            self.assertNotIn("line_ranges", stored["objects"][0])
 
     def test_startup_audit_merges_transient_alert_key_into_capture_folder(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1555,11 +1579,11 @@ class CompanionTests(unittest.TestCase):
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("3.8.6", report["application"]["version"])
+                self.assertEqual("3.8.7", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
                 self.assertIn("Poste de supervision", html)
                 self.assertIn("Historique Vision et rapports", html)
-                self.assertIn("Compteur local v3.8.6", html)
+                self.assertIn("Compteur local v3.8.7", html)
                 self.assertIn("shutdownCard.after(auditCard)", html)
                 self.assertIn("auditCard.after(reportsCard)", html)
                 snapshot_request = urllib.request.Request(

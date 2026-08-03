@@ -63,7 +63,7 @@ EVENTS_FILE = APP_DIR / "events.sqlite3"
 AUTOPILOT_FILE = APP_DIR / "autopilot.sqlite3"
 REPORTS_FILE = APP_DIR / "reports.sqlite3"
 HOST, PORT = "127.0.0.1", 8766
-__version__ = "3.8.6"
+__version__ = "3.8.7"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -301,6 +301,46 @@ def capture_print_folder(name: str, task_id: str, started_at: str | None = None)
     readable = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:48] or "impression"
     identity = re.sub(r"[^a-zA-Z0-9._-]+", "-", task_id).strip("-.")[:32] or "sans-id"
     return f"print-{stamp}-{identity}-{readable}"
+
+
+def compact_capture_object_map(value: Any) -> dict[str, Any]:
+    """Keep only the 3MF facts needed to review one stored camera frame.
+
+    Full G-code line ranges belong to the active job and its archived 3MF,
+    not to every JPEG.  Retaining them per frame needlessly inflates state
+    reads and the Centre Vision refresh without improving detection or manual
+    exclusion safety.
+    """
+    if not isinstance(value, dict):
+        return {}
+    objects: list[dict[str, Any]] = []
+    for item in value.get("objects", []):
+        if not isinstance(item, dict):
+            continue
+        object_id = str(item.get("id") or "")[:80]
+        if not object_id:
+            continue
+        compact: dict[str, Any] = {"id": object_id}
+        for key, limit in (("label", 240), ("plate", 32)):
+            if item.get(key) not in (None, ""):
+                compact[key] = str(item[key])[:limit]
+        bounds = item.get("bounds_xy")
+        if isinstance(bounds, dict):
+            clean_bounds = {
+                key: float(bounds[key]) for key in ("min_x", "min_y", "max_x", "max_y")
+                if isinstance(bounds.get(key), (int, float))
+            }
+            if clean_bounds:
+                compact["bounds_xy"] = clean_bounds
+        objects.append(compact)
+    result = {"status": str(value.get("status") or ""), "object_count": len(objects), "objects": objects}
+    protocol = value.get("protocol")
+    if isinstance(protocol, dict):
+        result["protocol"] = {
+            key: str(protocol[key])[:80] for key in ("command", "identity_source")
+            if protocol.get(key) not in (None, "")
+        }
+    return result
 
 
 def read_bambu_studio_credentials(path: Path = BAMBU_STUDIO_CONFIG) -> dict[str, str]:
@@ -2175,6 +2215,11 @@ class Companion:
                 atomic_save(self.state, self.state_path)
         self._restore_recent_auto_import()
         self._refresh_active_object_map_from_recent_archive()
+        # Older builds copied full G-code ranges into every JPEG record.
+        # Compact them once at startup; the archived 3MF remains the source
+        # for any later shape search.
+        if self._compact_stored_capture_maps():
+            self.save()
         # Versions antérieures conservaient les JPEG mais plafonnaient leur
         # index à 200 entrées.  Répare cet historique au démarrage, sans
         # toucher aux fichiers : chaque image locale redevient consultable.
@@ -2276,6 +2321,20 @@ class Companion:
             }
             for slot in map(str, range(1, 5))
         }
+
+    def _compact_stored_capture_maps(self) -> bool:
+        changed = False
+        for capture in self.state.get("camera", {}).get("captures", []):
+            if not isinstance(capture, dict) or "object_map" not in capture:
+                continue
+            original = capture.get("object_map")
+            compact = compact_capture_object_map(original)
+            if json.dumps(original, sort_keys=True, ensure_ascii=False) != json.dumps(compact, sort_keys=True, ensure_ascii=False):
+                capture["object_map"] = compact
+                changed = True
+        if changed:
+            log("Vision: métadonnées G-code compactées dans l’historique des captures")
+        return changed
 
     def public_state(self) -> dict[str, Any]:
         with self.lock:
@@ -4027,8 +4086,9 @@ class Companion:
                               "capture_view": view, "capture_views_total": views,
                               # Keep the verified G-code map alongside the frame so a
                               # completed print can still be reviewed with its object
-                              # overlay, even after the next job starts.
-                              "object_map": active_map if isinstance(active_map, dict) else {}}
+                              # overlay, even after the next job starts.  The full
+                              # ranges remain in the archived 3MF, not every JPEG.
+                              "object_map": compact_capture_object_map(active_map)}
                     if completed_folder:
                         result["folder"] = completed_folder
                         result["print_name"] = str(completed.get("name") or "Impression Bambu")
@@ -4140,13 +4200,22 @@ class Handler(BaseHTTPRequestHandler):
         supplied = query.get("token", [""])[0]
         return bool(supplied) and secrets.compare_digest(supplied, self.api_token)
 
+    def _write_response(self, raw: bytes) -> None:
+        """Send a completed response without treating a closed browser tab as an error."""
+        try:
+            self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionResetError):
+            # The dashboard polls local state.  A browser navigation can close
+            # a request after headers were sent; there is nothing to recover.
+            return
+
     def send_jpeg(self, raw: bytes) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "image/jpeg")
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", "private, no-store")
         self.end_headers()
-        self.wfile.write(raw)
+        self._write_response(raw)
 
     def send_pdf(self, raw: bytes, filename: str) -> None:
         self.send_response(200)
@@ -4155,7 +4224,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", "private, no-store")
         self.end_headers()
-        self.wfile.write(raw)
+        self._write_response(raw)
 
     def send_json(self, value: Any, status: int = 200) -> None:
         raw = json.dumps(value, ensure_ascii=False).encode("utf-8")
@@ -4164,7 +4233,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(raw)
+        self._write_response(raw)
 
     def send_csv(self, raw: bytes) -> None:
         self.send_response(200)
@@ -4173,7 +4242,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(raw)
+        self._write_response(raw)
 
     def body(self) -> bytes:
         try:
@@ -4208,7 +4277,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Security-Policy", "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; object-src 'none'")
             self.end_headers()
-            self.wfile.write(raw)
+            self._write_response(raw)
         elif path == "/api/health":
             self.send_json({"ok": True})
         elif match := re.fullmatch(r"/api/captures/(layer-\d{5}-\d{8}-\d{6}\.jpg)", path):

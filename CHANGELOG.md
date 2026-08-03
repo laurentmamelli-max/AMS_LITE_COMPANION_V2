@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.8.7 — 2026-08-03
+
+- Audit de performance : les captures Vision ne dupliquent plus les longues
+  plages du G-code. Les seuls éléments requis pour les silhouettes (identité,
+  libellé, plateau et limites) sont conservés ; le 3MF archivé demeure la
+  référence complète. Les historiques existants sont compactés au lancement.
+- Le serveur local ignore désormais proprement la fermeture normale d’un
+  onglet pendant une réponse, sans produire de fausse erreur dans les journaux.
+
 ## 3.8.6 — 2026-08-03
 
 - Le Garde-fou Vision suit désormais chaque séquence de vues non vérifiées au
