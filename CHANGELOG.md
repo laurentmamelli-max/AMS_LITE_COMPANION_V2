@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.8.11 — 2026-08-03
+
+- PrintGuard a été désinstallé : service macOS, moteur local et données ont
+  été retirés. Ses réglages, jeton éventuel et résultats historiques sont
+  effacés sans supprimer les captures Vision.
+
 ## 3.8.10 — 2026-08-03
 
 - Correction du Centre Vision : l’encart de contrôle Vision est à nouveau
