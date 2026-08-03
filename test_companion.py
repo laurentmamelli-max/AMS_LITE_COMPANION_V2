@@ -1293,6 +1293,12 @@ class CompanionTests(unittest.TestCase):
             self.assertEqual(989.5, app.state["spools"]["1"]["remaining_g"])
             self.assertEqual(995.75, app.state["spools"]["2"]["remaining_g"])
 
+    def test_bridge_defaults_to_a_post_upload_quiet_period(self):
+        """The observer must not contend with Bambu Studio's send phase."""
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json", [Path(tmp) / "watch"])
+            self.assertEqual(15.0, app.bridge.stable_seconds)
+
     def test_bridge_uses_ams_mapping_from_studio_request(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = ac.Companion(Path(tmp) / "state.json", [Path(tmp) / "watch"])
