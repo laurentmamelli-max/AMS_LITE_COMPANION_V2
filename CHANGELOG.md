@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.8.9 — 2026-08-03
+
+- Le garde-fou de récupération Vision est borné à une migration globale : les
+  relances suivantes ne parcourent jamais les anciennes impressions une par
+  une. L’application retrouve ainsi une empreinte mémoire légère au repos.
+
+## 3.8.8 — 2026-08-03
+
+- Audit CPU/RAM : le contrôle de récupération Vision est désormais mémorisé
+  une fois terminé. Il ne relance plus l’analyse OpenCV de captures historiques
+  à chaque ouverture de l’application, tout en restant disponible lors d’une
+  vraie migration de format.
+
 ## 3.8.7 — 2026-08-03
 
 - Audit de performance : les captures Vision ne dupliquent plus les longues

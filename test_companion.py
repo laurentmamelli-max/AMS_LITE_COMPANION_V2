@@ -481,7 +481,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "report-1", "layer_num": 5}})
             report = app.supervision_report()
             self.assertEqual(1, report["schema_version"])
-            self.assertEqual("3.8.7", report["application"]["version"])
+            self.assertEqual("3.8.9", report["application"]["version"])
             self.assertEqual(1, report["reliability"]["event_count"])
             self.assertEqual("processed", report["reliability"]["events"][0]["outcome"])
             self.assertEqual("mapped", report["print"]["object_map"]["status"])
@@ -685,6 +685,21 @@ class CompanionTests(unittest.TestCase):
             self.assertEqual("superseded", old["status"])
             self.assertEqual(new_id, old["superseded_by"])
             self.assertEqual([5, 10, 15], current["checkpoints"])
+            worker.assert_not_called()
+
+    def test_startup_visual_audit_is_not_repeated_after_completion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            folder = "print-20260803-audit-once"
+            app.state["camera"]["captures"] = [{
+                "file": "layer-00005-20260803-010101.jpg", "folder": folder,
+                "layer": 5, "object_map": {"objects": [{"id": "2565"}]},
+            }]
+            app._run_startup_visual_audit(folder)
+            self.assertEqual(ac.VISUAL_AUDIT_SCHEMA, app.state["camera"]["startup_visual_audits"][folder])
+            self.assertEqual(ac.VISUAL_AUDIT_SCHEMA, app.state["camera"]["startup_visual_audit_schema"])
+            with mock.patch.object(ac.threading, "Thread") as worker:
+                app._schedule_recent_visual_audit()
             worker.assert_not_called()
 
     def test_startup_restores_unlimited_vision_history_from_local_jpegs(self):
@@ -1579,11 +1594,11 @@ class CompanionTests(unittest.TestCase):
                 report = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/report.json", headers=headers), timeout=2).read())
                 self.assertEqual(1, report["schema_version"])
-                self.assertEqual("3.8.7", report["application"]["version"])
+                self.assertEqual("3.8.9", report["application"]["version"])
                 self.assertNotIn("access_code", json.dumps(report))
                 self.assertIn("Poste de supervision", html)
                 self.assertIn("Historique Vision et rapports", html)
-                self.assertIn("Compteur local v3.8.7", html)
+                self.assertIn("Compteur local v3.8.9", html)
                 self.assertIn("shutdownCard.after(auditCard)", html)
                 self.assertIn("auditCard.after(reportsCard)", html)
                 snapshot_request = urllib.request.Request(

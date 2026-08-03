@@ -63,12 +63,16 @@ EVENTS_FILE = APP_DIR / "events.sqlite3"
 AUTOPILOT_FILE = APP_DIR / "autopilot.sqlite3"
 REPORTS_FILE = APP_DIR / "reports.sqlite3"
 HOST, PORT = "127.0.0.1", 8766
-__version__ = "3.8.7"
+__version__ = "3.8.9"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
 MAX_ARCHIVE_COMPRESSION_RATIO = 100
 MAX_GCODE_OBJECT_MAP_BYTES = 24 * 1024 * 1024
+# Startup verification is a migration/recovery pass, not background work to
+# repeat after every macOS relaunch.  Bump this only when the persisted Vision
+# verification format itself changes and an existing history must be replayed.
+VISUAL_AUDIT_SCHEMA = 1
 # A human may prepare a job, then start it well after the 3MF is written by
 # Bambu Studio. Keep that candidate available for a reasonable test/prepare
 # window, while MQTT print commands remain short-lived below. The parsed
@@ -3273,6 +3277,27 @@ class Companion:
         results = [self.assess_capture_visual_verification(str(item.get("file") or "")) for item in captures if item.get("file")]
         return {"folder": folder_name, "checked": len(results), "results": results}
 
+    def _run_startup_visual_audit(self, folder_name: str) -> None:
+        """Complete one recovery audit and remember it to keep startup idle."""
+        try:
+            self.audit_visual_verification(folder_name)
+        except (OSError, RuntimeError, ValueError) as exc:
+            log(f"Vision: audit de récupération impossible pour {folder_name}: {exc}")
+            return
+        with self.lock:
+            camera = self.state.setdefault("camera", {})
+            completed = camera.get("startup_visual_audits")
+            if not isinstance(completed, dict):
+                completed = {}
+                camera["startup_visual_audits"] = completed
+            completed[folder_name] = VISUAL_AUDIT_SCHEMA
+            camera["startup_visual_audit_schema"] = VISUAL_AUDIT_SCHEMA
+            # A bounded recovery ledger avoids turning years of print folders
+            # into a permanently growing state file.
+            if len(completed) > 100:
+                camera["startup_visual_audits"] = dict(list(completed.items())[-100:])
+            self.save()
+
     def _schedule_capture_visual_verification(self, capture: dict[str, Any]) -> None:
         """Run the optional OpenCV evidence check away from camera capture I/O."""
         if not self._capture_has_expected_objects(capture):
@@ -3332,6 +3357,21 @@ class Companion:
                 migrated = True
             if migrated:
                 self.save()
+            completed_audits = camera.get("startup_visual_audits")
+            if not isinstance(completed_audits, dict):
+                completed_audits = {}
+            recovered_schema = int(_float(camera.get("startup_visual_audit_schema") or 0))
+            # V3.8.8 kept a per-folder ledger.  Treat a completed entry from
+            # that build as proof that the one-time recovery already ran, so
+            # a restart cannot walk through every old print archive.
+            if recovered_schema != VISUAL_AUDIT_SCHEMA and any(
+                int(_float(value)) == VISUAL_AUDIT_SCHEMA for value in completed_audits.values()
+            ):
+                camera["startup_visual_audit_schema"] = VISUAL_AUDIT_SCHEMA
+                self.save()
+                return
+            if recovered_schema == VISUAL_AUDIT_SCHEMA:
+                return
             legacy_open_keys = {
                 str(event.get("session_key") or "") for event in camera.get("verification_alerts", [])
                 if isinstance(event, dict) and event.get("status") == "open"
@@ -3341,6 +3381,7 @@ class Companion:
                 str(item.get("folder") or "") for item in captures
                 if isinstance(item, dict) and item.get("folder")
                 and self._capture_has_expected_objects(item)
+                and completed_audits.get(str(item.get("folder") or "")) != VISUAL_AUDIT_SCHEMA
                 and (
                     not isinstance(item.get("visual_verification"), dict)
                     or self._capture_verification_key(item) in legacy_open_keys
@@ -3351,7 +3392,7 @@ class Companion:
                 )
             ), "")
         if re.fullmatch(r"print-[a-zA-Z0-9._-]+", folder):
-            threading.Thread(target=self.audit_visual_verification, args=(folder,), daemon=True).start()
+            threading.Thread(target=self._run_startup_visual_audit, args=(folder,), daemon=True).start()
 
     def import_bambu_studio_configuration(self, data: dict[str, Any]) -> dict[str, Any]:
         """Reuse the current Bambu Studio LAN identity for this local Companion."""
