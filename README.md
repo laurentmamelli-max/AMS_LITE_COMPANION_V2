@@ -29,9 +29,8 @@ estimations et peuvent être corrigés manuellement après une pesée.
 
 - application native macOS avec un Centre Vision indépendant ;
 - séquences de trois captures caméra locales avec des pauses aléatoires, toutes les cinq couches, regroupées par impression ;
-- IA de détection locale PrintGuard appliquée aux captures (défaut global,
-  aucune commande d’imprimante), avec popup de vérification et score conservé
-  auprès de chaque image ;
+- garde-fou Vision local : confirmation des objets attendus sur une séquence
+  de captures, avec alerte de vérification et aucune commande d’imprimante ;
 - comparaison locale côte à côte disponible comme outil de revue visuelle, sans
   projection ni différence géométrique trompeuse ;
 - cartographie des objets Bambu Studio, alertes Vision locales et exclusion
@@ -61,17 +60,13 @@ estimations et peuvent être corrigés manuellement après une pesée.
 - cartographie 3MF conservée comme référence manuelle : avec une caméra montée
   sur la tête, elle ne prétend plus localiser automatiquement les objets.
 
-## Détection IA stable
+## Détection locale
 
-Companion V3.8 utilise le moteur open source [PrintGuard](https://github.com/oliverbravery/PrintGuard)
-comme application locale indépendante. Sur le Mac de production, PrintGuard est
-installé depuis son tag source verrouillé et lancé automatiquement en arrière-plan
-sur `127.0.0.1:8000`. Dans le Centre Vision, activez « Analyser automatiquement
-chaque nouvelle capture » puis cliquez « Tester PrintGuard ». Les images ne
-quittent pas le Mac et le code LAN Bambu n’est jamais transmis au moteur IA.
-
-Une alerte PrintGuard ne pause, n’annule et n’exclut jamais rien. L’exclusion
-manuelle Bambu déjà présente reste un choix séparé, explicitement confirmé.
+PrintGuard a été entièrement retiré. Companion conserve le garde-fou Vision
+local et prépare son propre détecteur léger, isolé du protocole Bambu. Les
+captures restent sur le Mac ; toute future détection ne créera qu’une alerte
+à vérifier. L’exclusion manuelle Bambu reste un choix séparé, explicitement
+confirmé.
 
 ## Compatibilité
 

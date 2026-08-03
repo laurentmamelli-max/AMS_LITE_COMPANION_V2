@@ -1,5 +1,15 @@
 # Changelog
 
+## 3.8.13 — 2026-08-03
+
+- Nettoyage complet de l’intégration PrintGuard : client, installateur,
+  routes API et analyse automatique retirés du paquet. La migration efface
+  définitivement les anciennes métadonnées, mais garde toutes les captures.
+- Correction de migration : une clé PrintGuard déjà présente dans l’ancien
+  fichier d’état est maintenant retirée physiquement au premier démarrage.
+- Le socle du futur détecteur local est désormais séparé de la surveillance
+  Vision et reste strictement en mode alerte, sans commande imprimante.
+
 ## 3.8.11 — 2026-08-03
 
 - PrintGuard a été désinstallé : service macOS, moteur local et données ont
